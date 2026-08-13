@@ -1,0 +1,5 @@
+Name,Url,Steps,ScrollFullPage,Notes
+Intranet Dashboard,https://intranet.example.com/dashboard,,N,Landing page showing the logged-in user and the environment banner.
+App Settings - Audit Log,https://app.example.com/settings,clicktext:Audit Log,Y,"Evidence that audit logging is enabled. Full page captured, the retention setting is near the bottom."
+Security - Password Policy,https://app.example.com/admin/security,click:#tab-password-policy ; wait:3,N,Password complexity and lockout thresholds (control ITGC-04).
+Admin User List,https://portal.example.com/admin/users,,Y,Complete list of accounts with administrative privileges as of the capture date.
