@@ -1,0 +1,5 @@
+# Example evidence must stay byte-for-byte identical, or its hashes stop matching
+# (SHA256SUMS is covered by the manifest hash; a CRLF conversion would break it).
+examples/** -text
+*.jpg binary
+*.png binary

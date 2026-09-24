@@ -1,0 +1,443 @@
+{
+  "Report": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\live-test.html",
+  "ExitCode": 2,
+  "Run": {
+    "StartTime": "2026-09-24 06:12:10",
+    "EndTime": "2026-09-24 06:13:07",
+    "TimeZone": "(UTC-08:00) Pacific Time (US & Canada) (UTC-07:00)",
+    "Computer": "DESKTOP-IUA0KK7",
+    "User": "DESKTOP-IUA0KK7\\eric",
+    "OperatingSystem": "Microsoft Windows 11 Enterprise (build 26200)",
+    "EdgeVersion": "Edg/153.0.4234.48",
+    "BrowserInstance": "Launched by this run on port 9333 using profile C:\\Users\\eric\\AppData\\Local\\Temp\\vouch-live-test-profile",
+    "CaptureDesktop": "Captured on a separate virtual desktop; other applications stayed on the original desktop.",
+    "ToolVersion": "1.2.0",
+    "CsvPath": "C:\\repo\\vouch\\tests\\live\\public-sites.csv",
+    "ImageFormat": "jpeg",
+    "ImageDescription": "JPEG (quality 85)",
+    "ScreenResolution": "1280 x 800 (primary display)",
+    "Total": 10,
+    "OkCount": 6,
+    "WarnCount": 1,
+    "FailCount": 3,
+    "CaptureCount": 23.0,
+    "RunId": "77f82c84-dd82-4571-a013-2a691108f05b",
+    "ManifestSha256": "cb607091b21538b02c3d46dd801af6daa7d00c722208a8b3a354193b3c5176e9"
+  },
+  "Items": [
+    {
+      "Index": 1,
+      "Name": "Example Domain",
+      "Url": "https://example.com/",
+      "FinalUrl": "https://example.com/",
+      "Status": "OK",
+      "HttpStatus": 200,
+      "ScrollFullPage": false,
+      "Details": [],
+      "Steps": [],
+      "Captures": [
+        {
+          "Timestamp": "2026-09-24 06:12:19",
+          "CapturedAt": "2026-09-24T06:12:19.495-07:00",
+          "Sha256": "929c1dc0a55203a8fa978b4472f85a17987779f6d2186a6988416dc5b48c0406",
+          "FileName": "001_Example_Domain_seg01.jpg",
+          "Url": "https://example.com/",
+          "SegmentIndex": 1,
+          "SegmentCount": 1,
+          "Bytes": 50823,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\001_Example_Domain_seg01.jpg"
+        }
+      ]
+    },
+    {
+      "Index": 2,
+      "Name": "Wikipedia - Audit (full page)",
+      "Url": "https://en.wikipedia.org/wiki/Audit",
+      "FinalUrl": "https://en.wikipedia.org/wiki/Audit",
+      "Status": "OK",
+      "HttpStatus": 200,
+      "ScrollFullPage": true,
+      "Details": [],
+      "Steps": [],
+      "Captures": [
+        {
+          "Timestamp": "2026-09-24 06:12:24",
+          "CapturedAt": "2026-09-24T06:12:24.653-07:00",
+          "Sha256": "afc7e4e1d4750c29be335837fe3e974af81f21933d210ffd8233c9916716b8bd",
+          "FileName": "002_Wikipedia_-_Audit_full_page_seg01.jpg",
+          "Url": "https://en.wikipedia.org/wiki/Audit",
+          "SegmentIndex": 1,
+          "SegmentCount": 15,
+          "Bytes": 188792,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\002_Wikipedia_-_Audit_full_page_seg01.jpg"
+        },
+        {
+          "Timestamp": "2026-09-24 06:12:25",
+          "CapturedAt": "2026-09-24T06:12:25.700-07:00",
+          "Sha256": "48937e63c176f728fc3b9f33c38a142f654f81f94b95760a8f6d73741938d718",
+          "FileName": "002_Wikipedia_-_Audit_full_page_seg02.jpg",
+          "Url": "https://en.wikipedia.org/wiki/Audit",
+          "SegmentIndex": 2,
+          "SegmentCount": 15,
+          "Bytes": 180089,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\002_Wikipedia_-_Audit_full_page_seg02.jpg"
+        },
+        {
+          "Timestamp": "2026-09-24 06:12:26",
+          "CapturedAt": "2026-09-24T06:12:26.761-07:00",
+          "Sha256": "becc42028a9193e2c80c39b9db61ee29ad1f1551a07458d211b74ac943d395be",
+          "FileName": "002_Wikipedia_-_Audit_full_page_seg03.jpg",
+          "Url": "https://en.wikipedia.org/wiki/Audit",
+          "SegmentIndex": 3,
+          "SegmentCount": 15,
+          "Bytes": 208691,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\002_Wikipedia_-_Audit_full_page_seg03.jpg"
+        },
+        {
+          "Timestamp": "2026-09-24 06:12:27",
+          "CapturedAt": "2026-09-24T06:12:27.813-07:00",
+          "Sha256": "72d909ab0ea5cdcb24fccf0f1f162741c783a86a7c6eb284d44bdbce41588400",
+          "FileName": "002_Wikipedia_-_Audit_full_page_seg04.jpg",
+          "Url": "https://en.wikipedia.org/wiki/Audit",
+          "SegmentIndex": 4,
+          "SegmentCount": 15,
+          "Bytes": 242911,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\002_Wikipedia_-_Audit_full_page_seg04.jpg"
+        },
+        {
+          "Timestamp": "2026-09-24 06:12:28",
+          "CapturedAt": "2026-09-24T06:12:28.856-07:00",
+          "Sha256": "c3fdc79c74b1a451140718a4cef4acddda126c14e866c20f51534f0d7d956853",
+          "FileName": "002_Wikipedia_-_Audit_full_page_seg05.jpg",
+          "Url": "https://en.wikipedia.org/wiki/Audit",
+          "SegmentIndex": 5,
+          "SegmentCount": 15,
+          "Bytes": 204509,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\002_Wikipedia_-_Audit_full_page_seg05.jpg"
+        },
+        {
+          "Timestamp": "2026-09-24 06:12:29",
+          "CapturedAt": "2026-09-24T06:12:29.891-07:00",
+          "Sha256": "6e38473f17dcbdbbb2bace2f472d46db5627c0c3682b2397de46f0627e2b6107",
+          "FileName": "002_Wikipedia_-_Audit_full_page_seg06.jpg",
+          "Url": "https://en.wikipedia.org/wiki/Audit",
+          "SegmentIndex": 6,
+          "SegmentCount": 15,
+          "Bytes": 248439,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\002_Wikipedia_-_Audit_full_page_seg06.jpg"
+        },
+        {
+          "Timestamp": "2026-09-24 06:12:30",
+          "CapturedAt": "2026-09-24T06:12:30.952-07:00",
+          "Sha256": "ccffd06b0e4d9eca2fd0c76235974c00182f13f9b607f113df26d7ff5977efff",
+          "FileName": "002_Wikipedia_-_Audit_full_page_seg07.jpg",
+          "Url": "https://en.wikipedia.org/wiki/Audit",
+          "SegmentIndex": 7,
+          "SegmentCount": 15,
+          "Bytes": 268746,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\002_Wikipedia_-_Audit_full_page_seg07.jpg"
+        },
+        {
+          "Timestamp": "2026-09-24 06:12:31",
+          "CapturedAt": "2026-09-24T06:12:31.997-07:00",
+          "Sha256": "a3d39172cc9f2040589be1975d56542b9e1a17094cf271e12b084fc337ee67f2",
+          "FileName": "002_Wikipedia_-_Audit_full_page_seg08.jpg",
+          "Url": "https://en.wikipedia.org/wiki/Audit",
+          "SegmentIndex": 8,
+          "SegmentCount": 15,
+          "Bytes": 229261,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\002_Wikipedia_-_Audit_full_page_seg08.jpg"
+        },
+        {
+          "Timestamp": "2026-09-24 06:12:33",
+          "CapturedAt": "2026-09-24T06:12:33.060-07:00",
+          "Sha256": "6dc2a0b47cbf0ea7362aef0fb33516a4e54e6cd6ae45ebb9bf9fcab8d8835b5d",
+          "FileName": "002_Wikipedia_-_Audit_full_page_seg09.jpg",
+          "Url": "https://en.wikipedia.org/wiki/Audit",
+          "SegmentIndex": 9,
+          "SegmentCount": 15,
+          "Bytes": 211761,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\002_Wikipedia_-_Audit_full_page_seg09.jpg"
+        },
+        {
+          "Timestamp": "2026-09-24 06:12:34",
+          "CapturedAt": "2026-09-24T06:12:34.110-07:00",
+          "Sha256": "cef2de745bc14b6330a8c0025ec1a409cc5969a1c7e4a2dc77cd7f074b5464e4",
+          "FileName": "002_Wikipedia_-_Audit_full_page_seg10.jpg",
+          "Url": "https://en.wikipedia.org/wiki/Audit",
+          "SegmentIndex": 10,
+          "SegmentCount": 15,
+          "Bytes": 210585,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\002_Wikipedia_-_Audit_full_page_seg10.jpg"
+        },
+        {
+          "Timestamp": "2026-09-24 06:12:35",
+          "CapturedAt": "2026-09-24T06:12:35.162-07:00",
+          "Sha256": "8a03424edd1c9bc94ca7ea0f3f2d40894cf2e9f71e11effe34453146285d4946",
+          "FileName": "002_Wikipedia_-_Audit_full_page_seg11.jpg",
+          "Url": "https://en.wikipedia.org/wiki/Audit",
+          "SegmentIndex": 11,
+          "SegmentCount": 15,
+          "Bytes": 195451,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\002_Wikipedia_-_Audit_full_page_seg11.jpg"
+        },
+        {
+          "Timestamp": "2026-09-24 06:12:36",
+          "CapturedAt": "2026-09-24T06:12:36.215-07:00",
+          "Sha256": "1e91a476e52bd2ee314279c51d7ea9908f68218dd657da9094c32bd8dc61673d",
+          "FileName": "002_Wikipedia_-_Audit_full_page_seg12.jpg",
+          "Url": "https://en.wikipedia.org/wiki/Audit",
+          "SegmentIndex": 12,
+          "SegmentCount": 15,
+          "Bytes": 126018,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\002_Wikipedia_-_Audit_full_page_seg12.jpg"
+        },
+        {
+          "Timestamp": "2026-09-24 06:12:37",
+          "CapturedAt": "2026-09-24T06:12:37.263-07:00",
+          "Sha256": "53bd6b7d5c6575c07d206cfea94bdb784b1d11ff619a7c4277523d678334d86e",
+          "FileName": "002_Wikipedia_-_Audit_full_page_seg13.jpg",
+          "Url": "https://en.wikipedia.org/wiki/Audit",
+          "SegmentIndex": 13,
+          "SegmentCount": 15,
+          "Bytes": 199945,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\002_Wikipedia_-_Audit_full_page_seg13.jpg"
+        },
+        {
+          "Timestamp": "2026-09-24 06:12:38",
+          "CapturedAt": "2026-09-24T06:12:38.311-07:00",
+          "Sha256": "446007dc9d79a4ff3a6e47fe9d07433b3b7d891bd442f365717d29c44a4754ce",
+          "FileName": "002_Wikipedia_-_Audit_full_page_seg14.jpg",
+          "Url": "https://en.wikipedia.org/wiki/Audit",
+          "SegmentIndex": 14,
+          "SegmentCount": 15,
+          "Bytes": 208032,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\002_Wikipedia_-_Audit_full_page_seg14.jpg"
+        },
+        {
+          "Timestamp": "2026-09-24 06:12:39",
+          "CapturedAt": "2026-09-24T06:12:39.356-07:00",
+          "Sha256": "71414f94b242629ac9a0f0fd6762ea068ac25d8cdb96b2c6aa4b87e0aa619d38",
+          "FileName": "002_Wikipedia_-_Audit_full_page_seg15.jpg",
+          "Url": "https://en.wikipedia.org/wiki/Audit",
+          "SegmentIndex": 15,
+          "SegmentCount": 15,
+          "Bytes": 153622,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\002_Wikipedia_-_Audit_full_page_seg15.jpg"
+        }
+      ]
+    },
+    {
+      "Index": 3,
+      "Name": "Python.org - Downloads via clicktext",
+      "Url": "https://www.python.org/",
+      "FinalUrl": "https://www.python.org/downloads/",
+      "Status": "OK",
+      "HttpStatus": 200,
+      "ScrollFullPage": false,
+      "Details": [],
+      "Steps": [
+        {
+          "Text": "clicktext:Downloads",
+          "Ok": true,
+          "Message": ""
+        }
+      ],
+      "Captures": [
+        {
+          "Timestamp": "2026-09-24 06:12:44",
+          "CapturedAt": "2026-09-24T06:12:44.355-07:00",
+          "Sha256": "25f2571c451ef27042d1e55e2444da1718c1183dbe87806bdcbf49d46f115060",
+          "FileName": "003_Python.org_-_Downloads_via_clicktext_seg01.jpg",
+          "Url": "https://www.python.org/downloads/",
+          "SegmentIndex": 1,
+          "SegmentCount": 1,
+          "Bytes": 134159,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\003_Python.org_-_Downloads_via_clicktext_seg01.jpg"
+        }
+      ]
+    },
+    {
+      "Index": 4,
+      "Name": "Hacker News - newest via selector",
+      "Url": "https://news.ycombinator.com/",
+      "FinalUrl": "https://news.ycombinator.com/newest",
+      "Status": "OK",
+      "HttpStatus": 200,
+      "ScrollFullPage": false,
+      "Details": [],
+      "Steps": [
+        {
+          "Text": "click:a[href='newest']",
+          "Ok": true,
+          "Message": ""
+        }
+      ],
+      "Captures": [
+        {
+          "Timestamp": "2026-09-24 06:12:49",
+          "CapturedAt": "2026-09-24T06:12:49.482-07:00",
+          "Sha256": "81ce6827b1b8e7785fbda79c9924b9792cfce1f1bd554702af3cc7a9e0b8232b",
+          "FileName": "004_Hacker_News_-_newest_via_selector_seg01.jpg",
+          "Url": "https://news.ycombinator.com/newest",
+          "SegmentIndex": 1,
+          "SegmentCount": 1,
+          "Bytes": 169125,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\004_Hacker_News_-_newest_via_selector_seg01.jpg"
+        }
+      ]
+    },
+    {
+      "Index": 5,
+      "Name": "GitHub - vouch repository",
+      "Url": "https://github.com/pwsh/vouch",
+      "FinalUrl": "https://github.com/pwsh/vouch",
+      "Status": "OK",
+      "HttpStatus": 200,
+      "ScrollFullPage": false,
+      "Details": [],
+      "Steps": [],
+      "Captures": [
+        {
+          "Timestamp": "2026-09-24 06:12:53",
+          "CapturedAt": "2026-09-24T06:12:53.418-07:00",
+          "Sha256": "53b7664f8e9aa3d64895c526fe94b394d32326e3f41b301c10aa386e071312d5",
+          "FileName": "005_GitHub_-_vouch_repository_seg01.jpg",
+          "Url": "https://github.com/pwsh/vouch",
+          "SegmentIndex": 1,
+          "SegmentCount": 1,
+          "Bytes": 132387,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\005_GitHub_-_vouch_repository_seg01.jpg"
+        }
+      ]
+    },
+    {
+      "Index": 6,
+      "Name": "GitHub - missing page",
+      "Url": "https://github.com/pwsh/vouch-live-test-page-that-does-not-exist",
+      "FinalUrl": "https://github.com/pwsh/vouch-live-test-page-that-does-not-exist",
+      "Status": "FAILED",
+      "HttpStatus": 404,
+      "ScrollFullPage": false,
+      "Details": [
+        "The server returned HTTP 404. The error page is captured below as evidence."
+      ],
+      "Steps": [],
+      "Captures": [
+        {
+          "Timestamp": "2026-09-24 06:12:56",
+          "CapturedAt": "2026-09-24T06:12:56.546-07:00",
+          "Sha256": "b19bb74c5fc1d9cdc76b2fbd17061230fe40689807d604ecc42fb8737411bf42",
+          "FileName": "006_GitHub_-_missing_page_seg01.jpg",
+          "Url": "https://github.com/pwsh/vouch-live-test-page-that-does-not-exist",
+          "SegmentIndex": 1,
+          "SegmentCount": 1,
+          "Bytes": 105322,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\006_GitHub_-_missing_page_seg01.jpg"
+        }
+      ]
+    },
+    {
+      "Index": 7,
+      "Name": "httpbin - 404 with an empty body",
+      "Url": "https://httpbin.org/status/404",
+      "FinalUrl": "https://httpbin.org/status/404",
+      "Status": "FAILED",
+      "HttpStatus": 404,
+      "ScrollFullPage": false,
+      "Details": [
+        "The server returned an HTTP error with an empty body (net::ERR_HTTP_RESPONSE_CODE_FAILURE). The browser's error page is captured below as evidence.",
+        "The server returned HTTP 404. The error page is captured below as evidence."
+      ],
+      "Steps": [],
+      "Captures": [
+        {
+          "Timestamp": "2026-09-24 06:12:59",
+          "CapturedAt": "2026-09-24T06:12:59.575-07:00",
+          "Sha256": "687579ac6b3151d85bff4ef23385695d669a8ec02566d13987ea6fe1cea4a5dc",
+          "FileName": "007_httpbin_-_404_with_an_empty_body_seg01.jpg",
+          "Url": "https://httpbin.org/status/404",
+          "SegmentIndex": 1,
+          "SegmentCount": 1,
+          "Bytes": 58673,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\007_httpbin_-_404_with_an_empty_body_seg01.jpg"
+        }
+      ]
+    },
+    {
+      "Index": 8,
+      "Name": "Plain http upgraded to https",
+      "Url": "http://example.com/",
+      "FinalUrl": "https://example.com/",
+      "Status": "OK",
+      "HttpStatus": 200,
+      "ScrollFullPage": false,
+      "Details": [],
+      "Steps": [],
+      "Captures": [
+        {
+          "Timestamp": "2026-09-24 06:13:02",
+          "CapturedAt": "2026-09-24T06:13:02.262-07:00",
+          "Sha256": "83a2eec6042fa9ed50ecc8ee2ffc785fa86f66f4e0c939b0002fc1b77ba79a63",
+          "FileName": "008_Plain_http_upgraded_to_https_seg01.jpg",
+          "Url": "https://example.com/",
+          "SegmentIndex": 1,
+          "SegmentCount": 1,
+          "Bytes": 50940,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\008_Plain_http_upgraded_to_https_seg01.jpg"
+        }
+      ]
+    },
+    {
+      "Index": 9,
+      "Name": "Step that cannot succeed",
+      "Url": "https://example.com/",
+      "FinalUrl": "https://example.com/",
+      "Status": "WARNING",
+      "HttpStatus": 200,
+      "ScrollFullPage": false,
+      "Details": [
+        "Completed with errors: 1 of 2 step(s) failed."
+      ],
+      "Steps": [
+        {
+          "Text": "clicktext:No Such Link Anywhere",
+          "Ok": false,
+          "Message": "No clickable element with the text 'No Such Link Anywhere' was found."
+        },
+        {
+          "Text": "wait:1",
+          "Ok": true,
+          "Message": ""
+        }
+      ],
+      "Captures": [
+        {
+          "Timestamp": "2026-09-24 06:13:05",
+          "CapturedAt": "2026-09-24T06:13:05.872-07:00",
+          "Sha256": "b24075f22726eb33e5359ff17403368aeaf4f666d5a392aeda1195171304b6eb",
+          "FileName": "009_Step_that_cannot_succeed_seg01.jpg",
+          "Url": "https://example.com/",
+          "SegmentIndex": 1,
+          "SegmentCount": 1,
+          "Bytes": 50922,
+          "FilePath": "C:\\repo\\vouch\\tests\\live\\output\\2026-09-24_061204\\images\\live-test\\009_Step_that_cannot_succeed_seg01.jpg"
+        }
+      ]
+    },
+    {
+      "Index": 10,
+      "Name": "Unreachable host",
+      "Url": "https://vouch-live-test.invalid/",
+      "FinalUrl": "",
+      "Status": "FAILED",
+      "HttpStatus": 0,
+      "ScrollFullPage": false,
+      "Details": [
+        "The page could not be loaded: net::ERR_NAME_NOT_RESOLVED"
+      ],
+      "Steps": [],
+      "Captures": []
+    }
+  ]
+}

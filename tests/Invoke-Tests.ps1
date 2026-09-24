@@ -42,7 +42,7 @@ if ($ScriptPath) { $env:VOUCH_PATH = (Resolve-Path -LiteralPath $ScriptPath).Pat
 
 $config = New-PesterConfiguration
 $config.Run.Path = if ($UnitOnly) {
-    @((Join-Path $PSScriptRoot 'Vouch.Unit.Tests.ps1'), (Join-Path $PSScriptRoot 'Schedule.Unit.Tests.ps1'))
+    @('Vouch.Unit.Tests.ps1', 'Schedule.Unit.Tests.ps1', 'Integrity.Unit.Tests.ps1' | ForEach-Object { Join-Path $PSScriptRoot $_ })
 }
 else { $PSScriptRoot }
 $config.Run.Exit = $true

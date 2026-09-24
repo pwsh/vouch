@@ -55,8 +55,11 @@ one-time step. Repeat it whenever a session expires or you add a new application
 # Another definition file and output folder
 .\vouch.ps1 -CsvPath .\q3-itgc.csv -OutputDir C:\Audit\2026-Q3
 
-# Also keep the individual images next to the report (reports\images\)
+# Also keep the individual images, with a SHA256SUMS file (reports\images\<report name>\)
 .\vouch.ps1 -SaveImages
+
+# Check a report (and its saved images) has not changed since it was made
+.\vouch.ps1 -Verify .\reports\VouchReport_2026-09-24_061204.html
 
 # Leave the browser open afterwards, e.g. to debug a selector
 .\vouch.ps1 -KeepBrowserOpen
@@ -69,7 +72,7 @@ Useful switches: `-SettleSeconds` (pause after load and after each click, defaul
 `-ScrollSettleSeconds` (pause after each scroll so lazy content can load, default 1),
 `-MaxScrollSegments` (cap per page, default 30), `-NavigationTimeoutSec` (default 30),
 `-JpegQuality` (default 85), `-DebugPort` (default 9222), `-FailOnWarning`,
-`-LogDir` (write a log of the run to that folder), `-JsonSummary` (also write the
+`-LogDir` (write a log of the run to that folder), `-Verify` (check a report), `-JsonSummary` (also write the
 results as `.json` next to the report, for monitoring or scripts).
 Run `Get-Help .\vouch.ps1 -Detailed` for the full list.
 
@@ -83,6 +86,53 @@ files without a "Start in" setting.
 | `1` | The run could not start: bad CSV, Edge not found, DevTools port unavailable. |
 | `2` | At least one item failed. |
 | `3` | Only with `-FailOnWarning`: nothing failed, but at least one item has a warning — for example an expired session redirecting to a sign-in page. Use this for scheduled jobs so an expired login does not look like a successful run. |
+| `4` | Only with `-Verify`: at least one integrity check failed. |
+
+## Image metadata, hashes and verification
+
+A complete example report — ten public websites, with its images and hashes — is in
+[`examples/live-test-2026-09-24`](examples/README.md).
+
+Every screenshot carries its own description **inside the image file**, so it still says
+what it is when it is separated from the report:
+
+| Where | JPEG (default) | PNG |
+| --- | --- | --- |
+| Page name and URL | EXIF *Title* / *ImageDescription* | `Title`, `Description` text chunks |
+| Capture time | EXIF *Date taken* (local time) | `Creation Time` |
+| Who captured it | EXIF *Author* (`DOMAIN\user`) | `Author` |
+| Tool and version | EXIF *Program name* | `Software` |
+| Everything, as JSON | EXIF *Comments* | `Vouch` |
+
+The JSON holds the run ID, item name and number, requested URL, the page URL at the
+moment of capture, the capture time to the millisecond with its UTC offset and in UTC,
+the segment ("3 of 15"), computer, user and screen size. Windows Explorer shows these
+under *Properties → Details*; any EXIF viewer (e.g. `exiftool`) shows them too.
+
+After the metadata is written, the file is hashed with **SHA-256**. The hash is printed
+under each screenshot in the report, listed in the report's *Integrity* section and the
+JSON summary, and — with `-SaveImages` — written to `SHA256SUMS` next to the images,
+in the standard format:
+
+```powershell
+Get-FileHash .\reports\images\VouchReport_...\001_Example_Domain_seg01.jpg   # one image
+sha256sum -c SHA256SUMS                                                       # all of them (Git Bash, WSL, Linux)
+```
+
+The **manifest SHA-256** at the top of the report is the hash of that list — one value
+that covers every image of the run. Copy it into the workpaper (or the e-mail that sends
+the report) when the evidence is taken.
+
+`.\vouch.ps1 -Verify <report.html>` re-checks a report later, on any Windows machine with
+PowerShell 7 (no browser needed): it re-hashes every embedded screenshot, confirms the
+metadata inside each image matches the report's capture time and URL, recomputes the
+manifest hash, and checks the saved images against `SHA256SUMS`. It exits 0 when
+everything matches and 4 when anything does not.
+
+What this does and does not prove: `-Verify` shows the report, the images and the manifest
+are consistent with each other. Someone who rebuilt every image *and* every hash could
+make a consistent forgery — the defence is the manifest hash you recorded somewhere else
+at capture time. If it matches, nothing has changed since.
 
 ## Keeping other applications out of the evidence
 

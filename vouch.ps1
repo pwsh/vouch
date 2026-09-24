@@ -24,6 +24,12 @@
     example an expired session redirecting to a sign-in page). Without it, warnings
     exit with 0.
 
+.PARAMETER Verify
+    Check a report instead of capturing: re-hash every embedded screenshot, compare the
+    metadata inside each image with the report, recompute the manifest hash, and check
+    saved images against SHA256SUMS. Exit code 0 when everything matches, 4 when not.
+    Needs no browser. Example: .\vouch.ps1 -Verify .\reports\VouchReport_2026-09-24_060231.html
+
 .PARAMETER UseVirtualDesktop
     Capture on a fresh virtual desktop (Task View) that the run opens and closes again,
     so other open applications are not in the taskbar of the evidence. Pinned taskbar
@@ -95,13 +101,15 @@ param(
 
     [switch]$UseVirtualDesktop,
 
+    [string]$Verify = '',
+
     [switch]$LoginSetup
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion       = '1.1.0'
+$script:ToolVersion       = '1.2.0'
 $script:ExitCode          = 0
 $script:CdpSocket         = $null
 $script:CdpWebSocketUrl   = ''
@@ -169,6 +177,31 @@ namespace Vouch
 
     [ComImport, Guid("aa509086-5ca9-4c25-8f95-589d3c07b48a")]
     public class VirtualDesktopManagerClass { }
+
+    // CRC-32 as used by PNG chunks (ISO 3309 polynomial).
+    public static class Crc32
+    {
+        private static readonly uint[] Table = Build();
+
+        private static uint[] Build()
+        {
+            var table = new uint[256];
+            for (uint n = 0; n < 256; n++)
+            {
+                uint c = n;
+                for (int k = 0; k < 8; k++) { c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1; }
+                table[n] = c;
+            }
+            return table;
+        }
+
+        public static uint Compute(byte[] data)
+        {
+            uint c = 0xFFFFFFFFu;
+            foreach (byte b in data) { c = Table[(c ^ b) & 0xFF] ^ (c >> 8); }
+            return c ^ 0xFFFFFFFFu;
+        }
+    }
 
     public static class VirtualDesktop
     {
@@ -1046,14 +1079,253 @@ function Invoke-DesktopShortcut {
     return $false
 }
 
+#region Image metadata ----------------------------------------------------------
+
+function New-CaptureMetadata {
+    <#
+        What each image carries inside itself, so it still says what it is when it is
+        separated from the report: which page, when (local with offset, and UTC), which
+        run, by whom and where.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][int]$ItemIndex,
+        [Parameter(Mandatory)][string]$ItemName,
+        [Parameter(Mandatory)][string]$RequestedUrl,
+        [AllowEmptyString()][string]$PageUrl = '',
+        [Parameter(Mandatory)][System.DateTimeOffset]$CapturedAt,
+        [Parameter(Mandatory)][int]$SegmentIndex,
+        [Parameter(Mandatory)][int]$SegmentCount,
+        [string]$Computer = $env:COMPUTERNAME,
+        [string]$User = "$env:USERDOMAIN\$env:USERNAME",
+        [string]$Screen = ''
+    )
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    return [ordered]@{
+        Tool          = "vouch.ps1 $($script:ToolVersion)"
+        RunId         = $RunId
+        ItemIndex     = $ItemIndex
+        ItemName      = $ItemName
+        RequestedUrl  = $RequestedUrl
+        PageUrl       = $PageUrl
+        CapturedAt    = $CapturedAt.ToString('yyyy-MM-ddTHH:mm:ss.fffzzz', $invariant)
+        CapturedAtUtc = $CapturedAt.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss.fffZ', $invariant)
+        Segment       = "$SegmentIndex of $SegmentCount"
+        Computer      = $Computer
+        User          = $User
+        Screen        = $Screen
+    }
+}
+
+function New-ExifPropertyItem {
+    # PropertyItem has no public constructor; GDI+ only needs the four fields set.
+    param([int]$Id, [int16]$Type, [byte[]]$Value)
+    $item = [System.Runtime.CompilerServices.RuntimeHelpers]::GetUninitializedObject([System.Drawing.Imaging.PropertyItem])
+    $item.Id = $Id
+    $item.Type = $Type
+    $item.Len = $Value.Length
+    $item.Value = $Value
+    return $item
+}
+
+function Set-JpegMetadata {
+    <#
+        Standard EXIF fields - shown by Windows Explorer under Properties > Details and
+        by any EXIF viewer - plus the complete metadata as JSON in the XP comment.
+        EXIF text fields are ASCII; non-ASCII characters there become '?', the JSON
+        comment (UTF-16) keeps them.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Drawing.Image]$Image,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Metadata
+    )
+    $ascii = { param([string]$Text) [System.Text.Encoding]::ASCII.GetBytes($Text + [char]0) }
+    $unicode = { param([string]$Text) [System.Text.Encoding]::Unicode.GetBytes($Text + [char]0) }
+    $captured = [System.DateTimeOffset]::Parse($Metadata.CapturedAt, [System.Globalization.CultureInfo]::InvariantCulture)
+    $exifTime = $captured.ToString('yyyy:MM:dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
+    $json = $Metadata | ConvertTo-Json -Compress
+
+    $fields = @(
+        @(0x010E, 2, (& $ascii "$($Metadata.ItemName) - $($Metadata.PageUrl)")),   # ImageDescription
+        @(0x013B, 2, (& $ascii $Metadata.User)),                                     # Artist
+        @(0x0131, 2, (& $ascii $Metadata.Tool)),                                     # Software
+        @(0x0132, 2, (& $ascii $exifTime)),                                          # DateTime
+        @(0x9003, 2, (& $ascii $exifTime)),                                          # DateTimeOriginal
+        @(0x9C9B, 1, (& $unicode $Metadata.ItemName)),                               # XPTitle
+        @(0x9C9C, 1, (& $unicode $json)),                                            # XPComment
+        @(0x9C9E, 1, (& $unicode 'vouch;audit evidence'))                            # XPKeywords
+    )
+    foreach ($field in $fields) {
+        $Image.SetPropertyItem((New-ExifPropertyItem -Id $field[0] -Type $field[1] -Value $field[2]))
+    }
+}
+
+function Add-PngTextChunks {
+    <#
+        Inserts iTXt (UTF-8 text) chunks before IEND. Keywords follow the PNG spec's
+        predefined ones where they fit; "Vouch" holds the complete metadata as JSON.
+    #>
+    param(
+        [Parameter(Mandatory)][byte[]]$Png,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Metadata
+    )
+    $iendOffset = $Png.Length - 12
+    if ($iendOffset -lt 8 -or [System.Text.Encoding]::ASCII.GetString($Png, $iendOffset + 4, 4) -ne 'IEND') {
+        throw 'Not a PNG image ending in an IEND chunk.'
+    }
+
+    $captured = [System.DateTimeOffset]::Parse($Metadata.CapturedAt, [System.Globalization.CultureInfo]::InvariantCulture)
+    $entries = [ordered]@{
+        'Title'         = $Metadata.ItemName
+        'Description'   = "$($Metadata.ItemName) - $($Metadata.PageUrl)"
+        'Author'        = $Metadata.User
+        'Software'      = $Metadata.Tool
+        'Creation Time' = $captured.ToString('R', [System.Globalization.CultureInfo]::InvariantCulture)
+        'Vouch'         = ($Metadata | ConvertTo-Json -Compress)
+    }
+
+    $output = [System.IO.MemoryStream]::new()
+    try {
+        $output.Write($Png, 0, $iendOffset)
+        foreach ($key in $entries.Keys) {
+            # keyword NUL, compression flag 0, method 0, empty language NUL, empty translated keyword NUL, text
+            $body = [System.Collections.Generic.List[byte]]::new()
+            $body.AddRange([System.Text.Encoding]::Latin1.GetBytes($key))
+            $body.AddRange([byte[]](0, 0, 0, 0, 0))
+            $body.AddRange([System.Text.Encoding]::UTF8.GetBytes([string]$entries[$key]))
+            $typeAndData = [byte[]]([System.Text.Encoding]::ASCII.GetBytes('iTXt') + $body.ToArray())
+            $length = [System.BitConverter]::GetBytes([uint32]$body.Count)
+            $crc = [System.BitConverter]::GetBytes([Vouch.Crc32]::Compute($typeAndData))
+            if ([System.BitConverter]::IsLittleEndian) { [array]::Reverse($length); [array]::Reverse($crc) }
+            $output.Write($length, 0, 4)
+            $output.Write($typeAndData, 0, $typeAndData.Length)
+            $output.Write($crc, 0, 4)
+        }
+        $output.Write($Png, $iendOffset, 12)
+        return , $output.ToArray()
+    }
+    finally {
+        $output.Dispose()
+    }
+}
+
+function Get-PngTextChunks {
+    # Reads tEXt and uncompressed iTXt chunks into a keyword -> text dictionary.
+    param([Parameter(Mandatory)][byte[]]$Png)
+    $result = [ordered]@{}
+    $offset = 8
+    while ($offset + 12 -le $Png.Length) {
+        $lengthBytes = $Png[$offset..($offset + 3)]
+        if ([System.BitConverter]::IsLittleEndian) { [array]::Reverse($lengthBytes) }
+        $length = [System.BitConverter]::ToUInt32([byte[]]$lengthBytes, 0)
+        $type = [System.Text.Encoding]::ASCII.GetString($Png, $offset + 4, 4)
+        $dataStart = $offset + 8
+        if ($type -in 'tEXt', 'iTXt' -and $length -gt 0) {
+            $data = [byte[]]$Png[$dataStart..($dataStart + $length - 1)]
+            $nul = [array]::IndexOf($data, [byte]0)
+            if ($nul -gt 0) {
+                $keyword = [System.Text.Encoding]::Latin1.GetString($data, 0, $nul)
+                if ($type -eq 'tEXt') {
+                    $result[$keyword] = [System.Text.Encoding]::Latin1.GetString($data, $nul + 1, $data.Length - $nul - 1)
+                }
+                elseif ($data[$nul + 1] -eq 0) {
+                    # skip compression flag and method, then the language tag and translated keyword
+                    $position = $nul + 3
+                    $position = [array]::IndexOf($data, [byte]0, $position) + 1
+                    $position = [array]::IndexOf($data, [byte]0, $position) + 1
+                    $result[$keyword] = [System.Text.Encoding]::UTF8.GetString($data, $position, $data.Length - $position)
+                }
+            }
+        }
+        if ($type -eq 'IEND') { break }
+        $offset = $dataStart + $length + 4
+    }
+    return $result
+}
+
+function ConvertFrom-MetadataJson {
+    <#
+        ConvertFrom-Json turns ISO 8601 strings into DateTime objects (dropping the exact
+        text, and before PowerShell 7.5 there is no switch to stop it). Evidence metadata
+        must come back exactly as written, so read it with System.Text.Json: strings stay
+        strings, numbers keep their text.
+    #>
+    param([Parameter(Mandatory)][string]$Json)
+    $document = [System.Text.Json.JsonDocument]::Parse($Json)
+    try {
+        $result = [ordered]@{}
+        foreach ($property in $document.RootElement.EnumerateObject()) {
+            $value = $property.Value
+            $result[$property.Name] = switch ($value.ValueKind) {
+                'String' { $value.GetString() }
+                'Number' { if ($value.TryGetInt64([ref]$null)) { $value.GetInt64() } else { $value.GetDouble() } }
+                'True'   { $true }
+                'False'  { $false }
+                'Null'   { $null }
+                default  { $value.GetRawText() }
+            }
+        }
+        return [pscustomobject]$result
+    }
+    finally {
+        $document.Dispose()
+    }
+}
+
+function Get-ImageMetadata {
+    <#
+        Returns the metadata a Vouch capture carries (the JSON written at capture time),
+        or $null when the image has none.
+    #>
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+
+    $isPng = $Bytes.Length -gt 8 -and $Bytes[0] -eq 0x89 -and $Bytes[1] -eq 0x50 -and $Bytes[2] -eq 0x4E -and $Bytes[3] -eq 0x47
+    try {
+        if ($isPng) {
+            $text = Get-PngTextChunks -Png $Bytes
+            if ($text.Contains('Vouch')) { return (ConvertFrom-MetadataJson -Json $text['Vouch']) }
+            return $null
+        }
+        $stream = [System.IO.MemoryStream]::new($Bytes)
+        try {
+            $image = [System.Drawing.Image]::FromStream($stream, $false, $false)
+            try {
+                if ($image.PropertyIdList -contains 0x9C9C) {
+                    $json = [System.Text.Encoding]::Unicode.GetString($image.GetPropertyItem(0x9C9C).Value).TrimEnd([char]0)
+                    return (ConvertFrom-MetadataJson -Json $json)
+                }
+            }
+            finally {
+                $image.Dispose()
+            }
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+    catch {
+        Write-Verbose "Could not read image metadata: $($_.Exception.Message)"
+    }
+    return $null
+}
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+    return [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant()
+}
+
+#endregion
+
 function Get-ScreenCapture {
     <#
         Real screen capture of the primary display, so the taskbar clock is included in
-        the evidence. Requires an unlocked, visible desktop.
+        the evidence. Requires an unlocked, visible desktop. With -Metadata the image
+        carries it inside (EXIF for JPEG, text chunks for PNG).
     #>
     param(
         [Parameter(Mandatory)][ValidateSet('jpeg', 'png')][string]$Format,
-        [int]$Quality = 85
+        [int]$Quality = 85,
+        [System.Collections.IDictionary]$Metadata = $null
     )
 
     $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
@@ -1069,29 +1341,31 @@ function Get-ScreenCapture {
 
         $stream = [System.IO.MemoryStream]::new()
         try {
+            $encoder = $null
             if ($Format -eq 'jpeg') {
                 $encoder = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() |
                     Where-Object { $_.MimeType -eq 'image/jpeg' } |
                     Select-Object -First 1
-                if ($null -eq $encoder) {
-                    $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
-                }
-                else {
-                    $encoderParameters = [System.Drawing.Imaging.EncoderParameters]::new(1)
-                    try {
-                        $encoderParameters.Param[0] = [System.Drawing.Imaging.EncoderParameter]::new([System.Drawing.Imaging.Encoder]::Quality, [int64]$Quality)
-                        $bitmap.Save($stream, $encoder, $encoderParameters)
-                    }
-                    finally {
-                        $encoderParameters.Dispose()
-                    }
-                }
             }
-            else {
-                $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+            if ($null -ne $encoder) {
+                if ($null -ne $Metadata) { Set-JpegMetadata -Image $bitmap -Metadata $Metadata }
+                $encoderParameters = [System.Drawing.Imaging.EncoderParameters]::new(1)
+                try {
+                    $encoderParameters.Param[0] = [System.Drawing.Imaging.EncoderParameter]::new([System.Drawing.Imaging.Encoder]::Quality, [int64]$Quality)
+                    $bitmap.Save($stream, $encoder, $encoderParameters)
+                }
+                finally {
+                    $encoderParameters.Dispose()
+                }
+                # The leading comma keeps the byte array intact instead of streaming it out byte by byte.
+                return , $stream.ToArray()
             }
-            # The leading comma keeps the byte array intact instead of streaming it out byte by byte.
-            return , $stream.ToArray()
+
+            # PNG (asked for, or no JPEG encoder available).
+            $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+            $png = $stream.ToArray()
+            if ($null -ne $Metadata) { $png = Add-PngTextChunks -Png $png -Metadata $Metadata }
+            return , $png
         }
         finally {
             $stream.Dispose()
@@ -1338,18 +1612,66 @@ function New-CaptureRecord {
         [Parameter(Mandatory)][AllowEmptyString()][string]$Url,
         [Parameter(Mandatory)][int]$SegmentIndex,
         [Parameter(Mandatory)][int]$SegmentCount,
-        [string]$FilePath = ''
+        [string]$FilePath = '',
+        [string]$FileName = '',
+        [System.Nullable[System.DateTimeOffset]]$CapturedAt = $null
     )
 
+    # PowerShell hands a Nullable parameter over already unwrapped.
+    $when = if ($null -ne $CapturedAt) { [System.DateTimeOffset]$CapturedAt } else { [System.DateTimeOffset]::Now }
     return [pscustomobject]@{
-        Timestamp    = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        Timestamp    = $when.ToString('yyyy-MM-dd HH:mm:ss')
+        CapturedAt   = $when.ToString('yyyy-MM-ddTHH:mm:ss.fffzzz', [System.Globalization.CultureInfo]::InvariantCulture)
         Url          = $Url
         SegmentIndex = $SegmentIndex
         SegmentCount = $SegmentCount
         Base64       = [Convert]::ToBase64String($Bytes)
         Bytes        = $Bytes.Length
+        Sha256       = Get-Sha256Hex -Bytes $Bytes
+        FileName     = $FileName
         FilePath     = $FilePath
     }
+}
+
+function Add-ItemCapture {
+    <#
+        One screenshot for an item: stamp the metadata, capture, save (with -SaveImages)
+        and record the SHA-256 of the exact bytes that went into the report and the file.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Item,
+        [Parameter(Mandatory)][int]$SegmentIndex,
+        [Parameter(Mandatory)][int]$SegmentCount,
+        [AllowEmptyString()][string]$PageUrl = '',
+        [Parameter(Mandatory)][hashtable]$Context
+    )
+
+    $fileName = '{0:d3}_{1}_seg{2:d2}.{3}' -f $Item.Index, (Get-SafeFileName -Name $Item.Name), $SegmentIndex, $Context.Extension
+    $capturedAt = [System.DateTimeOffset]::Now
+    $metadata = New-CaptureMetadata -RunId $Context.RunId -ItemIndex $Item.Index -ItemName $Item.Name -RequestedUrl $Item.Url `
+        -PageUrl $PageUrl -CapturedAt $capturedAt -SegmentIndex $SegmentIndex -SegmentCount $SegmentCount -Screen $Context.Screen
+    $bytes = Get-ScreenCapture -Format $Context.Format -Quality $Context.Quality -Metadata $metadata
+
+    $filePath = ''
+    if ($Context.SaveImages) {
+        $filePath = Join-Path -Path $Context.ImagesDir -ChildPath $fileName
+        [System.IO.File]::WriteAllBytes($filePath, $bytes)
+    }
+    $Item.Captures.Add((New-CaptureRecord -Bytes $bytes -Url $PageUrl -SegmentIndex $SegmentIndex -SegmentCount $SegmentCount `
+        -FilePath $filePath -FileName $fileName -CapturedAt $capturedAt))
+}
+
+function Get-CaptureManifest {
+    <#
+        "<sha256>  <file name>" per screenshot, in sha256sum format: the same text is
+        saved as SHA256SUMS next to the images (sha256sum -c works on it) and its own
+        SHA-256 is the run's manifest hash - one value that covers every image.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items)
+    $lines = foreach ($item in $Items) {
+        foreach ($capture in $item.Captures) { "$($capture.Sha256)  $($capture.FileName)" }
+    }
+    return (@($lines) -join "`n") + "`n"
 }
 
 function Get-CurrentPageUrl {
@@ -1397,6 +1719,8 @@ function New-HtmlReport {
     )
 
     $mimeType = if ($Run.ImageFormat -eq 'png') { 'image/png' } else { 'image/jpeg' }
+    $runId = if ($Run.PSObject.Properties['RunId']) { [string]$Run.RunId } else { '' }
+    $manifestHash = if ($Run.PSObject.Properties['ManifestSha256']) { [string]$Run.ManifestSha256 } else { '' }
 
     $css = @'
 :root { color-scheme: light; }
@@ -1440,6 +1764,9 @@ ul.steps code { background: #f0f3f5; padding: 1px 5px; border-radius: 3px; }
 figure { margin: 0 0 22px 0; page-break-inside: avoid; break-inside: avoid; }
 figure img { display: block; width: 100%; max-width: 100%; height: auto; border: 1px solid #7d8894; }
 figcaption { font-size: 12px; color: #4a545e; padding: 6px 2px 0 2px; border-bottom: 1px solid #eceff2; word-break: break-all; }
+figcaption .hash, table.hashes code, .manifest code { font-family: Consolas, "Cascadia Mono", monospace; font-size: 11px; }
+.manifest { background: #f7f9fa; border-left: 3px solid #12507d; padding: 8px 12px; }
+.integrity-note { color: #3a4149; }
 .empty { color: #8a5a00; font-style: italic; }
 footer { margin-top: 46px; padding-top: 12px; border-top: 1px solid #d5dbe1; color: #5a6570; font-size: 12px; }
 a { color: #12507d; }
@@ -1480,7 +1807,9 @@ a { color: #12507d; }
         [pscustomobject]@{ Label = 'Capture tool';      Text = "vouch.ps1 v$($Run.ToolVersion)" },
         [pscustomobject]@{ Label = 'Definition file';   Text = $Run.CsvPath },
         [pscustomobject]@{ Label = 'Image format';      Text = $Run.ImageDescription },
-        [pscustomobject]@{ Label = 'Screen resolution'; Text = $Run.ScreenResolution }
+        [pscustomobject]@{ Label = 'Screen resolution'; Text = $Run.ScreenResolution },
+        [pscustomobject]@{ Label = 'Run ID';            Text = $runId },
+        [pscustomobject]@{ Label = 'Manifest SHA-256';  Text = $manifestHash }
     )
     foreach ($row in $metaRows) {
         [void]$sb.AppendLine("<tr><td class=""k"">$(Encode-Html $row.Label)</td><td>$(Encode-Html ([string]$row.Text))</td></tr>")
@@ -1511,6 +1840,22 @@ a { color: #12507d; }
             "<td><span class=""$badgeClass"">$(Encode-Html $item.Status)</span></td>" +
             "<td>$details</td>" +
             "<td>$($item.Captures.Count)</td></tr>")
+    }
+    [void]$sb.AppendLine('</tbody></table>')
+
+    [void]$sb.AppendLine('<h2>Integrity</h2>')
+    [void]$sb.AppendLine('<p class="integrity-note">Each screenshot carries its own metadata (page, capture time, run ID, computer and user) ' +
+        'inside the image file, and is identified below by the SHA-256 hash of that file. The manifest hash covers all of them at once: ' +
+        'record it in the workpaper at capture time, and anyone can later confirm the evidence is unchanged with ' +
+        '<code>vouch.ps1 -Verify &lt;report&gt;</code>, or check saved images with <code>sha256sum -c SHA256SUMS</code>.</p>')
+    [void]$sb.AppendLine("<p class=""manifest"" data-manifest-sha256=""$(Encode-Html $manifestHash)"">Run ID <code>$(Encode-Html $runId)</code><br>" +
+        "Manifest SHA-256 <code>$(Encode-Html $manifestHash)</code></p>")
+    [void]$sb.AppendLine('<table class="summary hashes"><thead><tr><th>#</th><th>File</th><th>Captured</th><th>SHA-256</th></tr></thead><tbody>')
+    foreach ($item in $Items) {
+        foreach ($capture in $item.Captures) {
+            [void]$sb.AppendLine("<tr><td><a href=""#item-$($item.Index)"">$($item.Index)</a></td><td>$(Encode-Html $capture.FileName)</td>" +
+                "<td>$(Encode-Html $capture.CapturedAt)</td><td><code>$($capture.Sha256)</code></td></tr>")
+        }
     }
     [void]$sb.AppendLine('</tbody></table>')
 
@@ -1566,14 +1911,25 @@ a { color: #12507d; }
             foreach ($capture in $item.Captures) {
                 $segmentText = if ($capture.SegmentCount -gt 1) { " &middot; segment $($capture.SegmentIndex) of $($capture.SegmentCount)" } else { '' }
                 [void]$sb.AppendLine('<figure>')
+                # The data-* attributes are what -Verify checks each image against; keep
+                # their order in step with Test-ReportIntegrity.
                 [void]$sb.Append('<img alt="')
                 [void]$sb.Append((Encode-Html "$($item.Name) screenshot $($capture.SegmentIndex) of $($capture.SegmentCount)"))
+                [void]$sb.Append('" data-file="')
+                [void]$sb.Append((Encode-Html $capture.FileName))
+                [void]$sb.Append('" data-sha256="')
+                [void]$sb.Append($capture.Sha256)
+                [void]$sb.Append('" data-captured="')
+                [void]$sb.Append((Encode-Html $capture.CapturedAt))
+                [void]$sb.Append('" data-url="')
+                [void]$sb.Append((Encode-Html $capture.Url))
                 [void]$sb.Append('" src="data:')
                 [void]$sb.Append($mimeType)
                 [void]$sb.Append(';base64,')
                 [void]$sb.Append($capture.Base64)
                 [void]$sb.AppendLine('">')
-                [void]$sb.AppendLine("<figcaption>Captured $(Encode-Html $capture.Timestamp)$segmentText &middot; $(Encode-Html $capture.Url)</figcaption>")
+                [void]$sb.AppendLine("<figcaption>Captured $(Encode-Html $capture.Timestamp)$segmentText &middot; $(Encode-Html $capture.Url)<br>" +
+                    "<span class=""hash"">SHA-256 $($capture.Sha256) &middot; $(Encode-Html $capture.FileName)</span></figcaption>")
                 [void]$sb.AppendLine('</figure>')
             }
         }
@@ -1746,6 +2102,9 @@ function ConvertTo-RunSummaryJson {
                 Captures       = @($item.Captures | ForEach-Object {
                     [ordered]@{
                         Timestamp    = $_.Timestamp
+                        CapturedAt   = $_.CapturedAt
+                        Sha256       = $_.Sha256
+                        FileName     = $_.FileName
                         Url          = $_.Url
                         SegmentIndex = $_.SegmentIndex
                         SegmentCount = $_.SegmentCount
@@ -1757,6 +2116,100 @@ function ConvertTo-RunSummaryJson {
         })
     }
     return ($summary | ConvertTo-Json -Depth 6)
+}
+
+function Test-ReportIntegrity {
+    <#
+        Re-checks a report without trusting anything but its own contents: every embedded
+        image is hashed again and compared with the hash printed for it, the metadata
+        inside each image must match the report (capture time, page URL), the manifest
+        hash is recomputed from the per-image hashes, and saved images (images\<report>\
+        with SHA256SUMS) are hashed from disk. Returns one row per check.
+
+        This proves the report and images are unchanged since the manifest hash was
+        recorded; it cannot tell on its own whether someone rebuilt all hashes together,
+        which is why the manifest hash should be kept outside the report as well.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Report not found: $Path" }
+    $html = [System.IO.File]::ReadAllText($Path)
+    $decode = { param([string]$Text) [System.Net.WebUtility]::HtmlDecode($Text) }
+    $results = [System.Collections.Generic.List[object]]::new()
+    $add = { param($Check, $Ok, $Detail) $results.Add([pscustomobject]@{ Check = $Check; Ok = [bool]$Ok; Detail = $Detail }) }
+
+    $pattern = '<img alt="[^"]*" data-file="([^"]*)" data-sha256="([0-9a-f]{64})" data-captured="([^"]*)" data-url="([^"]*)" src="data:image/(?:jpeg|png);base64,([A-Za-z0-9+/=]+)">'
+    $images = [regex]::Matches($html, $pattern)
+    if ($images.Count -eq 0) { & $add 'Report' $false 'No hashed screenshots found - not a Vouch 1.2+ report, or it has no captures.' }
+
+    $manifestLines = [System.Collections.Generic.List[string]]::new()
+    foreach ($image in $images) {
+        $file = & $decode $image.Groups[1].Value
+        $listed = $image.Groups[2].Value
+        $bytes = [System.Convert]::FromBase64String($image.Groups[5].Value)
+        $actual = Get-Sha256Hex -Bytes $bytes
+        $manifestLines.Add("$listed  $file")
+        & $add "Image $file" ($actual -eq $listed) $(if ($actual -eq $listed) { "SHA-256 $actual" } else { "hash is $actual, report lists $listed" })
+
+        $metadata = Get-ImageMetadata -Bytes $bytes
+        if ($null -eq $metadata) {
+            & $add "Metadata $file" $false 'no embedded metadata'
+        }
+        else {
+            $problems = @()
+            if ([string]$metadata.CapturedAt -ne (& $decode $image.Groups[3].Value)) { $problems += "capture time $($metadata.CapturedAt) differs from the report" }
+            if ([string]$metadata.PageUrl -ne (& $decode $image.Groups[4].Value)) { $problems += "page URL $($metadata.PageUrl) differs from the report" }
+            & $add "Metadata $file" ($problems.Count -eq 0) $(if ($problems.Count -eq 0) { "$($metadata.ItemName) | $($metadata.CapturedAt) | $($metadata.PageUrl)" } else { $problems -join '; ' })
+        }
+    }
+
+    $stated = [regex]::Match($html, 'data-manifest-sha256="([0-9a-f]{64})"')
+    if ($images.Count -gt 0) {
+        $recomputed = Get-Sha256Hex -Bytes ([System.Text.Encoding]::UTF8.GetBytes((@($manifestLines) -join "`n") + "`n"))
+        if (-not $stated.Success) { & $add 'Manifest' $false 'the report states no manifest hash' }
+        else {
+            $ok = $recomputed -eq $stated.Groups[1].Value
+            & $add 'Manifest' $ok $(if ($ok) { "SHA-256 $recomputed" } else { "recomputed $recomputed, report states $($stated.Groups[1].Value)" })
+        }
+    }
+
+    # Saved image files, when the run used -SaveImages.
+    $imagesDir = Join-Path -Path (Split-Path -Path $Path -Parent) -ChildPath (Join-Path 'images' ([System.IO.Path]::GetFileNameWithoutExtension($Path)))
+    $sums = Join-Path -Path $imagesDir -ChildPath 'SHA256SUMS'
+    if (Test-Path -LiteralPath $sums -PathType Leaf) {
+        $sumsText = [System.IO.File]::ReadAllText($sums)
+        $sumsHash = Get-Sha256Hex -Bytes ([System.Text.Encoding]::UTF8.GetBytes($sumsText))
+        & $add 'SHA256SUMS' ($stated.Success -and $sumsHash -eq $stated.Groups[1].Value) "file hashes to $sumsHash"
+        foreach ($line in ($sumsText -split "`n" | Where-Object { $_ -match '^([0-9a-f]{64})  (.+)$' })) {
+            $null = $line -match '^([0-9a-f]{64})  (.+)$'
+            $expected = $Matches[1]
+            $name = $Matches[2]
+            $filePath = Join-Path -Path $imagesDir -ChildPath $name
+            if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) { & $add "File $name" $false 'missing'; continue }
+            $actual = Get-Sha256Hex -Bytes ([System.IO.File]::ReadAllBytes($filePath))
+            & $add "File $name" ($actual -eq $expected) $(if ($actual -eq $expected) { 'matches' } else { "hash is $actual, expected $expected" })
+        }
+    }
+    return $results
+}
+
+function Invoke-VerifyReport {
+    param([Parameter(Mandatory)][string]$Path)
+    Add-Type -AssemblyName System.Drawing
+    $results = @(Test-ReportIntegrity -Path $Path)
+    Write-Host "Verifying $Path" -ForegroundColor Cyan
+    foreach ($result in $results) {
+        $colour = if ($result.Ok) { 'Green' } else { 'Red' }
+        Write-Host ('  {0,-4} {1,-58} {2}' -f $(if ($result.Ok) { 'OK' } else { 'FAIL' }), $result.Check, $result.Detail) -ForegroundColor $colour
+    }
+    $failed = @($results | Where-Object { -not $_.Ok }).Count
+    Write-Host ''
+    if ($failed -eq 0) {
+        Write-Host "VERIFIED: $($results.Count) check(s) passed." -ForegroundColor Green
+        return 0
+    }
+    Write-Host "NOT VERIFIED: $failed of $($results.Count) check(s) failed." -ForegroundColor Red
+    return 4
 }
 
 function Start-RunLog {
@@ -1789,6 +2242,12 @@ function Invoke-Main {
     Add-Type -AssemblyName System.Windows.Forms
     Initialize-NativeInterop
 
+    if ($Verify) {
+        # Needs no browser: works on any Windows machine the report is copied to.
+        $script:ExitCode = Invoke-VerifyReport -Path $Verify
+        return
+    }
+
     $edgePath = Find-EdgeExecutable
 
     # Absolute, so Edge receives the same path the process lookups search for.
@@ -1813,14 +2272,6 @@ function Invoke-Main {
     }
     $resolvedOutputDir = (Resolve-Path -LiteralPath $OutputDir).Path
 
-    $imagesDir = ''
-    if ($SaveImages) {
-        $imagesDir = Join-Path -Path $resolvedOutputDir -ChildPath 'images'
-        if (-not (Test-Path -LiteralPath $imagesDir)) {
-            [void](New-Item -ItemType Directory -Path $imagesDir -Force)
-        }
-    }
-
     $effectiveReportName = $ReportName
     if ([string]::IsNullOrWhiteSpace($effectiveReportName)) {
         $effectiveReportName = "VouchReport_$((Get-Date).ToString('yyyy-MM-dd_HHmmss')).html"
@@ -1828,7 +2279,27 @@ function Invoke-Main {
     if ($effectiveReportName -notmatch '(?i)\.html?$') { $effectiveReportName += '.html' }
     $reportPath = Join-Path -Path $resolvedOutputDir -ChildPath $effectiveReportName
 
+    # One folder per report, so a later run never overwrites the images (and with them
+    # the hashes) of an earlier one.
+    $imagesDir = ''
+    if ($SaveImages) {
+        $imagesDir = Join-Path -Path $resolvedOutputDir -ChildPath (Join-Path 'images' ([System.IO.Path]::GetFileNameWithoutExtension($effectiveReportName)))
+        if (-not (Test-Path -LiteralPath $imagesDir)) {
+            [void](New-Item -ItemType Directory -Path $imagesDir -Force)
+        }
+    }
+
     $imageExtension = if ($ImageFormat -eq 'png') { 'png' } else { 'jpg' }
+    $screenBounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $captureContext = @{
+        RunId      = [guid]::NewGuid().ToString()
+        Format     = $ImageFormat
+        Quality    = $JpegQuality
+        Extension  = $imageExtension
+        SaveImages = [bool]$SaveImages
+        ImagesDir  = $imagesDir
+        Screen     = "$($screenBounds.Width)x$($screenBounds.Height)"
+    }
     $runStart = [System.DateTimeOffset]::Now
     $items = [System.Collections.Generic.List[object]]::new()
     $captureDesktop = $null
@@ -2047,29 +2518,15 @@ function Invoke-Main {
                             }
                         }
 
-                        $bytes = Get-ScreenCapture -Format $ImageFormat -Quality $JpegQuality
-                        $filePath = ''
-                        if ($SaveImages) {
-                            $fileName = '{0:d3}_{1}_seg{2:d2}.{3}' -f $definition.Index, (Get-SafeFileName -Name $definition.Name), ($segment + 1), $imageExtension
-                            $filePath = Join-Path -Path $imagesDir -ChildPath $fileName
-                            [System.IO.File]::WriteAllBytes($filePath, $bytes)
-                        }
                         $segmentUrl = if ($browserErrorPage) { $item.FinalUrl } else { Get-CurrentPageUrl }
-                        $item.Captures.Add((New-CaptureRecord -Bytes $bytes -Url $segmentUrl -SegmentIndex ($segment + 1) -SegmentCount $segmentCount -FilePath $filePath))
+                        Add-ItemCapture -Item $item -SegmentIndex ($segment + 1) -SegmentCount $segmentCount -PageUrl $segmentUrl -Context $captureContext
                     }
 
                     try { [void](Invoke-CdpEval -Expression 'window.scrollTo(0, 0)' -TimeoutSec 10) }
                     catch { Write-Verbose "Could not scroll back to the top: $($_.Exception.Message)" }
                 }
                 else {
-                    $bytes = Get-ScreenCapture -Format $ImageFormat -Quality $JpegQuality
-                    $filePath = ''
-                    if ($SaveImages) {
-                        $fileName = '{0:d3}_{1}_seg{2:d2}.{3}' -f $definition.Index, (Get-SafeFileName -Name $definition.Name), 1, $imageExtension
-                        $filePath = Join-Path -Path $imagesDir -ChildPath $fileName
-                        [System.IO.File]::WriteAllBytes($filePath, $bytes)
-                    }
-                    $item.Captures.Add((New-CaptureRecord -Bytes $bytes -Url $item.FinalUrl -SegmentIndex 1 -SegmentCount 1 -FilePath $filePath))
+                    Add-ItemCapture -Item $item -SegmentIndex 1 -SegmentCount 1 -PageUrl $item.FinalUrl -Context $captureContext
                 }
 
                 $summary = "    $($item.Status) - $($item.Captures.Count) capture(s)"
@@ -2138,6 +2595,14 @@ function Invoke-Main {
         WarnCount        = $warnCount
         FailCount        = $failCount
         CaptureCount     = $captureCount
+        RunId            = $captureContext.RunId
+        ManifestSha256   = ''
+    }
+
+    $manifest = Get-CaptureManifest -Items @($items)
+    $run.ManifestSha256 = Get-Sha256Hex -Bytes ([System.Text.Encoding]::UTF8.GetBytes($manifest))
+    if ($SaveImages) {
+        [System.IO.File]::WriteAllText((Join-Path -Path $imagesDir -ChildPath 'SHA256SUMS'), $manifest, [System.Text.UTF8Encoding]::new($false))
     }
 
     $html = New-HtmlReport -Items @($items) -Run $run

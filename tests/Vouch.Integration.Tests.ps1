@@ -181,7 +181,17 @@ Plain page after the slow one,$Web/ok,,N,
         $FailOnWarning = $false
 
         Mock Set-EdgeForeground { $null }
-        Mock Get-ScreenCapture { , [byte[]](0xFF, 0xD8, 0xFF, 0xD9) }
+        # A real (tiny) JPEG carrying the real metadata, so the report can be verified in full.
+        Mock Get-ScreenCapture {
+            $bitmap = [System.Drawing.Bitmap]::new(16, 10)
+            try {
+                if ($Metadata) { Set-JpegMetadata -Image $bitmap -Metadata $Metadata }
+                $stream = [System.IO.MemoryStream]::new()
+                $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                , $stream.ToArray()
+            }
+            finally { $bitmap.Dispose() }
+        }
         Mock New-HtmlReport {
             $global:VouchE2E.Items = $Items
             $global:VouchE2E.Run = $Run
@@ -284,9 +294,19 @@ Plain page after the slow one,$Web/ok,,N,
         $item.Status | Should -Be 'OK'
     }
 
-    It 'saves the images with -SaveImages' {
-        @(Get-ChildItem -LiteralPath (Join-Path $OutputDir 'images') -Filter '*.jpg').Count |
-            Should -Be $global:VouchE2E.Run.CaptureCount
+    It 'saves the images with -SaveImages, in a folder of their own with SHA256SUMS' {
+        $imagesDir = Join-Path $OutputDir 'images\e2e'
+        @(Get-ChildItem -LiteralPath $imagesDir -Filter '*.jpg').Count | Should -Be $global:VouchE2E.Run.CaptureCount
+        $sums = @(Get-Content -LiteralPath (Join-Path $imagesDir 'SHA256SUMS'))
+        $sums.Count | Should -Be $global:VouchE2E.Run.CaptureCount
+        $global:VouchE2E.Run.ManifestSha256 | Should -Match '^[0-9a-f]{64}$'
+    }
+
+    It 'produces a report that -Verify accepts' {
+        $results = @(Test-ReportIntegrity -Path $script:ReportFile)
+        @($results | Where-Object { -not $_.Ok }) | Should -BeNullOrEmpty
+        @($results | Where-Object Check -like 'Metadata *').Count | Should -Be $global:VouchE2E.Run.CaptureCount
+        @($results | Where-Object Check -like 'File *').Count | Should -Be $global:VouchE2E.Run.CaptureCount
     }
 }
 

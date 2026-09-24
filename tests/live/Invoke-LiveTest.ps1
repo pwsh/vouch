@@ -105,6 +105,15 @@ function Get-VirtualDesktopCount {
     return [int]($ids.Length / 16)
 }
 
+function Get-ExifTitle([string]$Path) {
+    $image = [System.Drawing.Image]::FromFile($Path)
+    try {
+        if ($image.PropertyIdList -notcontains 0x9C9B) { return '' }
+        return [System.Text.Encoding]::Unicode.GetString($image.GetPropertyItem(0x9C9B).Value).TrimEnd([char]0)
+    }
+    finally { $image.Dispose() }
+}
+
 function Get-ExpectedCaptureCheck([string]$Text) {
     if ($Text -match '^(\d+)\+$') { return @{ Min = [int]$Matches[1]; Exact = -1 } }
     if ($Text -match '^\d+$') { return @{ Min = [int]$Text; Exact = [int]$Text } }
@@ -204,6 +213,14 @@ else {
                 $problems.Add("screenshot file missing: '$($capture.FilePath)'")
                 continue
             }
+            if ($capture.FilePath -like '*.jpg') {
+                # The image must name its own page in its EXIF title, and hash to the value in the report.
+                $title = Get-ExifTitle -Path $capture.FilePath
+                if ($title -ne $item.Name) { $problems.Add("$(Split-Path -Leaf $capture.FilePath) EXIF title is '$title', expected '$($item.Name)'") }
+            }
+            if ((Get-FileHash -LiteralPath $capture.FilePath -Algorithm SHA256).Hash -ne $capture.Sha256) {
+                $problems.Add("$(Split-Path -Leaf $capture.FilePath) does not hash to the value in the summary")
+            }
             foreach ($issue in (Test-ImageContent -Path $capture.FilePath -Width $screen.Width -Height $screen.Height)) {
                 $problems.Add("$(Split-Path -Leaf $capture.FilePath) $issue")
             }
@@ -239,6 +256,19 @@ if ($UseVirtualDesktop) {
     $desktopsAfter = Get-VirtualDesktopCount
     if ($desktopsAfter -ne $desktopsBefore) { Add-Failure "$desktopsBefore virtual desktop(s) before the run, $desktopsAfter after - the capture desktop was not closed" }
     else { Write-Host "  PASS  capture desktop closed ($desktopsAfter desktop(s), as before)" -ForegroundColor Green }
+}
+
+# The report must pass its own integrity check (hashes, embedded metadata, manifest, files).
+$reportFile = Get-ChildItem -LiteralPath $runDir -Filter '*.htm*' -File | Select-Object -First 1
+if ($null -ne $reportFile) {
+    $verifyOutput = & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -File $vouch -Verify $reportFile.FullName 6>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) {
+        $checks = [regex]::Match($verifyOutput, 'VERIFIED: (\d+) check').Groups[1].Value
+        Write-Host "  PASS  vouch.ps1 -Verify: $checks integrity checks passed" -ForegroundColor Green
+    }
+    else {
+        Add-Failure "vouch.ps1 -Verify failed (exit $LASTEXITCODE):`n$verifyOutput"
+    }
 }
 
 # Edge must be shut down so the DevTools port does not stay open.
