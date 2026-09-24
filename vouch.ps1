@@ -13,6 +13,20 @@
 
 .PARAMETER CsvPath
     Path to the capture definition CSV. Header: Name,Url,Steps,ScrollFullPage,Notes
+    Defaults to captures.csv in the script's own folder, so the script behaves the same
+    when started by Task Scheduler (whose working directory is C:\Windows\System32).
+
+.PARAMETER OutputDir
+    Folder for the report. Defaults to the reports folder next to the script.
+
+.PARAMETER FailOnWarning
+    Exit with code 3 when no item failed but at least one produced a warning (for
+    example an expired session redirecting to a sign-in page). Without it, warnings
+    exit with 0.
+
+.PARAMETER LogDir
+    Write a transcript of the run (vouch_<date>_<time>.log) to this folder. Meant for
+    unattended runs; Install-VouchSchedule.ps1 sets it.
 
 .PARAMETER LoginSetup
     First-run onboarding: opens Edge with the dedicated audit profile (no debugging
@@ -30,9 +44,9 @@
 
 [CmdletBinding()]
 param(
-    [string]$CsvPath = '.\captures.csv',
+    [string]$CsvPath = (Join-Path -Path $PSScriptRoot -ChildPath 'captures.csv'),
 
-    [string]$OutputDir = '.\reports',
+    [string]$OutputDir = (Join-Path -Path $PSScriptRoot -ChildPath 'reports'),
 
     [string]$ReportName = '',
 
@@ -63,18 +77,25 @@ param(
 
     [switch]$KeepBrowserOpen,
 
+    [switch]$FailOnWarning,
+
+    [string]$LogDir = '',
+
     [switch]$LoginSetup
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion       = '1.0.0'
+$script:ToolVersion       = '1.1.0'
 $script:ExitCode          = 0
 $script:CdpSocket         = $null
+$script:CdpWebSocketUrl   = ''
+$script:CdpPort           = 0
 $script:CdpMessageId      = 0
 $script:CdpDefaultTimeout = 30
 $script:EdgeProcess       = $null
+$script:BrowserWsUrl      = ''
 $script:LaunchedEdge      = $false
 $script:ReusedEdge        = $false
 
@@ -113,6 +134,9 @@ namespace Vouch
 
         [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
     }
 }
 '@
@@ -164,6 +188,44 @@ function Find-EdgeExecutable {
     }
 
     throw 'Microsoft Edge (msedge.exe) was not found. Install Edge, or make sure it is registered under HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe.'
+}
+
+function Find-EdgeBrowserProcess {
+    <#
+        The msedge.exe that Start-Process returns is a launcher that exits almost at once;
+        the browser that owns the windows and the DevTools port is a new process. Find it
+        by its command line instead: the main browser process is the one without --type=.
+        Other users' command lines are not readable, so their Edge is never matched.
+    #>
+    param(
+        [string]$ProfileDir = '',
+        [int]$Port = 0
+    )
+
+    $candidates = @()
+    try {
+        $candidates = @(Get-CimInstance -ClassName Win32_Process -Filter "Name='msedge.exe'" -ErrorAction Stop)
+    }
+    catch {
+        Write-Verbose "Could not enumerate Edge processes: $($_.Exception.Message)"
+        return $null
+    }
+
+    $profileText = $ProfileDir.TrimEnd('\')
+    foreach ($candidate in $candidates) {
+        $commandLine = [string]$candidate.CommandLine
+        if ([string]::IsNullOrWhiteSpace($commandLine) -or $commandLine -match '\s--type=') { continue }
+        if ($Port -gt 0 -and $commandLine -notmatch "--remote-debugging-port=$Port(?!\d)") { continue }
+        if ($profileText -ne '' -and
+            -not $commandLine.Contains($profileText, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        try {
+            return Get-Process -Id $candidate.ProcessId -ErrorAction Stop
+        }
+        catch {
+            Write-Verbose "Edge process $($candidate.ProcessId) exited while being inspected."
+        }
+    }
+    return $null
 }
 
 #endregion
@@ -239,8 +301,12 @@ function ConvertTo-StepList {
                 }
             }
             'wait' {
+                # Parse culture-independently: on a de-DE machine TryParse would read
+                # '2.5' as 25. A comma is accepted as the decimal separator as well.
                 $seconds = 0.0
-                if (-not [double]::TryParse($argument, [ref]$seconds) -or $seconds -lt 0 -or $seconds -gt 300) {
+                $parsed = [double]::TryParse($argument.Replace(',', '.'), [System.Globalization.NumberStyles]::Float,
+                    [System.Globalization.CultureInfo]::InvariantCulture, [ref]$seconds)
+                if (-not $parsed -or [double]::IsNaN($seconds) -or $seconds -lt 0 -or $seconds -gt 300) {
                     $Errors.Add("Line ${LineNumber}: 'wait:$argument' is not a number of seconds between 0 and 300.")
                 }
                 else {
@@ -277,17 +343,20 @@ function Import-CaptureDefinition {
 
     $errors = [System.Collections.Generic.List[string]]::new()
     $definitions = [System.Collections.Generic.List[object]]::new()
-    $index = 0
+    $lineNumber = 1   # the header line
 
     foreach ($row in $rows) {
-        $index++
-        $lineNumber = $index + 1   # +1 for the header line
+        $lineNumber++
 
         $name = Get-CsvField -Row $row -Field 'Name'
         $url = Get-CsvField -Row $row -Field 'Url'
         $stepsText = Get-CsvField -Row $row -Field 'Steps'
         $scrollText = Get-CsvField -Row $row -Field 'ScrollFullPage'
         $notes = Get-CsvField -Row $row -Field 'Notes'
+
+        # Excel leaves rows of bare commas behind when rows are cleared; skip them.
+        if (-not ($name + $url + $stepsText + $scrollText + $notes)) { continue }
+        $index = $definitions.Count + 1
 
         if ([string]::IsNullOrWhiteSpace($name)) {
             $errors.Add("Line ${lineNumber}: 'Name' is required.")
@@ -314,6 +383,10 @@ function Import-CaptureDefinition {
             ScrollFullPage = (ConvertTo-BooleanFlag -Value $scrollText)
             Notes          = $notes
         })
+    }
+
+    if ($definitions.Count -eq 0 -and $errors.Count -eq 0) {
+        throw "The CSV '$Path' contains no capture rows (only blank lines)."
     }
 
     if ($errors.Count -gt 0) {
@@ -344,6 +417,14 @@ function Get-DebugEndpointInfo {
     }
 }
 
+function Get-BrowserWebSocketUrl {
+    param([object]$VersionInfo)
+    if ($null -ne $VersionInfo -and $VersionInfo.PSObject.Properties['webSocketDebuggerUrl']) {
+        return [string]$VersionInfo.webSocketDebuggerUrl
+    }
+    return ''
+}
+
 function Start-EdgeDebug {
     <#
         Chromium 136+ refuses --remote-debugging-port when the default user profile is
@@ -360,8 +441,17 @@ function Start-EdgeDebug {
     if ($null -ne $existing) {
         $script:ReusedEdge = $true
         $script:LaunchedEdge = $false
+        $script:EdgeProcess = Find-EdgeBrowserProcess -Port $Port
+        $script:BrowserWsUrl = Get-BrowserWebSocketUrl -VersionInfo $existing
         Write-Host "Reusing the Edge instance already listening on port $Port." -ForegroundColor Yellow
         return $existing
+    }
+
+    # Launching against a profile that an ordinary Edge window already holds just hands
+    # the request to that window, and the DevTools port never opens.
+    $holder = Find-EdgeBrowserProcess -ProfileDir $ProfileDir
+    if ($null -ne $holder) {
+        throw "Edge is already running with the audit profile (process $($holder.Id)) but without the DevTools port - typically a window left open after -LoginSetup. Close every Edge window that uses $ProfileDir and run again."
     }
 
     if (-not (Test-Path -LiteralPath $ProfileDir)) {
@@ -381,14 +471,21 @@ function Start-EdgeDebug {
     )
 
     Write-Host "Launching Edge with the audit profile ($ProfileDir)..."
-    $script:EdgeProcess = Start-Process -FilePath $EdgePath -ArgumentList $arguments -PassThru
+    [void](Start-Process -FilePath $EdgePath -ArgumentList $arguments)
     $script:LaunchedEdge = $true
 
     $deadline = (Get-Date).AddSeconds(15)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 400
         $info = Get-DebugEndpointInfo -Port $Port
-        if ($null -ne $info) { return $info }
+        if ($null -ne $info) {
+            $script:EdgeProcess = Find-EdgeBrowserProcess -Port $Port -ProfileDir $ProfileDir
+            if ($null -eq $script:EdgeProcess) {
+                Write-Verbose 'Could not identify the Edge browser process; window focus falls back to title matching.'
+            }
+            $script:BrowserWsUrl = Get-BrowserWebSocketUrl -VersionInfo $info
+            return $info
+        }
     }
 
     throw "Edge did not open its DevTools endpoint on port $Port within 15 seconds. Close any running Edge instance that uses the audit profile and try again, or pick another port with -DebugPort."
@@ -435,9 +532,11 @@ function Connect-CdpSocket {
     $socket = [System.Net.WebSockets.ClientWebSocket]::new()
     $socket.Options.KeepAliveInterval = [TimeSpan]::FromSeconds(30)
 
+    # PowerShell binds GetAwaiter() on the task's runtime type, Task<VoidTaskResult>, so
+    # GetResult() returns an object; [void] keeps it out of the function's output.
     $cts = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($TimeoutSec))
     try {
-        $socket.ConnectAsync([Uri]::new($WebSocketUrl), $cts.Token).GetAwaiter().GetResult()
+        [void]$socket.ConnectAsync([Uri]::new($WebSocketUrl), $cts.Token).GetAwaiter().GetResult()
     }
     catch {
         $socket.Dispose()
@@ -448,7 +547,31 @@ function Connect-CdpSocket {
     }
 
     $script:CdpSocket = $socket
+    $script:CdpWebSocketUrl = $WebSocketUrl
     $script:CdpMessageId = 0
+}
+
+function Restore-CdpConnection {
+    <#
+        Cancelling a ClientWebSocket receive (which is how a CDP timeout is implemented)
+        aborts the socket for good. Open a fresh connection to the same tab so one slow
+        page does not fail every row after it; if the tab is gone, attach to another.
+    #>
+    $url = $script:CdpWebSocketUrl
+    Close-CdpSocket
+    try {
+        Connect-CdpSocket -WebSocketUrl $url
+        return
+    }
+    catch {
+        Write-Verbose "Reconnecting to the same tab failed: $($_.Exception.Message)"
+    }
+    if ($script:CdpPort -le 0) { throw 'The DevTools connection was lost and could not be re-established.' }
+    $target = Get-CdpPageTarget -Port $script:CdpPort
+    if ($null -eq $target -or -not $target.PSObject.Properties['webSocketDebuggerUrl']) {
+        throw 'The DevTools connection was lost and no page target is available to reconnect to.'
+    }
+    Connect-CdpSocket -WebSocketUrl ([string]$target.webSocketDebuggerUrl)
 }
 
 function Receive-CdpMessage {
@@ -510,6 +633,10 @@ function Send-CdpCommand {
 
     if ($TimeoutSec -le 0) { $TimeoutSec = $script:CdpDefaultTimeout }
     if ($null -eq $script:CdpSocket) { throw 'No DevTools connection is open.' }
+    if ($script:CdpSocket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+        Write-Verbose "DevTools socket is $($script:CdpSocket.State); reconnecting."
+        Restore-CdpConnection
+    }
 
     $script:CdpMessageId++
     $messageId = $script:CdpMessageId
@@ -520,7 +647,7 @@ function Send-CdpCommand {
 
     $cts = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($TimeoutSec))
     try {
-        $script:CdpSocket.SendAsync($payload, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $cts.Token).GetAwaiter().GetResult()
+        [void]$script:CdpSocket.SendAsync($payload, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $cts.Token).GetAwaiter().GetResult()
     }
     finally {
         $cts.Dispose()
@@ -648,32 +775,28 @@ function Get-EdgeWindowHandle {
 
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     while ((Get-Date) -lt $deadline) {
-        # The launched process may not own the visible window yet (or at all, if Edge
-        # re-parented the session), so re-query and fall back to another msedge window.
+        # Re-query each time: MainWindowHandle is cached per Process object and the
+        # browser may not have created its window yet.
         if ($null -ne $script:EdgeProcess) {
             try {
                 $process = Get-Process -Id $script:EdgeProcess.Id -ErrorAction Stop
                 if ($process.MainWindowHandle -ne [IntPtr]::Zero) { return $process.MainWindowHandle }
             }
             catch {
-                Write-Verbose "Launched Edge process is no longer available: $($_.Exception.Message)"
+                Write-Verbose "The audit Edge process is no longer available: $($_.Exception.Message)"
             }
         }
-
-        # In the fallback the user's personal Edge windows are candidates too, so prefer
-        # the window whose title carries the page we just navigated - focusing the wrong
-        # window would put the wrong application into the evidence.
-        $candidates = @(Get-Process -Name 'msedge' -ErrorAction SilentlyContinue |
-            Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero })
-        if ($candidates.Count -gt 0) {
-            if (-not [string]::IsNullOrWhiteSpace($ExpectedTitle)) {
-                foreach ($candidate in $candidates) {
-                    if ($candidate.MainWindowTitle.Contains($ExpectedTitle, [System.StringComparison]::OrdinalIgnoreCase)) {
-                        return $candidate.MainWindowHandle
-                    }
+        elseif (-not [string]::IsNullOrWhiteSpace($ExpectedTitle)) {
+            # The browser process is unknown, so the user's personal Edge windows are
+            # candidates too. Only a window showing the page just navigated qualifies;
+            # focusing any other would put the wrong application into the evidence.
+            $candidates = @(Get-Process -Name 'msedge' -ErrorAction SilentlyContinue |
+                Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero })
+            foreach ($candidate in $candidates) {
+                if ($candidate.MainWindowTitle.Contains($ExpectedTitle, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    return $candidate.MainWindowHandle
                 }
             }
-            return $candidates[0].MainWindowHandle
         }
 
         Start-Sleep -Milliseconds 300
@@ -698,6 +821,11 @@ function Set-EdgeForeground {
     Start-Sleep -Milliseconds 500
 
     if ([Vouch.Native]::GetForegroundWindow() -ne $handle) {
+        # Windows ignores SetForegroundWindow from a background process - which is what
+        # a scheduled run is - unless that process sent the last input event. A synthetic
+        # Alt press and release satisfies the rule without typing anything.
+        [Vouch.Native]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)   # VK_MENU down
+        [Vouch.Native]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)   # KEYEVENTF_KEYUP
         [void][Vouch.Native]::SetForegroundWindow($handle)
         Start-Sleep -Milliseconds 300
         if ([Vouch.Native]::GetForegroundWindow() -ne $handle) {
@@ -791,6 +919,36 @@ function Get-OriginFromUrl {
     }
 }
 
+function Test-LoginRedirect {
+    <#
+        Same-origin counterpart of the cross-origin redirect warning: many applications
+        send an expired session to their own /login page. Flags a final URL that differs
+        from the requested one and either looks like a sign-in URL (when the requested
+        one did not) or shows a password field.
+    #>
+    param(
+        [string]$RequestedUrl,
+        [string]$FinalUrl,
+        [bool]$HasPasswordField = $false
+    )
+
+    try {
+        $requested = [Uri]::new($RequestedUrl)
+        $final = [Uri]::new($FinalUrl)
+    }
+    catch {
+        return $false
+    }
+
+    $requestedPath = ($requested.PathAndQuery + $requested.Fragment).TrimEnd('/')
+    $finalPath = ($final.PathAndQuery + $final.Fragment).TrimEnd('/')
+    if ($requestedPath -eq $finalPath) { return $false }
+
+    $loginPattern = '(?i)(log-?in|sign-?in|log-?on|/auth(\b|/)|oauth|/sso(\b|/)|saml|openid|/adfs/|/idp/)'
+    if ($finalPath -match $loginPattern -and $requestedPath -notmatch $loginPattern) { return $true }
+    return $HasPasswordField
+}
+
 function Invoke-ClickSelector {
     param([Parameter(Mandatory)][string]$Selector)
 
@@ -813,34 +971,89 @@ function Invoke-ClickSelector {
 function Invoke-ClickText {
     param([Parameter(Mandatory)][string]$Text)
 
+    <#
+        Only rendered elements are considered: hidden duplicates (collapsed mobile menus
+        and the like) come earlier in the DOM surprisingly often. An exact match wins;
+        otherwise the partial match with the shortest label, i.e. the closest one. A
+        partial match never selects a sign-out control unless the wanted text itself
+        says so - clicking "Log out" for "Log" would end the audit profile's session.
+    #>
     $literal = ConvertTo-JsLiteral -Value $Text
     $expression = @"
 (function (wanted) {
-  var target = String(wanted).trim().toLowerCase();
+  var target = String(wanted).replace(/\s+/g, ' ').trim().toLowerCase();
   var nodes = Array.prototype.slice.call(document.querySelectorAll(
     'a,button,[role=button],[role=tab],[role=menuitem],input[type=submit],input[type=button]'));
   var label = function (el) {
     var text = el.innerText || el.textContent || el.value || '';
     return String(text).replace(/\s+/g, ' ').trim().toLowerCase();
   };
-  var pick = null;
+  var visible = function (el) {
+    var rect = el.getBoundingClientRect();
+    var style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  };
+  var signOut = /\b(log|sign)\s*-?\s*(out|off)\b/;
+  var hiddenMatch = false;
+  var exact = null;
+  var partial = null;
   for (var i = 0; i < nodes.length; i++) {
-    if (label(nodes[i]) === target) { pick = nodes[i]; break; }
+    var text = label(nodes[i]);
+    if (text.indexOf(target) === -1) { continue; }
+    if (!visible(nodes[i])) { hiddenMatch = true; continue; }
+    if (text === target) { exact = nodes[i]; break; }
+    if (signOut.test(text) && !signOut.test(target)) { continue; }
+    if (!partial || text.length < label(partial).length) { partial = nodes[i]; }
   }
-  if (!pick) {
-    for (var j = 0; j < nodes.length; j++) {
-      if (label(nodes[j]).indexOf(target) !== -1) { pick = nodes[j]; break; }
-    }
-  }
-  if (!pick) { return 'NOTFOUND'; }
+  var pick = exact || partial;
+  if (!pick) { return hiddenMatch ? 'HIDDEN' : 'NOTFOUND'; }
   if (pick.scrollIntoView) { pick.scrollIntoView({ block: 'center' }); }
   pick.click();
   return 'OK';
 })($literal)
 "@
     $outcome = Invoke-CdpEval -Expression $expression
+    if ($outcome -eq 'HIDDEN') {
+        throw "Only hidden elements have the text '$Text'; nothing was clicked."
+    }
     if ($outcome -ne 'OK') {
         throw "No clickable element with the text '$Text' was found."
+    }
+}
+
+function Set-StepNavigationProbe {
+    <#
+        Marks the document before a click. beforeunload fires as soon as a navigation
+        starts - before the server has answered - so a click that opens another page is
+        detectable even while the old page is still on screen.
+    #>
+    $expression = "window.__vouchMark = 1; window.__vouchLeaving = false; " +
+        "window.addEventListener('beforeunload', function () { window.__vouchLeaving = true; });"
+    try { [void](Invoke-CdpEval -Expression $expression -TimeoutSec 10) }
+    catch { Write-Verbose "Could not set the step navigation probe: $($_.Exception.Message)" }
+}
+
+function Wait-StepNavigation {
+    <#
+        After a click: if it navigated (or started to), wait for the new document to
+        finish loading so the screenshot does not show a half-loaded or the old page.
+        In-page changes (tabs, SPA routes) keep the marker and return immediately.
+    #>
+    param([Parameter(Mandatory)][int]$TimeoutSec)
+
+    $probe = 'same'
+    try {
+        $probe = [string](Invoke-CdpEval -TimeoutSec 10 -Expression (
+            "typeof window.__vouchMark === 'undefined' ? 'new' : (window.__vouchLeaving ? 'leaving' : 'same')"))
+    }
+    catch {
+        # Evaluation can fail while a navigation commits; treat that as navigating.
+        $probe = 'new'
+    }
+    if ($probe -eq 'same') { return }
+
+    if (-not (Wait-PageReady -TimeoutSec $TimeoutSec -SameDocumentGraceSeconds $TimeoutSec)) {
+        throw "The click opened a page that did not finish loading within $TimeoutSec seconds."
     }
 }
 
@@ -851,7 +1064,8 @@ function Invoke-RowSteps {
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Steps,
-        [Parameter(Mandatory)][double]$SettleSeconds
+        [Parameter(Mandatory)][double]$SettleSeconds,
+        [int]$NavigationTimeoutSec = 30
     )
 
     $log = [System.Collections.Generic.List[object]]::new()
@@ -861,12 +1075,16 @@ function Invoke-RowSteps {
         try {
             switch ($step.Verb) {
                 'click' {
+                    Set-StepNavigationProbe
                     Invoke-ClickSelector -Selector ([string]$step.Argument)
                     Start-Sleep -Milliseconds ([int]($SettleSeconds * 1000))
+                    Wait-StepNavigation -TimeoutSec $NavigationTimeoutSec
                 }
                 'clicktext' {
+                    Set-StepNavigationProbe
                     Invoke-ClickText -Text ([string]$step.Argument)
                     Start-Sleep -Milliseconds ([int]($SettleSeconds * 1000))
+                    Wait-StepNavigation -TimeoutSec $NavigationTimeoutSec
                 }
                 'wait' {
                     Start-Sleep -Milliseconds ([int]([double]$step.Argument * 1000))
@@ -886,7 +1104,8 @@ function Invoke-RowSteps {
 function New-CaptureRecord {
     param(
         [Parameter(Mandatory)][byte[]]$Bytes,
-        [Parameter(Mandatory)][string]$Url,
+        # Empty when the browser would not report its URL; the screenshot still counts.
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Url,
         [Parameter(Mandatory)][int]$SegmentIndex,
         [Parameter(Mandatory)][int]$SegmentCount,
         [string]$FilePath = ''
@@ -1161,7 +1380,7 @@ function Close-CdpSocket {
         if ($script:CdpSocket.State -eq [System.Net.WebSockets.WebSocketState]::Open) {
             $cts = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(5))
             try {
-                $script:CdpSocket.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, 'done', $cts.Token).GetAwaiter().GetResult()
+                [void]$script:CdpSocket.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, 'done', $cts.Token).GetAwaiter().GetResult()
             }
             finally {
                 $cts.Dispose()
@@ -1178,12 +1397,31 @@ function Close-CdpSocket {
 }
 
 function Stop-EdgeProcess {
-    if (-not $script:LaunchedEdge -or $null -eq $script:EdgeProcess) { return }
+    if (-not $script:LaunchedEdge) { return }
+
+    # Browser.close shuts every window down in order, so Edge flushes cookies and
+    # sessions to the audit profile and the DevTools port closes with it.
+    $closeRequested = $false
+    if (-not [string]::IsNullOrWhiteSpace($script:BrowserWsUrl)) {
+        try {
+            Connect-CdpSocket -WebSocketUrl $script:BrowserWsUrl -TimeoutSec 5
+            try { [void](Send-CdpCommand -Method 'Browser.close' -TimeoutSec 5) }
+            catch { Write-Verbose "Browser.close: $($_.Exception.Message)" }   # the socket may drop before the reply
+            $closeRequested = $true
+        }
+        catch {
+            Write-Verbose "Could not reach the browser DevTools endpoint: $($_.Exception.Message)"
+        }
+        finally {
+            Close-CdpSocket
+        }
+    }
+
+    if ($null -eq $script:EdgeProcess) { return }
     try {
         $process = Get-Process -Id $script:EdgeProcess.Id -ErrorAction SilentlyContinue
         if ($null -eq $process) { return }
-        # Close the window first so Edge flushes cookies/sessions to the audit profile.
-        [void]$process.CloseMainWindow()
+        if (-not $closeRequested) { [void]$process.CloseMainWindow() }
         if (-not $process.WaitForExit(10000)) {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
         }
@@ -1219,23 +1457,55 @@ function Invoke-LoginSetup {
         '--start-maximized'
         'about:blank'
     )
-    $process = Start-Process -FilePath $EdgePath -ArgumentList $arguments -PassThru
+    [void](Start-Process -FilePath $EdgePath -ArgumentList $arguments)
 
     [void](Read-Host 'Press Enter when you have finished signing in')
 
-    try {
-        $running = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
-        if ($null -ne $running) {
-            [void]$running.CloseMainWindow()
-            [void]$running.WaitForExit(10000)
+    # Start-Process only returns Edge's short-lived launcher, so find the browser by its
+    # profile. Close its windows one at a time so every session is flushed to disk.
+    $browser = Find-EdgeBrowserProcess -ProfileDir $ProfileDir
+    $deadline = (Get-Date).AddSeconds(20)
+    while ($null -ne $browser -and (Get-Date) -lt $deadline) {
+        try {
+            $browser = Get-Process -Id $browser.Id -ErrorAction Stop
+            if ($browser.MainWindowHandle -ne [IntPtr]::Zero) { [void]$browser.CloseMainWindow() }
+            if ($browser.WaitForExit(2000)) { $browser = $null }
         }
-    }
-    catch {
-        Write-Verbose "Could not close the setup browser: $($_.Exception.Message)"
+        catch {
+            $browser = $null
+        }
     }
 
     Write-Host ''
-    Write-Host 'Sessions saved. You can now run the script normally to capture evidence.' -ForegroundColor Green
+    if ($null -ne $browser) {
+        Write-Host 'Edge is still running with the audit profile. Close all of its windows before starting a capture run.' -ForegroundColor Yellow
+    }
+    else {
+        Write-Host 'Sessions saved. You can now run the script normally to capture evidence.' -ForegroundColor Green
+    }
+}
+
+function Start-RunLog {
+    <#
+        Unattended runs have no console to read, so -LogDir keeps a transcript of each
+        run (everything the console would have shown, including the exit code).
+        Returns $true when a transcript was started.
+    #>
+    param([string]$Directory)
+
+    if ([string]::IsNullOrWhiteSpace($Directory)) { return $false }
+    try {
+        if (-not (Test-Path -LiteralPath $Directory)) {
+            [void](New-Item -ItemType Directory -Path $Directory -Force)
+        }
+        $logPath = Join-Path -Path $Directory -ChildPath "vouch_$((Get-Date).ToString('yyyy-MM-dd_HHmmss')).log"
+        [void](Start-Transcript -LiteralPath $logPath -Force)
+        return $true
+    }
+    catch {
+        Write-Host "WARNING: could not start the log in '$Directory': $($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
+    }
 }
 
 function Invoke-Main {
@@ -1247,8 +1517,11 @@ function Invoke-Main {
 
     $edgePath = Find-EdgeExecutable
 
+    # Absolute, so Edge receives the same path the process lookups search for.
+    $profileDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($EdgeProfileDir)
+
     if ($LoginSetup) {
-        Invoke-LoginSetup -EdgePath $edgePath -ProfileDir $EdgeProfileDir
+        Invoke-LoginSetup -EdgePath $edgePath -ProfileDir $profileDir
         $script:ExitCode = 0
         return
     }
@@ -1286,7 +1559,8 @@ function Invoke-Main {
     $items = [System.Collections.Generic.List[object]]::new()
 
     try {
-        $versionInfo = Start-EdgeDebug -EdgePath $edgePath -ProfileDir $EdgeProfileDir -Port $DebugPort
+        $versionInfo = Start-EdgeDebug -EdgePath $edgePath -ProfileDir $profileDir -Port $DebugPort
+        $script:CdpPort = $DebugPort
 
         $edgeVersion = 'unknown'
         if ($null -ne $versionInfo -and $versionInfo.PSObject.Properties['Browser']) {
@@ -1322,12 +1596,22 @@ function Invoke-Main {
             try {
                 Set-NavigationMarker
                 $navigation = Send-CdpCommand -Method 'Page.navigate' -Params @{ url = $definition.Url } -TimeoutSec $NavigationTimeoutSec
+                $browserErrorPage = $false
                 if ($null -ne $navigation -and $navigation.PSObject.Properties['errorText'] -and
                     -not [string]::IsNullOrWhiteSpace([string]$navigation.errorText)) {
+                    $errorText = [string]$navigation.errorText
                     $item.Status = 'FAILED'
-                    $item.Details.Add("The page could not be loaded: $([string]$navigation.errorText)")
-                    Write-RowStatus -Message "    FAILED - $([string]$navigation.errorText)" -Status 'FAILED'
-                    continue
+                    if ($errorText -eq 'net::ERR_HTTP_RESPONSE_CODE_FAILURE') {
+                        # An HTTP error with an empty body: Edge shows its own error page
+                        # instead, which is evidence like any other error page.
+                        $browserErrorPage = $true
+                        $item.Details.Add("The server returned an HTTP error with an empty body ($errorText). The browser's error page is captured below as evidence.")
+                    }
+                    else {
+                        $item.Details.Add("The page could not be loaded: $errorText")
+                        Write-RowStatus -Message "    FAILED - $errorText" -Status 'FAILED'
+                        continue
+                    }
                 }
 
                 if (-not (Wait-PageReady -TimeoutSec $NavigationTimeoutSec)) {
@@ -1352,7 +1636,9 @@ function Invoke-Main {
                     $item.Details.Add("The server returned HTTP $($item.HttpStatus). The error page is captured below as evidence.")
                 }
 
-                $item.FinalUrl = Get-CurrentPageUrl
+                # Edge's error page lives at chrome-error://; the browser stayed on the
+                # requested URL, so record that rather than report a redirect.
+                $item.FinalUrl = if ($browserErrorPage) { $definition.Url } else { Get-CurrentPageUrl }
                 $requestedOrigin = Get-OriginFromUrl -Url $definition.Url
                 $finalOrigin = Get-OriginFromUrl -Url $item.FinalUrl
                 if (-not [string]::IsNullOrWhiteSpace($finalOrigin) -and
@@ -1361,16 +1647,31 @@ function Invoke-Main {
                     if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
                     $item.Details.Add("Redirected to $finalOrigin - possible login required.")
                 }
+                elseif (-not $browserErrorPage -and -not [string]::IsNullOrWhiteSpace($item.FinalUrl)) {
+                    $hasPasswordField = $false
+                    try {
+                        $hasPasswordField = [bool](Invoke-CdpEval -TimeoutSec 10 -Expression (
+                            "Array.prototype.some.call(document.querySelectorAll('input[type=password]'), " +
+                            "function (e) { var r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; })"))
+                    }
+                    catch {
+                        Write-Verbose "Could not look for a password field: $($_.Exception.Message)"
+                    }
+                    if (Test-LoginRedirect -RequestedUrl $definition.Url -FinalUrl $item.FinalUrl -HasPasswordField $hasPasswordField) {
+                        if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
+                        $item.Details.Add("Redirected to a sign-in page ($(([Uri]$item.FinalUrl).AbsolutePath)) - the session has probably expired. Run -LoginSetup.")
+                    }
+                }
 
                 if ($definition.Steps.Count -gt 0) {
-                    $stepLog = Invoke-RowSteps -Steps @($definition.Steps) -SettleSeconds $SettleSeconds
+                    $stepLog = Invoke-RowSteps -Steps @($definition.Steps) -SettleSeconds $SettleSeconds -NavigationTimeoutSec $NavigationTimeoutSec
                     foreach ($entry in $stepLog) { $item.StepLog.Add($entry) }
                     $failedSteps = @($stepLog | Where-Object { -not $_.Ok })
                     if ($failedSteps.Count -gt 0) {
                         if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
                         $item.Details.Add("Completed with errors: $($failedSteps.Count) of $($stepLog.Count) step(s) failed.")
                     }
-                    $item.FinalUrl = Get-CurrentPageUrl
+                    if (-not $browserErrorPage) { $item.FinalUrl = Get-CurrentPageUrl }
                 }
 
                 try { [void](Send-CdpCommand -Method 'Page.bringToFront' -TimeoutSec 10) }
@@ -1409,10 +1710,13 @@ function Invoke-Main {
                     }
                 }
 
+                $truncationMessage = "Page truncated at $MaxScrollSegments segments (raise -MaxScrollSegments to capture more)."
+                $truncationNoted = $false
                 if ($segmentCount -gt $MaxScrollSegments) {
                     $segmentCount = $MaxScrollSegments
                     if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-                    $item.Details.Add("Page truncated at $MaxScrollSegments segments (raise -MaxScrollSegments to capture more).")
+                    $item.Details.Add($truncationMessage)
+                    $truncationNoted = $true
                 }
 
                 if ($definition.ScrollFullPage -and $segmentCount -gt 1 -and $viewportHeight -gt 0) {
@@ -1433,7 +1737,10 @@ function Invoke-Main {
                                         if ($recomputed -gt $MaxScrollSegments) {
                                             $recomputed = $MaxScrollSegments
                                             if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-                                            $item.Details.Add("Page truncated at $MaxScrollSegments segments (raise -MaxScrollSegments to capture more).")
+                                            if (-not $truncationNoted) {
+                                                $item.Details.Add($truncationMessage)
+                                                $truncationNoted = $true
+                                            }
                                         }
                                         $segmentCount = $recomputed
                                     }
@@ -1451,7 +1758,8 @@ function Invoke-Main {
                             $filePath = Join-Path -Path $imagesDir -ChildPath $fileName
                             [System.IO.File]::WriteAllBytes($filePath, $bytes)
                         }
-                        $item.Captures.Add((New-CaptureRecord -Bytes $bytes -Url (Get-CurrentPageUrl) -SegmentIndex ($segment + 1) -SegmentCount $segmentCount -FilePath $filePath))
+                        $segmentUrl = if ($browserErrorPage) { $item.FinalUrl } else { Get-CurrentPageUrl }
+                        $item.Captures.Add((New-CaptureRecord -Bytes $bytes -Url $segmentUrl -SegmentIndex ($segment + 1) -SegmentCount $segmentCount -FilePath $filePath))
                     }
 
                     try { [void](Invoke-CdpEval -Expression 'window.scrollTo(0, 0)' -TimeoutSec 10) }
@@ -1510,7 +1818,7 @@ function Invoke-Main {
         "Existing Edge instance reused on port $DebugPort (not launched by this run)"
     }
     else {
-        "Launched by this run on port $DebugPort using profile $EdgeProfileDir"
+        "Launched by this run on port $DebugPort using profile $profileDir"
     }
 
     $run = [pscustomobject]@{
@@ -1544,18 +1852,25 @@ function Invoke-Main {
     if ($SaveImages) { Write-Host "Individual images: $imagesDir" }
     Write-Host "Report: $reportPath ($reportSizeMb MB)" -ForegroundColor Cyan
 
-    $script:ExitCode = if ($failCount -gt 0) { 2 } else { 0 }
+    $script:ExitCode = if ($failCount -gt 0) { 2 } elseif ($FailOnWarning -and $warnCount -gt 0) { 3 } else { 0 }
 }
 
+$transcribing = Start-RunLog -Directory $LogDir
 try {
     Invoke-Main
-    exit $script:ExitCode
 }
 catch {
     Write-Host ''
     Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
     if ($null -ne $_.ScriptStackTrace) { Write-Verbose $_.ScriptStackTrace }
-    exit 1
+    $script:ExitCode = 1
 }
+finally {
+    if ($transcribing) {
+        Write-Host "Exit code: $($script:ExitCode)"
+        try { [void](Stop-Transcript) } catch { Write-Verbose 'Transcript already stopped.' }
+    }
+}
+exit $script:ExitCode
 
 #endregion

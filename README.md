@@ -48,7 +48,8 @@ one-time step. Repeat it whenever a session expires or you add a new application
 3. Open the report it prints at the end.
 
 ```powershell
-# Default: reads .\captures.csv, writes .\reports\VouchReport_<date>_<time>.html
+# Default: reads captures.csv next to the script and writes
+# reports\VouchReport_<date>_<time>.html next to the script, whatever the current folder
 .\vouch.ps1
 
 # Another definition file and output folder
@@ -67,11 +68,59 @@ one-time step. Repeat it whenever a session expires or you add a new application
 Useful switches: `-SettleSeconds` (pause after load and after each click, default 2),
 `-ScrollSettleSeconds` (pause after each scroll so lazy content can load, default 1),
 `-MaxScrollSegments` (cap per page, default 30), `-NavigationTimeoutSec` (default 30),
-`-JpegQuality` (default 85), `-DebugPort` (default 9222).
+`-JpegQuality` (default 85), `-DebugPort` (default 9222), `-FailOnWarning`,
+`-LogDir` (write a log of the run to that folder).
 Run `Get-Help .\vouch.ps1 -Detailed` for the full list.
 
-Exit code is `0` when nothing failed and `2` when at least one item failed, so the
-script can be wired into a scheduled job.
+Relative paths passed to `-CsvPath` and `-OutputDir` resolve against the current
+folder; the defaults resolve against the script's folder, so a scheduled task finds its
+files without a "Start in" setting.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Nothing failed (warnings are allowed unless `-FailOnWarning` is set). |
+| `1` | The run could not start: bad CSV, Edge not found, DevTools port unavailable. |
+| `2` | At least one item failed. |
+| `3` | Only with `-FailOnWarning`: nothing failed, but at least one item has a warning — for example an expired session redirecting to a sign-in page. Use this for scheduled jobs so an expired login does not look like a successful run. |
+
+## Running on a schedule
+
+`Install-VouchSchedule.ps1` sets up a Windows scheduled task that runs the capture for
+you — no Task Scheduler clicking needed:
+
+```powershell
+.\Install-VouchSchedule.ps1 -At 07:30                    # every weekday at 07:30
+.\Install-VouchSchedule.ps1 -Schedule Weekly -DaysOfWeek Monday -At 06:00 `
+    -CsvPath .\q3-itgc.csv -OutputDir C:\Audit\2026-Q3   # weekly, own CSV and folder
+.\Install-VouchSchedule.ps1 -Schedule AtLogOn            # 3 minutes after you sign in
+
+.\Install-VouchSchedule.ps1 -RunNow      # try it straight away
+.\Install-VouchSchedule.ps1 -Status      # next/last run, result in plain words, newest report and log
+.\Install-VouchSchedule.ps1 -Uninstall   # remove the task (reports, logs and logins are kept)
+```
+
+Running the installer again replaces the task with the new settings. It uses
+`-Daily`, `-Weekdays` (default), `-Weekly` or `-AtLogOn`, plus `-SaveImages`,
+`-ImageFormat`, `-MaxRunHours` (default 2) and `-TaskName` if you want several schedules.
+
+What the task does for you: it runs PowerShell 7 hidden in **your** signed-in session,
+starts in the script folder, writes a log of every run to `<reports>\logs\`, and passes
+`-FailOnWarning` so an expired login shows up as *Last Run Result 0x3* instead of a green
+tick (`-AllowWarnings` turns that off). A run missed while the PC was off starts as soon
+as possible, and two runs never overlap.
+
+**The one thing it cannot do for you:** screen captures need an unlocked desktop. At the
+scheduled time you must be signed in, with the screen unlocked and the screen saver not
+running — otherwise the images come out blank. If your screen locks after inactivity,
+`-Schedule AtLogOn` (run shortly after you sign in) is the most dependable choice. Over
+Remote Desktop, keep the session connected and not minimised. A task set to "run whether
+user is logged on or not" can never work, because that session has no desktop; the
+installer never sets it up that way.
+
+Sign in once with `.\vouch.ps1 -LoginSetup` before the first scheduled run, and again
+whenever `-Status` reports warnings about expired logins.
+
+For your own unattended setups, `vouch.ps1 -LogDir <folder>` writes the same run log.
 
 ## CSV reference
 
@@ -86,14 +135,18 @@ Header: `Name,Url,Steps,ScrollFullPage,Notes`
 | `Notes` | no | Free text reproduced in the report — the control reference, what the reviewer should look at, and so on. |
 
 Fields containing a comma must be quoted, as in any CSV. Excel does this for you.
+Completely blank rows (such as the `,,,,` rows Excel leaves behind) are ignored.
 
 ### Step grammar
 
 | Step | Effect |
 | --- | --- |
 | `click:<css selector>` | Clicks the first element matching the CSS selector. |
-| `clicktext:<visible text>` | Clicks the link, button or tab whose visible text matches (exact match first, otherwise the first partial match). Case-insensitive. |
-| `wait:<seconds>` | Pauses, for pages that load data after rendering. |
+| `clicktext:<visible text>` | Clicks the link, button or tab whose visible text matches. Case-insensitive. Only elements actually shown on the page count. An exact match wins; otherwise the closest partial match (the one with the shortest text). A partial match never picks a log-out / sign-out control, so `clicktext:Log` cannot end the session — write `clicktext:Log out` if you really mean it. |
+| `wait:<seconds>` | Pauses, for pages that load data after rendering. `2.5` and `2,5` both work. |
+
+When a `click:` or `clicktext:` step opens another page, the script waits for that page
+to finish loading (up to `-NavigationTimeoutSec`) before the next step or screenshot.
 
 Combine steps with `;`, for example:
 
@@ -120,8 +173,8 @@ problem never stops the run — the script always continues to the next row.
 | Badge | Meaning |
 | --- | --- |
 | **OK** (green) | Page loaded, all steps ran, screenshots taken. |
-| **WARNING** (amber) | Evidence was captured but needs a look. Typically the final URL is on a different origin than requested ("redirected to … — possible login required"), a step failed (bad selector, text not found), the page did not finish loading in time, or the page was truncated at the segment cap. |
-| **FAILED** (red) | Either the page could not be reached at all (`net::ERR_NAME_NOT_RESOLVED`, connection refused — no screenshot is possible in this case), or the server returned HTTP 400 or higher. HTTP errors are still captured: the error page is itself evidence. |
+| **WARNING** (amber) | Evidence was captured but needs a look. Typically the final URL is on a different origin than requested ("redirected to … — possible login required"), the page landed on a sign-in page of the same site ("redirected to a sign-in page — the session has probably expired"), a step failed (bad selector, text not found, a page it opened did not load in time), the page did not finish loading in time, the Edge window could not be brought to the front, or the page was truncated at the segment cap. |
+| **FAILED** (red) | Either the page could not be reached at all (`net::ERR_NAME_NOT_RESOLVED`, connection refused, or the page did not respond within `-NavigationTimeoutSec` — no screenshot is possible in these cases), or the server returned HTTP 400 or higher. HTTP errors are still captured: the error page is itself evidence. When the server sends an error with an empty body, Edge's own error page is captured instead. |
 
 Each section records the requested URL, the URL actually reached, the HTTP status, the
 outcome of every step and the exact local timestamp of each screenshot, so a reviewer
@@ -149,11 +202,16 @@ A redirect warning almost always means the session for that application expired.
 
 ## Troubleshooting
 
-**"Edge did not open its DevTools endpoint on port 9222"** — an ordinary Edge window is
-already using the audit profile, or something else holds the port. Close Edge windows
-that were started with the audit profile and retry, or pick another port with
-`-DebugPort 9333`. If a debugging-enabled Edge is already listening on the port, the
-script attaches to it instead of launching a new one and notes this in the report.
+**"Edge is already running with the audit profile … but without the DevTools port"** —
+an ordinary Edge window still uses the audit profile, usually the one opened by
+`-LoginSetup`. Close every window of it and rerun. (`-LoginSetup` closes its windows
+itself when you press Enter and warns you if any are left.)
+
+**"Edge did not open its DevTools endpoint on port 9222"** — something else holds the
+port. Pick another port with `-DebugPort 9333`. If a debugging-enabled Edge is already
+listening on the port, the script attaches to it instead of launching a new one and
+notes this in the report. The Edge the script launches is closed at the end of every run
+(unless `-KeepBrowserOpen`), so the debugging port does not stay open.
 
 **"Microsoft Edge (msedge.exe) was not found"** — Edge is not installed or not
 registered. Install it, or check
@@ -174,3 +232,19 @@ the element had not rendered yet. Add `wait:3` before the step, or rerun with
 **PowerShell refuses to run the script** — it is unsigned, so either unblock it once
 with `Unblock-File .\vouch.ps1` or start it with
 `pwsh -ExecutionPolicy Bypass -File .\vouch.ps1`.
+
+## Tests
+
+The `tests` folder holds a Pester suite: unit tests for the CSV parsing, report
+generation and helpers, and integration tests that drive a **headless** Edge (throwaway
+profile, no window, your own profiles untouched) against a local test server, including
+an end-to-end run of the capture loop with only window focus and screen capture mocked.
+
+```powershell
+Install-Module Pester -Scope CurrentUser -MinimumVersion 5.0   # once
+pwsh .\tests\Invoke-Tests.ps1              # everything (about 1 minute)
+pwsh .\tests\Invoke-Tests.ps1 -UnitOnly    # no browser needed
+```
+
+Tests tagged `KnownIssue` document bugs that are not fixed yet and are expected to fail;
+`-ExcludeKnownIssues` leaves them out. `-ResultPath results.xml` writes NUnit XML for CI.
