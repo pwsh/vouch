@@ -209,6 +209,42 @@ Describe 'Get-OriginFromUrl' {
     }
 }
 
+Describe 'Test-HttpsUpgrade' {
+    It 'returns <Expected> for <Requested> -> <Final>' -ForEach @(
+        @{ Requested = 'http://example.com/'; Final = 'https://example.com/'; Expected = $true }
+        @{ Requested = 'http://Example.com/a'; Final = 'https://example.com/b'; Expected = $true }
+        @{ Requested = 'http://example.com/'; Final = 'https://www.example.com/'; Expected = $false }
+        @{ Requested = 'http://example.com/'; Final = 'https://login.example.net/'; Expected = $false }
+        @{ Requested = 'http://example.com:8080/'; Final = 'https://example.com/'; Expected = $false }
+        @{ Requested = 'https://example.com/'; Final = 'http://example.com/'; Expected = $false }
+        @{ Requested = 'http://example.com/'; Final = ''; Expected = $false }
+    ) {
+        Test-HttpsUpgrade -RequestedUrl $Requested -FinalUrl $Final | Should -Be $Expected
+    }
+}
+
+Describe 'ConvertTo-RunSummaryJson' {
+    It 'carries the run, the items and capture metadata but no image data' {
+        $captures = [System.Collections.Generic.List[object]]::new()
+        $captures.Add((New-CaptureRecord -Bytes ([byte[]](1, 2, 3)) -Url 'https://a/' -SegmentIndex 1 -SegmentCount 1 -FilePath 'C:\x.jpg'))
+        $item = [pscustomobject]@{
+            Index = 1; Name = 'A'; Url = 'https://a/'; FinalUrl = 'https://a/'; Status = 'OK'; HttpStatus = 200
+            ScrollFullPage = $false; Details = [System.Collections.Generic.List[string]]::new()
+            StepLog = [System.Collections.Generic.List[object]]::new(); Captures = $captures
+        }
+        $run = [pscustomobject]@{ OkCount = 1; WarnCount = 0; FailCount = 0; CaptureCount = 1 }
+        $json = ConvertTo-RunSummaryJson -Items @($item) -Run $run -ReportPath 'C:\r.html' -ExitCode 0
+        $json | Should -Not -Match 'Base64|AQID'
+        $parsed = $json | ConvertFrom-Json
+        $parsed.ExitCode | Should -Be 0
+        $parsed.Run.OkCount | Should -Be 1
+        $parsed.Items[0].Status | Should -Be 'OK'
+        @($parsed.Items[0].Details).Count | Should -Be 0
+        $parsed.Items[0].Captures[0].FilePath | Should -Be 'C:\x.jpg'
+        $parsed.Items[0].Captures[0].Bytes | Should -Be 3
+    }
+}
+
 Describe 'Encode-Html and ConvertTo-JsLiteral' {
     It 'escapes all five HTML special characters, ampersand first' {
         Encode-Html -Text '<a href="x">Tom & Jerry''s</a>' |

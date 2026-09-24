@@ -354,6 +354,29 @@ Describe 'Browser lifecycle' -Tag 'Integration' {
         Get-DebugEndpointInfo -Port $port -TimeoutSec 1 | Should -BeNullOrEmpty
     }
 
+    It 'Get-CdpPageTarget uses the existing tab instead of opening another' {
+        $port = Get-FreeTcpPort
+        [void](Start-HeadlessEdge -Port $port -ProfileDir $lifecycleProfile)
+        $target = Get-CdpPageTarget -Port $port -WaitSeconds 10
+        $pages = @(Get-DevToolsTargetList -Port $port | Where-Object type -eq 'page')
+        $pages.Count | Should -Be 1
+        $target.id | Should -Be $pages[0].id
+    }
+
+    It 'Close-OtherPageTargets leaves only the tab in use' {
+        $port = Get-FreeTcpPort
+        [void](Start-HeadlessEdge -Port $port -ProfileDir $lifecycleProfile)
+        $keep = Get-CdpPageTarget -Port $port -WaitSeconds 10
+        1..2 | ForEach-Object { [void](Invoke-RestMethod -Method Put -Uri "http://127.0.0.1:$port/json/new?about:blank" -NoProxy) }
+        @(Get-DevToolsTargetList -Port $port | Where-Object type -eq 'page').Count | Should -Be 3
+
+        Close-OtherPageTargets -Port $port -KeepId $keep.id
+        Start-Sleep -Milliseconds 500
+        $pages = @(Get-DevToolsTargetList -Port $port | Where-Object type -eq 'page')
+        $pages.Count | Should -Be 1
+        $pages[0].id | Should -Be $keep.id
+    }
+
     It 'Start-EdgeDebug refuses a profile an ordinary Edge window already holds' {
         # No DevTools port: the situation after -LoginSetup's window was left open.
         [void](Start-Process -FilePath (Get-EdgePathForTest) -ArgumentList @(

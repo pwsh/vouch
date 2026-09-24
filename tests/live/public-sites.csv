@@ -1,0 +1,11 @@
+Name,Url,Steps,ScrollFullPage,Notes,Expect,ExpectCaptures,ExpectFinalUrl
+Example Domain,https://example.com/,,N,Baseline: a small static page.,OK,1,https://example.com/
+Wikipedia - Audit (full page),https://en.wikipedia.org/wiki/Audit,,Y,Long article captured as several scroll segments.,OK,2+,*wikipedia.org/wiki/Audit*
+Python.org - Downloads via clicktext,https://www.python.org/,clicktext:Downloads,N,A click step that opens another page; the capture must show the new page.,OK,1,*python.org/downloads/*
+Hacker News - newest via selector,https://news.ycombinator.com/,click:a[href='newest'],N,A CSS selector click step that opens another page.,OK,1,*news.ycombinator.com/newest*
+GitHub - vouch repository,https://github.com/pwsh/vouch,,N,A large public web application page.,OK,1,https://github.com/pwsh/vouch
+GitHub - missing page,https://github.com/pwsh/vouch-live-test-page-that-does-not-exist,,N,HTTP 404 with an error page: FAILED but captured.,FAILED,1,
+httpbin - 404 with an empty body,https://httpbin.org/status/404,,N,HTTP 404 without a body: FAILED and Edge's own error page captured.,FAILED,1,
+Plain http upgraded to https,http://example.com/,,N,The site answers on https; an http-to-https upgrade is not a login redirect.,OK,1,https://example.com/
+Step that cannot succeed,https://example.com/,clicktext:No Such Link Anywhere;wait:1,N,A failed step: WARNING but captured.,WARNING,1,
+Unreachable host,https://vouch-live-test.invalid/,,N,DNS failure: FAILED without a screenshot.,FAILED,0,

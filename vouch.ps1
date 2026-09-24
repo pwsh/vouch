@@ -24,6 +24,11 @@
     example an expired session redirecting to a sign-in page). Without it, warnings
     exit with 0.
 
+.PARAMETER JsonSummary
+    Also write the results as JSON next to the report (same name, .json): run metadata
+    and per-item status, URLs, details, steps and capture timestamps - no image data.
+    For monitoring and tests; Install-VouchSchedule.ps1 sets it.
+
 .PARAMETER LogDir
     Write a transcript of the run (vouch_<date>_<time>.log) to this folder. Meant for
     unattended runs; Install-VouchSchedule.ps1 sets it.
@@ -80,6 +85,8 @@ param(
     [switch]$FailOnWarning,
 
     [string]$LogDir = '',
+
+    [switch]$JsonSummary,
 
     [switch]$LoginSetup
 )
@@ -491,25 +498,49 @@ function Start-EdgeDebug {
     throw "Edge did not open its DevTools endpoint on port $Port within 15 seconds. Close any running Edge instance that uses the audit profile and try again, or pick another port with -DebugPort."
 }
 
-function Get-CdpPageTarget {
+function Get-DevToolsTargetList {
+    <#
+        PowerShell 7's Invoke-RestMethod writes a JSON array to the pipeline as ONE object,
+        so @(Invoke-RestMethod ...) is a one-element array holding the whole list. Unroll
+        it, or every lookup silently sees a single "target" with no type.
+    #>
     param([Parameter(Mandatory)][int]$Port)
+    $response = Invoke-RestMethod -Uri "http://$($script:CdpHost):$Port/json/list" -TimeoutSec 10 -NoProxy
+    $response | ForEach-Object { $_ }
+}
 
-    $targets = @()
-    try {
-        $targets = @(Invoke-RestMethod -Uri "http://$($script:CdpHost):$Port/json/list" -TimeoutSec 10 -NoProxy)
-    }
-    catch {
-        Write-Verbose "Could not enumerate DevTools targets: $($_.Exception.Message)"
-    }
+function Get-CdpPageTarget {
+    <#
+        Returns an existing tab, or opens one. Right after the DevTools port opens, a
+        freshly launched Edge briefly lists no tabs at all even though its about:blank
+        tab is on its way, so wait up to -WaitSeconds for it rather than opening a
+        second tab that would then show up in every screenshot.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$Port,
+        [double]$WaitSeconds = 0
+    )
 
-    foreach ($target in $targets) {
-        if ($target.PSObject.Properties['type'] -and $target.type -eq 'page' -and
-            $target.PSObject.Properties['webSocketDebuggerUrl'] -and
-            -not [string]::IsNullOrWhiteSpace($target.webSocketDebuggerUrl)) {
-            $targetUrl = if ($target.PSObject.Properties['url']) { [string]$target.url } else { '' }
-            if ($targetUrl -notlike 'devtools://*') { return $target }
+    $deadline = (Get-Date).AddSeconds($WaitSeconds)
+    do {
+        $targets = @()
+        try {
+            $targets = @(Get-DevToolsTargetList -Port $Port)
         }
-    }
+        catch {
+            Write-Verbose "Could not enumerate DevTools targets: $($_.Exception.Message)"
+        }
+
+        foreach ($target in $targets) {
+            if ($target.PSObject.Properties['type'] -and $target.type -eq 'page' -and
+                $target.PSObject.Properties['webSocketDebuggerUrl'] -and
+                -not [string]::IsNullOrWhiteSpace($target.webSocketDebuggerUrl)) {
+                $targetUrl = if ($target.PSObject.Properties['url']) { [string]$target.url } else { '' }
+                if ($targetUrl -notlike 'devtools://*') { return $target }
+            }
+        }
+        if ((Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+    } while ((Get-Date) -lt $deadline)
 
     # Newer Chromium builds reject GET on /json/new; PUT is the supported verb.
     # GET is kept as a fallback for older builds.
@@ -520,6 +551,31 @@ function Get-CdpPageTarget {
     catch {
         Write-Verbose "PUT /json/new failed ($($_.Exception.Message)); retrying with GET."
         return Invoke-RestMethod -Method Get -Uri $newTargetUri -TimeoutSec 10 -NoProxy
+    }
+}
+
+function Close-OtherPageTargets {
+    <#
+        A fresh profile opens with more than one tab (the about:blank from the command line
+        plus Edge's own start page). Every screenshot shows the tab strip, so close the
+        tabs the run does not use. Only called for an Edge this run launched.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][string]$KeepId
+    )
+    try {
+        $targets = @(Get-DevToolsTargetList -Port $Port)
+    }
+    catch {
+        Write-Verbose "Could not list tabs to tidy up: $($_.Exception.Message)"
+        return
+    }
+    foreach ($target in $targets) {
+        if (-not $target.PSObject.Properties['type'] -or $target.type -ne 'page') { continue }
+        if ([string]$target.id -eq $KeepId) { continue }
+        try { [void](Invoke-RestMethod -Uri "http://$($script:CdpHost):$Port/json/close/$($target.id)" -TimeoutSec 10 -NoProxy) }
+        catch { Write-Verbose "Could not close tab $($target.id): $($_.Exception.Message)" }
     }
 }
 
@@ -906,6 +962,25 @@ function Get-SafeFileName {
     if ([string]::IsNullOrWhiteSpace($safe)) { $safe = 'capture' }
     if ($safe.Length -gt 48) { $safe = $safe.Substring(0, 48) }
     return $safe
+}
+
+function Test-HttpsUpgrade {
+    <#
+        http://host/ answered by https://host/ is a different origin, but it is the site
+        enforcing TLS, not a login redirect. Only the scheme may change: same host, and
+        default ports on both sides.
+    #>
+    param([string]$RequestedUrl, [string]$FinalUrl)
+    try {
+        $requested = [Uri]::new($RequestedUrl)
+        $final = [Uri]::new($FinalUrl)
+    }
+    catch {
+        return $false
+    }
+    return $requested.Scheme -eq 'http' -and $final.Scheme -eq 'https' -and
+        $requested.IsDefaultPort -and $final.IsDefaultPort -and
+        $requested.IdnHost -eq $final.IdnHost
 }
 
 function Get-OriginFromUrl {
@@ -1485,6 +1560,49 @@ function Invoke-LoginSetup {
     }
 }
 
+function ConvertTo-RunSummaryJson {
+    <#
+        Machine-readable companion to the HTML report (-JsonSummary): the same run
+        metadata and per-item results, without the image data.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items,
+        [Parameter(Mandatory)][object]$Run,
+        [Parameter(Mandatory)][string]$ReportPath,
+        [Parameter(Mandatory)][int]$ExitCode
+    )
+
+    $summary = [ordered]@{
+        Report    = $ReportPath
+        ExitCode  = $ExitCode
+        Run       = $Run
+        Items     = @(foreach ($item in $Items) {
+            [ordered]@{
+                Index          = $item.Index
+                Name           = $item.Name
+                Url            = $item.Url
+                FinalUrl       = $item.FinalUrl
+                Status         = $item.Status
+                HttpStatus     = $item.HttpStatus
+                ScrollFullPage = $item.ScrollFullPage
+                Details        = @($item.Details)
+                Steps          = @($item.StepLog | ForEach-Object { [ordered]@{ Text = $_.Text; Ok = $_.Ok; Message = $_.Message } })
+                Captures       = @($item.Captures | ForEach-Object {
+                    [ordered]@{
+                        Timestamp    = $_.Timestamp
+                        Url          = $_.Url
+                        SegmentIndex = $_.SegmentIndex
+                        SegmentCount = $_.SegmentCount
+                        Bytes        = $_.Bytes
+                        FilePath     = $_.FilePath
+                    }
+                })
+            }
+        })
+    }
+    return ($summary | ConvertTo-Json -Depth 6)
+}
+
 function Start-RunLog {
     <#
         Unattended runs have no console to read, so -LogDir keeps a transcript of each
@@ -1568,11 +1686,12 @@ function Invoke-Main {
         }
         Write-Host "Connected to $edgeVersion"
 
-        $target = Get-CdpPageTarget -Port $DebugPort
+        $target = Get-CdpPageTarget -Port $DebugPort -WaitSeconds 10
         if ($null -eq $target -or -not $target.PSObject.Properties['webSocketDebuggerUrl']) {
             throw 'Could not obtain a DevTools page target from Edge.'
         }
         Connect-CdpSocket -WebSocketUrl ([string]$target.webSocketDebuggerUrl)
+        if ($script:LaunchedEdge) { Close-OtherPageTargets -Port $DebugPort -KeepId ([string]$target.id) }
 
         foreach ($definition in $definitions) {
             $item = [pscustomobject]@{
@@ -1643,7 +1762,8 @@ function Invoke-Main {
                 $finalOrigin = Get-OriginFromUrl -Url $item.FinalUrl
                 if (-not [string]::IsNullOrWhiteSpace($finalOrigin) -and
                     -not [string]::IsNullOrWhiteSpace($requestedOrigin) -and
-                    $finalOrigin -ne $requestedOrigin) {
+                    $finalOrigin -ne $requestedOrigin -and
+                    -not (Test-HttpsUpgrade -RequestedUrl $definition.Url -FinalUrl $item.FinalUrl)) {
                     if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
                     $item.Details.Add("Redirected to $finalOrigin - possible login required.")
                 }
@@ -1846,13 +1966,20 @@ function Invoke-Main {
     [System.IO.File]::WriteAllText($reportPath, $html, [System.Text.UTF8Encoding]::new($false))
 
     $reportSizeMb = [Math]::Round((Get-Item -LiteralPath $reportPath).Length / 1MB, 1)
+    $script:ExitCode = if ($failCount -gt 0) { 2 } elseif ($FailOnWarning -and $warnCount -gt 0) { 3 } else { 0 }
+
+    $summaryPath = ''
+    if ($JsonSummary) {
+        $summaryPath = [System.IO.Path]::ChangeExtension($reportPath, '.json')
+        $json = ConvertTo-RunSummaryJson -Items @($items) -Run $run -ReportPath $reportPath -ExitCode $script:ExitCode
+        [System.IO.File]::WriteAllText($summaryPath, $json, [System.Text.UTF8Encoding]::new($false))
+    }
 
     Write-Host ''
     Write-Host "Done. $($items.Count) item(s): $okCount OK, $warnCount warning(s), $failCount failed. $captureCount screenshot(s)." -ForegroundColor Cyan
     if ($SaveImages) { Write-Host "Individual images: $imagesDir" }
     Write-Host "Report: $reportPath ($reportSizeMb MB)" -ForegroundColor Cyan
-
-    $script:ExitCode = if ($failCount -gt 0) { 2 } elseif ($FailOnWarning -and $warnCount -gt 0) { 3 } else { 0 }
+    if ($summaryPath) { Write-Host "Summary: $summaryPath" }
 }
 
 $transcribing = Start-RunLog -Directory $LogDir

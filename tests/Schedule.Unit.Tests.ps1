@@ -28,6 +28,14 @@ Describe 'Get-VouchTaskArguments' {
         $full | Should -Match '-ImageFormat png -SaveImages -FailOnWarning'
     }
 
+    It 'always asks for the JSON summary and passes profile and port when given' {
+        $plain = Get-VouchTaskArguments -ScriptPath 'C:\v\vouch.ps1' -LogDir 'C:\v\logs'
+        $plain | Should -Match '-JsonSummary'
+        $plain | Should -Not -Match 'EdgeProfileDir|DebugPort'
+        $custom = Get-VouchTaskArguments -ScriptPath 'C:\v\vouch.ps1' -LogDir 'C:\v\logs' -EdgeProfileDir 'C:\P 2\' -DebugPort 9333
+        $custom | Should -Match '-EdgeProfileDir "C:\\P 2" -DebugPort 9333'
+    }
+
     It 'splits back into the same arguments the way CreateProcess would' {
         $arguments = Get-VouchTaskArguments -ScriptPath 'C:\Tools\My Vouch\vouch.ps1' -LogDir 'C:\Out\logs' -CsvPath 'C:\A B\c.csv'
         # Round-trip through a real process: echo the argv pwsh receives.

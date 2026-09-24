@@ -85,6 +85,15 @@ param(
     [ValidateRange(1, 24)]
     [int]$MaxRunHours = 2,
 
+    # Only needed for a second schedule on the same machine: give each its own port
+    # (and, if they sign in to different accounts, its own profile).
+    [Parameter(ParameterSetName = 'Install')]
+    [string]$EdgeProfileDir = '',
+
+    [Parameter(ParameterSetName = 'Install')]
+    [ValidateRange(0, 65535)]
+    [int]$DebugPort = 0,
+
     [Parameter(ParameterSetName = 'Status', Mandatory)]
     [switch]$Status,
 
@@ -133,7 +142,9 @@ function Get-VouchTaskArguments {
         [string]$OutputDir = '',
         [string]$ImageFormat = 'jpeg',
         [bool]$SaveImages = $false,
-        [bool]$FailOnWarning = $true
+        [bool]$FailOnWarning = $true,
+        [string]$EdgeProfileDir = '',
+        [int]$DebugPort = 0
     )
 
     $arguments = [System.Collections.Generic.List[string]]::new()
@@ -146,6 +157,10 @@ function Get-VouchTaskArguments {
     if ($ImageFormat -ne 'jpeg') { $arguments.Add('-ImageFormat'); $arguments.Add($ImageFormat) }
     if ($SaveImages) { $arguments.Add('-SaveImages') }
     if ($FailOnWarning) { $arguments.Add('-FailOnWarning') }
+    if ($EdgeProfileDir) { $arguments.Add('-EdgeProfileDir'); $arguments.Add((ConvertTo-TaskArgument -Value $EdgeProfileDir)) }
+    if ($DebugPort -gt 0) { $arguments.Add('-DebugPort'); $arguments.Add([string]$DebugPort) }
+    # The JSON summary lets -Status report the last run's counts.
+    $arguments.Add('-JsonSummary')
     $arguments.Add('-LogDir')
     $arguments.Add((ConvertTo-TaskArgument -Value $LogDir))
     return ($arguments -join ' ')
@@ -225,11 +240,24 @@ function Show-VouchStatus {
     $lastRun = if ($info.LastRunTime -and $info.LastRunTime.Year -gt 2000) { $info.LastRunTime } else { 'never' }
     $report = Get-NewestFile -Directory $outputDir -Filter '*.htm*'
     $log = Get-NewestFile -Directory $logDir -Filter 'vouch_*.log'
+    $counts = ''
+    $summaryFile = Get-NewestFile -Directory $outputDir -Filter '*.json'
+    if ($null -ne $summaryFile) {
+        try {
+            $summary = Get-Content -LiteralPath $summaryFile.FullName -Raw | ConvertFrom-Json
+            $counts = "$($summary.Run.OkCount) OK, $($summary.Run.WarnCount) warning(s), $($summary.Run.FailCount) failed, " +
+                "$($summary.Run.CaptureCount) screenshot(s) - run of $($summary.Run.StartTime)"
+        }
+        catch {
+            Write-Verbose "Could not read $($summaryFile.FullName): $($_.Exception.Message)"
+        }
+    }
 
     Write-Host "Task:        $TaskName ($($task.State))" -ForegroundColor Cyan
     Write-Host "Next run:    $(if ($info.NextRunTime) { $info.NextRunTime } else { 'not scheduled' })"
     Write-Host "Last run:    $lastRun"
     Write-Host "Last result: $(Get-ExitCodeMeaning -Code $info.LastTaskResult)"
+    if ($counts) { Write-Host "Last report: $counts" }
     Write-Host "Command:     $($task.Actions[0].Execute) $arguments"
     Write-Host "Newest report: $(if ($report) { $report.FullName } else { 'none yet' })"
     Write-Host "Newest log:    $(if ($log) { $log.FullName } else { 'none yet' })"
@@ -252,14 +280,16 @@ function Install-VouchTask {
     if (-not (Test-Path -LiteralPath $csv -PathType Leaf)) {
         throw "Capture definition CSV not found: $csv`nCreate it first (copy captures.sample.csv), or pass -CsvPath."
     }
-    if (-not (Test-Path -LiteralPath $defaultProfileDir)) {
-        Write-Warning 'The audit browser profile does not exist yet. Run .\vouch.ps1 -LoginSetup and sign in before the first scheduled run.'
+    $edgeProfile = if ($EdgeProfileDir) { & $resolve $EdgeProfileDir } else { '' }
+    if (-not (Test-Path -LiteralPath $(if ($edgeProfile) { $edgeProfile } else { $defaultProfileDir }))) {
+        Write-Warning 'The audit browser profile does not exist yet. Run .\vouch.ps1 -LoginSetup (with the same -EdgeProfileDir) and sign in before the first scheduled run of pages that need a login.'
     }
 
     $userId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     $action = New-ScheduledTaskAction -Execute (Get-PwshPath) -WorkingDirectory $PSScriptRoot -Argument (
         Get-VouchTaskArguments -ScriptPath $vouchScript -LogDir $logDir -CsvPath $csv -OutputDir $output `
-            -ImageFormat $ImageFormat -SaveImages $SaveImages.IsPresent -FailOnWarning (-not $AllowWarnings))
+            -ImageFormat $ImageFormat -SaveImages $SaveImages.IsPresent -FailOnWarning (-not $AllowWarnings) `
+            -EdgeProfileDir $edgeProfile -DebugPort $DebugPort)
     $trigger = New-VouchTrigger -Schedule $Schedule -At $At -DaysOfWeek $DaysOfWeek -UserId $userId
     # Interactive: runs in your signed-in session, the only one with a desktop to capture.
     $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited

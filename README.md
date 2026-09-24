@@ -69,7 +69,8 @@ Useful switches: `-SettleSeconds` (pause after load and after each click, defaul
 `-ScrollSettleSeconds` (pause after each scroll so lazy content can load, default 1),
 `-MaxScrollSegments` (cap per page, default 30), `-NavigationTimeoutSec` (default 30),
 `-JpegQuality` (default 85), `-DebugPort` (default 9222), `-FailOnWarning`,
-`-LogDir` (write a log of the run to that folder).
+`-LogDir` (write a log of the run to that folder), `-JsonSummary` (also write the
+results as `.json` next to the report, for monitoring or scripts).
 Run `Get-Help .\vouch.ps1 -Detailed` for the full list.
 
 Relative paths passed to `-CsvPath` and `-OutputDir` resolve against the current
@@ -248,3 +249,24 @@ pwsh .\tests\Invoke-Tests.ps1 -UnitOnly    # no browser needed
 
 Tests tagged `KnownIssue` document bugs that are not fixed yet and are expected to fail;
 `-ExcludeKnownIssues` leaves them out. `-ResultPath results.xml` writes NUnit XML for CI.
+
+### Live test against public websites
+
+`tests\live\Invoke-LiveTest.ps1` runs the real thing: Edge opens maximised on this
+desktop and captures ten public pages listed in `tests\live\public-sites.csv` — a plain
+page, a long Wikipedia article in scroll segments, click steps that open other pages, a
+404 with and without a body, an http-to-https upgrade, a failing step and an unreachable
+host. Each row carries its expected status, screenshot count and final URL, and the
+runner checks them, plus: every screenshot exists at full screen size and is not blank,
+the taskbar strip is present, the exit code is right, and Edge is gone afterwards.
+
+```powershell
+pwsh .\tests\live\Invoke-LiveTest.ps1                 # about 1 minute; hands off the keyboard and mouse
+pwsh .\tests\live\Invoke-LiveTest.ps1 -ViaScheduler   # same, through a temporary scheduled task
+```
+
+It takes over the screen, needs internet access, and uses its own throwaway Edge profile
+and port (9333), so the audit profile is never touched. Results, the report and the
+images land in `tests\live\output\<date>` (git-ignored). Public sites change, so an
+unexpected result can mean the site moved rather than that Vouch broke — look at the
+screenshot before concluding either way.
