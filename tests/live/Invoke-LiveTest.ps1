@@ -142,6 +142,21 @@ if ($portBusy) { throw "A DevTools endpoint already listens on port $DebugPort. 
 $rows = @(Import-Csv -LiteralPath $CsvPath)
 [void](New-Item -ItemType Directory -Path $runDir -Force)
 
+# Rows can point at the local test server ({LOCAL}; {OTHER} is a second origin) for page
+# layouts no stable public site guarantees - inner scrolling panels, frames. Start it
+# and hand vouch.ps1 a copy of the CSV with the real addresses.
+$testServer = $null
+$csvText = Get-Content -LiteralPath $CsvPath -Raw
+if ($csvText -match '\{LOCAL\}|\{OTHER\}') {
+    . (Join-Path -Path $PSScriptRoot -ChildPath '..\TestHelpers.ps1')
+    $localPort = Get-FreeTcpPort
+    $otherPort = Get-FreeTcpPort
+    $testServer = Start-TestServer -Port $localPort, $otherPort
+    $CsvPath = Join-Path -Path $runDir -ChildPath 'sites.csv'
+    $csvText.Replace('{LOCAL}', "http://localhost:$localPort").Replace('{OTHER}', "http://localhost:$otherPort") |
+        Set-Content -LiteralPath $CsvPath -Encoding utf8 -NoNewline
+}
+
 Write-Host "Live test: $($rows.Count) sites from $CsvPath" -ForegroundColor Cyan
 Write-Host "Output:    $runDir"
 Write-Host 'Edge is about to take over the screen. Do not touch the mouse or keyboard until it finishes.' -ForegroundColor Yellow
@@ -286,6 +301,8 @@ else {
 Write-Host ''
 $report = Get-ChildItem -LiteralPath $runDir -Filter '*.htm*' -File | Select-Object -First 1
 if ($report) { Write-Host "Report: $($report.FullName)" }
+if ($null -ne $testServer) { Stop-Process -Id $testServer.Id -Force -ErrorAction SilentlyContinue }
+
 if ($failures.Count -eq 0) {
     Write-Host "LIVE TEST PASSED ($($rows.Count) sites)" -ForegroundColor Green
     exit 0

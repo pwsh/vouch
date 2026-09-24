@@ -218,7 +218,7 @@ Header: `Name,Url,Steps,ScrollFullPage,Notes`
 | `Name` | yes | Short label for the evidence item. Shown in the report and used in image file names. |
 | `Url` | yes | Page to capture. Must start with `http://` or `https://`. |
 | `Steps` | no | Semicolon-separated actions performed after the page loads, before the screenshot. |
-| `ScrollFullPage` | no | `Y` to scroll the whole page and capture every screenful. Blank or `N` captures one screen. Also accepts `Yes`/`No`, `True`/`False`, `1`/`0`. |
+| `ScrollFullPage` | no | `Y` to scroll the whole page and capture every screenful. Works when the content scrolls inside a panel or a frame rather than the page itself (see *Inner scrolling areas and frames*). Blank or `N` captures one screen. Also accepts `Yes`/`No`, `True`/`False`, `1`/`0`. |
 | `Notes` | no | Free text reproduced in the report — the control reference, what the reviewer should look at, and so on. |
 
 Fields containing a comma must be quoted, as in any CSV. Excel does this for you.
@@ -228,7 +228,7 @@ Completely blank rows (such as the `,,,,` rows Excel leaves behind) are ignored.
 
 | Step | Effect |
 | --- | --- |
-| `click:<css selector>` | Clicks the first element matching the CSS selector. |
+| `click:<css selector>` | Clicks the first element matching the CSS selector - on the page, or else inside one of its frames. |
 | `clicktext:<visible text>` | Clicks the link, button or tab whose visible text matches. Case-insensitive. Only elements actually shown on the page count. An exact match wins; otherwise the closest partial match (the one with the shortest text). A partial match never picks a log-out / sign-out control, so `clicktext:Log` cannot end the session — write `clicktext:Log out` if you really mean it. |
 | `wait:<seconds>` | Pauses, for pages that load data after rendering. `2.5` and `2,5` both work. |
 
@@ -240,6 +240,24 @@ Combine steps with `;`, for example:
 ```
 click:#settings-tab ; clicktext:Audit Log ; wait:3
 ```
+
+### Inner scrolling areas and frames
+
+Many web applications do not scroll the page itself: a header and menu stay still and
+only a panel inside the page scrolls, or the content sits in a frame. For `ScrollFullPage`
+rows, Vouch looks at what actually scrolls — the page, any large panel inside it, or a
+frame (and panels inside frames) — and steps through the largest one it can see, one
+screenshot per screenful of that area. The report's *Scroll capture* line names what was
+scrolled (for example `div#main`, or `the frame /app/content`). Scrolling areas smaller
+than a quarter of the screen, such as a sidebar or a code box, are left alone.
+
+When a page has a **second** large scrolling area, or a large **frame from another site**
+(the browser does not let a page look into those), the content hidden in it cannot be
+captured; the item is marked WARNING and the reason says which area it was.
+
+`click:` and `clicktext:` steps search the page first, then its frames. Frames from
+another site cannot be searched; when a step fails on such a page the message says so.
+A click that loads a new page inside a frame waits for that frame to finish loading.
 
 Prefer `clicktext:` — it survives redesigns better than a selector. Use `click:` when
 the target has no distinctive text or the same text appears several times.
@@ -260,7 +278,7 @@ problem never stops the run — the script always continues to the next row.
 | Badge | Meaning |
 | --- | --- |
 | **OK** (green) | Page loaded, all steps ran, screenshots taken. |
-| **WARNING** (amber) | Evidence was captured but needs a look. Typically the final URL is on a different origin than requested ("redirected to … — possible login required"), the page landed on a sign-in page of the same site ("redirected to a sign-in page — the session has probably expired"), a step failed (bad selector, text not found, a page it opened did not load in time), the page did not finish loading in time, the Edge window could not be brought to the front, or the page was truncated at the segment cap. |
+| **WARNING** (amber) | Evidence was captured but needs a look. Typically the final URL is on a different origin than requested ("redirected to … — possible login required"), the page landed on a sign-in page of the same site ("redirected to a sign-in page — the session has probably expired"), a step failed (bad selector, text not found, a page it opened did not load in time), the page did not finish loading in time, the Edge window could not be brought to the front, the page was truncated at the segment cap, or a full-page capture found a second large scrolling area or a frame from another site whose hidden content it could not scroll. |
 | **FAILED** (red) | Either the page could not be reached at all (`net::ERR_NAME_NOT_RESOLVED`, connection refused, or the page did not respond within `-NavigationTimeoutSec` — no screenshot is possible in these cases), or the server returned HTTP 400 or higher. HTTP errors are still captured: the error page is itself evidence. When the server sends an error with an empty body, Edge's own error page is captured instead. |
 
 Each section records the requested URL, the URL actually reached, the HTTP status, the

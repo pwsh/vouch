@@ -55,6 +55,45 @@ while ($listener.IsListening) {
                 $to = $query['to']
                 Send-Response $context 302 '' @{ Location = $to }
             }
+            '^/innerscroll$' {
+                # App-style layout: the page never scrolls, a panel inside it does.
+                $rows = if ($query['rows']) { [int]$query['rows'] } else { 20 }
+                $content = (1..$rows | ForEach-Object { "<div class='row'>Inner row $_</div>" }) -join ''
+                $body = "<style>html,body{margin:0;height:100%;overflow:hidden} header{height:60px;background:#333;color:#fff}" +
+                    " #main{height:calc(100% - 60px);overflow-y:auto} .row{height:100px;border-bottom:1px solid #ccc}</style>" +
+                    "<header>Admin console</header><div id='main'>$content</div>"
+                Send-Response $context 200 (Page 'Inner scroll' $body)
+            }
+            '^/tworegions$' {
+                $column = (1..20 | ForEach-Object { "<div style='height:100px'>Line $_</div>" }) -join ''
+                $body = "<style>html,body{margin:0;height:100%;overflow:hidden} .pane{float:left;width:50%;height:100%;overflow-y:auto}</style>" +
+                    "<div class='pane' id='left'>$column</div><div class='pane' id='right'>$column</div>"
+                Send-Response $context 200 (Page 'Two regions' $body)
+            }
+            '^/framepage$' {
+                $rows = if ($query['rows']) { [int]$query['rows'] } else { 12 }
+                $body = "<style>html,body{margin:0;height:100%;overflow:hidden}</style>" +
+                    "<iframe id='content' name='content' src='/framecontent?rows=$rows' style='border:0;width:100%;height:100%'></iframe>"
+                Send-Response $context 200 (Page 'Frame page' $body)
+            }
+            '^/framecontent$' {
+                $rows = if ($query['rows']) { [int]$query['rows'] } else { 12 }
+                $content = (1..$rows | ForEach-Object { "<div style='height:100px;border-bottom:1px solid #ccc'>Frame row $_</div>" }) -join ''
+                $body = "<button id='frame-btn' onclick=""top.document.title='FRAME CLICKED'"">Frame button</button>" +
+                    "<a id='frame-next' href='/slowsame?s=2'>Frame next</a>$content"
+                Send-Response $context 200 (Page 'Frame content' $body)
+            }
+            '^/slowsame$' {
+                $seconds = if ($query['s']) { [int]$query['s'] } else { 2 }
+                Start-Sleep -Seconds $seconds
+                Send-Response $context 200 (Page 'Slow same' '<h1>Loaded in the frame</h1>')
+            }
+            '^/xframe$' {
+                $to = [System.Net.WebUtility]::HtmlEncode($query['to'])
+                $body = "<style>html,body{margin:0;height:100%;overflow:hidden}</style>" +
+                    "<iframe src='$to' style='border:0;width:100%;height:100%'></iframe>"
+                Send-Response $context 200 (Page 'Other-site frame' $body)
+            }
             '^/links$' {
                 $to = [System.Net.WebUtility]::HtmlEncode($query['to'])
                 Send-Response $context 200 (Page 'Links' "<a id='go' href='$to'>Go</a>")

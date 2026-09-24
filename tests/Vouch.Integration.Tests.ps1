@@ -113,6 +113,84 @@ Describe 'CDP plumbing' -Tag 'Integration' {
         }
     }
 
+    Context 'finding what scrolls' {
+        It 'uses the window on an ordinary long page' {
+            [void](Open-TestPage "$Web/tall?px=3000")
+            $target = Invoke-CdpEval -Expression (Get-ScrollTargetScript)
+            $target.kind | Should -Be 'window'
+            $target.total | Should -BeGreaterThan 2900
+        }
+
+        It 'finds nothing to scroll on a page that fits' {
+            [void](Open-TestPage "$Web/ok")
+            (Invoke-CdpEval -Expression (Get-ScrollTargetScript)).kind | Should -Be 'none'
+        }
+
+        It 'scrolls the inner panel of an app-style page' {
+            [void](Open-TestPage "$Web/innerscroll?rows=20")
+            $target = Invoke-CdpEval -Expression (Get-ScrollTargetScript)
+            $target.kind | Should -Be 'element'
+            $target.description | Should -Be 'div#main'
+            $target.total | Should -Be 2020   # 20 rows of 100 px plus a 1 px border each
+            $target.view | Should -BeLessThan $target.total
+            @($target.others).Count | Should -Be 0
+            Invoke-CdpEval -Expression 'window.__vouchTarget.to(500)' | Should -Be 500
+            Invoke-CdpEval -Expression "document.getElementById('main').scrollTop" | Should -Be 500
+            Invoke-CdpEval -Expression 'window.scrollY' | Should -Be 0
+        }
+
+        It 'scrolls the frame that holds the content' {
+            [void](Open-TestPage "$Web/framepage?rows=30")
+            $target = Invoke-CdpEval -Expression (Get-ScrollTargetScript)
+            $target.kind | Should -Be 'frame'
+            $target.description | Should -BeLike '*framecontent*'
+            [void](Invoke-CdpEval -Expression 'window.__vouchTarget.to(700)')
+            Invoke-CdpEval -Expression "document.getElementById('content').contentWindow.scrollY" | Should -Be 700
+        }
+
+        It 'reports a second large scrolling area it does not scroll' {
+            [void](Open-TestPage "$Web/tworegions")
+            $target = Invoke-CdpEval -Expression (Get-ScrollTargetScript)
+            $target.kind | Should -Be 'element'
+            @($target.others).Count | Should -Be 1
+        }
+
+        It 'reports a large frame from another site' {
+            [void](Open-TestPage "$Web/xframe?to=http://localhost:$($script:OtherOriginPort)/tall")
+            $target = Invoke-CdpEval -Expression (Get-ScrollTargetScript)
+            @($target.blockedFrames).Count | Should -Be 1
+            @($target.blockedFrames)[0] | Should -BeLike "*:$($script:OtherOriginPort)/tall"
+        }
+    }
+
+    Context 'click steps inside frames' {
+        BeforeEach { [void](Open-TestPage "$Web/framepage") }
+
+        It 'clicktext: finds a button inside a same-site frame' {
+            Invoke-ClickText -Text 'Frame button'
+            Invoke-CdpEval -Expression 'document.title' | Should -Be 'FRAME CLICKED'
+        }
+
+        It 'click: finds a selector inside a same-site frame' {
+            Invoke-ClickSelector -Selector '#frame-btn'
+            Invoke-CdpEval -Expression 'document.title' | Should -Be 'FRAME CLICKED'
+        }
+
+        It 'waits for a page loaded inside the frame by a click' {
+            Set-StepNavigationProbe
+            Invoke-ClickText -Text 'Frame next'
+            Start-Sleep -Milliseconds 200
+            Wait-StepNavigation -TimeoutSec 15
+            Invoke-CdpEval -Expression "document.getElementById('content').contentDocument.title" | Should -Be 'Slow same'
+        }
+
+        It 'explains that frames from another site cannot be searched' {
+            [void](Open-TestPage "$Web/xframe?to=http://localhost:$($script:OtherOriginPort)/tabs")
+            { Invoke-ClickText -Text 'General' } | Should -Throw '*1 frame(s) from another site*'
+            { Invoke-ClickSelector -Selector '#t-general' } | Should -Throw '*1 frame(s) from another site*'
+        }
+    }
+
     Context 'after a command times out' {
         It 'the next command reconnects and succeeds' {
             { Invoke-CdpEval -Expression 'new Promise(r => setTimeout(r, 5000))' -TimeoutSec 2 } | Should -Throw '*Timed out*'
@@ -158,6 +236,9 @@ Expired session same origin,$Web/protected,,N,
 Expired session other origin,$Web/xredirect?to=$other/login,,N,
 Steps with a bad selector,$Web/tabs,clicktext:General;click:#missing,N,
 Link to a slow page,$Web/links?to=$slow/slow?s=3,click:#go,N,
+Inner scrolling panel,$Web/innerscroll?rows=12,,Y,
+Frame with a click,$Web/framepage?rows=12,clicktext:Frame button,Y,
+Frame from another site,$Web/xframe?to=$other/tall,,Y,
 Unreachable host,http://localhost:1/,,N,
 Slow page,$slow/slow?s=12,,N,
 Plain page after the slow one,$Web/ok,,N,
@@ -209,7 +290,7 @@ Plain page after the slow one,$Web/ok,,N,
     It 'writes the report and exits with code 2 because rows failed' {
         $script:ReportFile | Should -Exist
         $script:ExitCode | Should -Be 2
-        $global:VouchE2E.Run.Total | Should -Be 11
+        $global:VouchE2E.Run.Total | Should -Be 14
     }
 
     It 'captures a plain page as OK' {
@@ -259,6 +340,33 @@ Plain page after the slow one,$Web/ok,,N,
         $item.FinalUrl | Should -Match '/login'
         $item.Status | Should -Be 'WARNING'
         ($item.Details -join ' ') | Should -Match 'sign-in page \(/login\)'
+    }
+
+    It 'captures an app-style page by scrolling its inner panel' {
+        $item = $script:Items['Inner scrolling panel']
+        ($item.Details -join ' | ') | Should -BeNullOrEmpty
+        $item.Status | Should -Be 'OK'
+        $item.ScrollArea | Should -Be 'div#main'
+        # 1212 px of rows in a panel of roughly 600-740 px: two or three screens.
+        $item.Captures.Count | Should -BeGreaterOrEqual 2
+        $item.Captures.Count | Should -BeLessOrEqual 3
+    }
+
+    It 'clicks inside a frame, then captures by scrolling the frame' {
+        $item = $script:Items['Frame with a click']
+        $item.Status | Should -Be 'OK'
+        $item.StepLog[0].Ok | Should -BeTrue
+        $item.ScrollArea | Should -BeLike 'the frame *framecontent*'
+        ($item.Details -join ' | ') | Should -BeNullOrEmpty
+        $item.Captures.Count | Should -BeGreaterOrEqual 2
+        $item.Captures.Count | Should -BeLessOrEqual 3
+    }
+
+    It 'warns that a frame from another site cannot be scrolled' {
+        $item = $script:Items['Frame from another site']
+        $item.Status | Should -Be 'WARNING'
+        ($item.Details -join ' ') | Should -Match 'frame from another site'
+        $item.Captures.Count | Should -Be 1
     }
 
     It 'waits for a page opened by a click step to load before capturing' {

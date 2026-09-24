@@ -9,3 +9,6 @@ httpbin - 404 with an empty body,https://httpbin.org/status/404,,N,HTTP 404 with
 Plain http upgraded to https,http://example.com/,,N,The site answers on https; an http-to-https upgrade is not a login redirect.,OK,1,https://example.com/
 Step that cannot succeed,https://example.com/,clicktext:No Such Link Anywhere;wait:1,N,A failed step: WARNING but captured.,WARNING,1,
 Unreachable host,https://vouch-live-test.invalid/,,N,DNS failure: FAILED without a screenshot.,FAILED,0,
+Local page - inner scrolling panel,{LOCAL}/innerscroll?rows=25,,Y,Local test page: the page stays still and a panel inside it scrolls; every row must be captured.,OK,2+,*innerscroll*
+Local page - click and scroll inside a frame,{LOCAL}/framepage?rows=25,clicktext:Frame button,Y,Local test page: the content is in a frame; the click and the scrolling happen inside it.,OK,2+,*framepage*
+Local page - frame from another site,{LOCAL}/xframe?to={OTHER}/tall,,Y,Local test page: a frame from another site cannot be scrolled; expect a warning.,WARNING,1,

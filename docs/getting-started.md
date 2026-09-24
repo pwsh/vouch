@@ -185,7 +185,7 @@ names) exactly as it is.
 | **Name** | A short label for the evidence. Shown in the report. | `Payroll - Password policy` |
 | **Url** | The page address, copied from Edge's address bar. Must start with `https://` or `http://`. | `https://payroll.example.com/admin/security` |
 | **Steps** | *Optional.* What to click on the page before the screenshot — see below. Leave empty if the page is right as it opens. | `clicktext:Password Policy` |
-| **ScrollFullPage** | `Y` to capture the whole page, however long (one screenshot per screenful). `N` or empty for just what fits on the screen. | `Y` |
+| **ScrollFullPage** | `Y` to capture the whole page, however long (one screenshot per screenful) - also when the content scrolls inside a panel or a frame of the page. `N` or empty for just what fits on the screen. | `Y` |
 | **Notes** | *Optional.* Anything the reviewer should know — the control number, what to look at. Copied into the report. | `ITGC-04: minimum length must be 12` |
 
 **Getting the Url right:** open the page in your normal Edge, click the address bar,
@@ -453,6 +453,21 @@ Your saved logins have expired. Repeat [step 6](#6-sign-in-to-your-applications-
 **A step says "No clickable element with the text … was found".**
 The words on the button are different from what is in *Steps*, or the page had not
 finished loading. Check the exact words on the page, or add `wait:3;` before the step.
+
+**A step fails with "… The page also contains 1 frame(s) from another site, which Vouch
+cannot look inside."**
+The button is inside a part of the page that comes from a different website (a
+*frame*), and browsers do not let Vouch reach into those. Open that part's own address
+instead: in your normal Edge, right-click inside that part of the page → **View frame
+source** or **Open frame in new tab** (if offered) shows its address; use that as the
+**Url** of the row.
+
+**WARNING: "Another scrolling area (…) was not scrolled" or "A frame from another site
+(…) cannot be scrolled".**
+The page has more than one part that scrolls on its own, and Vouch captured the largest
+one. Content hidden in the other part is not in the screenshots. If you need it, capture
+that part's own address in a separate row (see the entry above), or use a `clicktext:`
+step to open it full size first.
 
 **The screenshots are black or blank.**
 The screen was locked, the screen saver started, or a Remote Desktop session was

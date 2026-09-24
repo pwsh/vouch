@@ -109,7 +109,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion       = '1.2.0'
+$script:ToolVersion       = '1.3.0'
 $script:ExitCode          = 0
 $script:CdpSocket         = $null
 $script:CdpWebSocketUrl   = ''
@@ -1453,22 +1453,189 @@ function Test-LoginRedirect {
     return $HasPasswordField
 }
 
+function Get-FrameDocsScript {
+    <#
+        Browser-side helpers shared by the click steps and the scroll-area search.
+        vouchDocs() lists the page and every frame inside it that can be reached from
+        the page - frames from the same site; the browser does not let a page look into
+        a frame from another site, so those are listed separately as "blocked" (only
+        frames big enough to matter, so tracking pixels and ads do not count).
+        vouchVisible() is true when an element is rendered and so is every frame
+        around it.
+    #>
+    return @'
+function vouchDocs() {
+  var list = [{ doc: document, win: window, frame: null, parent: null }];
+  var blocked = [];
+  for (var i = 0; i < list.length; i++) {
+    var frames = list[i].doc.querySelectorAll('iframe,frame');
+    for (var j = 0; j < frames.length; j++) {
+      var f = frames[j], d = null;
+      try { d = f.contentDocument; } catch (e) { d = null; }
+      if (d && d.documentElement) {
+        list.push({ doc: d, win: f.contentWindow, frame: f, parent: list[i] });
+      } else {
+        var r = f.getBoundingClientRect();
+        if (r.width >= 50 && r.height >= 50) { blocked.push({ frame: f, parent: list[i] }); }
+      }
+    }
+  }
+  return { list: list, blocked: blocked };
+}
+function vouchVisible(entry, el) {
+  var rect = el.getBoundingClientRect();
+  var style = entry.win.getComputedStyle(el);
+  if (!(rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none')) { return false; }
+  for (var e = entry; e.frame; e = e.parent) {
+    var fr = e.frame.getBoundingClientRect();
+    if (!(fr.width > 0 && fr.height > 0)) { return false; }
+  }
+  return true;
+}
+function vouchFrameName(f) {
+  return f.getAttribute('src') || f.getAttribute('name') || f.id || 'unnamed frame';
+}
+'@
+}
+
+function Get-ScrollTargetScript {
+    <#
+        Finds what actually scrolls on the page, for full-page capture. Many web
+        applications keep the page itself still and scroll a panel inside it, or show
+        their content in a frame; scrolling only the window would capture one screen of
+        those and miss the rest.
+
+        Candidates: the window; every element that scrolls vertically; every frame (same
+        site) whose document scrolls - including elements inside frames. The one with
+        the largest visible area wins, so an ordinary scrolling page keeps using the
+        window. Areas smaller than a quarter of the screen are ignored (sidebars, code
+        boxes). Other large scrolling areas, and large frames from another site, are
+        reported so the item can be flagged: their hidden content is not captured.
+
+        Leaves window.__vouchTarget with measure() -> {view,total,top} and to(y) -> top.
+    #>
+    return @"
+(function () {
+$(Get-FrameDocsScript)
+  var vw = window.innerWidth, vh = window.innerHeight, viewArea = vw * vh;
+  function visibleArea(rect, off) {
+    var l = Math.max(0, rect.left + off.x), t = Math.max(0, rect.top + off.y);
+    var r = Math.min(vw, rect.right + off.x), b = Math.min(vh, rect.bottom + off.y);
+    return Math.max(0, r - l) * Math.max(0, b - t);
+  }
+  function offsetOf(entry) {
+    var x = 0, y = 0;
+    for (var e = entry; e && e.frame; e = e.parent) { var r = e.frame.getBoundingClientRect(); x += r.left; y += r.top; }
+    return { x: x, y: y };
+  }
+  function describe(el) {
+    var d = el.tagName.toLowerCase();
+    if (el.id) { d += '#' + el.id; }
+    else if (typeof el.className === 'string' && el.className.trim()) { d += '.' + el.className.trim().split(/\s+/)[0]; }
+    return d;
+  }
+  var docs = vouchDocs();
+  var candidates = [];
+  var topScroller = document.scrollingElement || document.documentElement;
+  if (topScroller.scrollHeight > vh + 16) {
+    candidates.push({ kind: 'window', area: viewArea, desc: 'the page', node: null, entry: docs.list[0] });
+  }
+  docs.list.forEach(function (entry) {
+    var off = offsetOf(entry);
+    if (entry.frame) {
+      var fs = entry.doc.scrollingElement || entry.doc.documentElement;
+      if (fs && fs.scrollHeight > entry.win.innerHeight + 16) {
+        candidates.push({ kind: 'frame', area: visibleArea(entry.frame.getBoundingClientRect(), offsetOf(entry.parent)),
+          desc: 'the frame ' + vouchFrameName(entry.frame), node: entry.frame, entry: entry });
+      }
+    }
+    var all = entry.doc.querySelectorAll('*');
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (el === entry.doc.documentElement || el.clientHeight < 50 || el.scrollHeight <= el.clientHeight + 16) { continue; }
+      var oy = entry.win.getComputedStyle(el).overflowY;
+      if (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') { continue; }
+      candidates.push({ kind: 'element', area: visibleArea(el.getBoundingClientRect(), off),
+        desc: describe(el) + (entry.frame ? ' in the frame ' + vouchFrameName(entry.frame) : ''), node: el, entry: entry });
+    }
+  });
+
+  var usable = candidates.filter(function (c) { return c.area >= viewArea * 0.25; })
+    .sort(function (a, b) { return b.area - a.area; });
+  var chosen = usable.length > 0 ? usable[0] : null;
+  function related(c) {
+    if (!chosen) { return false; }
+    if (chosen.kind === 'frame' && c.entry === chosen.entry) { return true; }
+    if (c.kind === 'frame' && chosen.entry === c.entry) { return true; }
+    if (c.entry === chosen.entry && c.node && chosen.node && (c.node.contains(chosen.node) || chosen.node.contains(c.node))) { return true; }
+    return false;
+  }
+  var others = usable.slice(1).filter(function (c) { return !related(c); }).map(function (c) { return c.desc; });
+  var blocked = docs.blocked.filter(function (b) {
+    return visibleArea(b.frame.getBoundingClientRect(), offsetOf(b.parent)) >= viewArea * 0.25;
+  }).map(function (b) { return vouchFrameName(b.frame); });
+
+  var t = chosen;
+  window.__vouchTarget = {
+    measure: function () {
+      if (!t) { return { view: window.innerHeight, total: window.innerHeight, top: 0 }; }
+      if (t.kind === 'window') {
+        var s = document.scrollingElement || document.documentElement;
+        return { view: window.innerHeight, total: Math.max(document.body ? document.body.scrollHeight : 0, s.scrollHeight), top: window.scrollY };
+      }
+      if (t.kind === 'frame') {
+        var f = t.entry.doc.scrollingElement || t.entry.doc.documentElement;
+        return { view: t.entry.win.innerHeight, total: f.scrollHeight, top: t.entry.win.scrollY };
+      }
+      return { view: t.node.clientHeight, total: t.node.scrollHeight, top: t.node.scrollTop };
+    },
+    to: function (y) {
+      if (!t) { return 0; }
+      if (t.kind === 'window') { window.scrollTo(0, y); return window.scrollY; }
+      if (t.kind === 'frame') { t.entry.win.scrollTo(0, y); return t.entry.win.scrollY; }
+      t.node.scrollTop = y;
+      return t.node.scrollTop;
+    }
+  };
+  window.__vouchTarget.to(0);
+  var m = window.__vouchTarget.measure();
+  return { kind: t ? t.kind : 'none', description: t ? t.desc : '', view: m.view, total: m.total, others: others, blockedFrames: blocked };
+})()
+"@
+}
+
+function Get-BlockedFrameNote {
+    param([int]$Count)
+    if ($Count -le 0) { return '' }
+    return " The page also contains $Count frame(s) from another site, which Vouch cannot look inside."
+}
+
 function Invoke-ClickSelector {
+    <#
+        Clicks the first element matching the selector, looking in the page first and
+        then in its frames (same site only).
+    #>
     param([Parameter(Mandatory)][string]$Selector)
 
     $literal = ConvertTo-JsLiteral -Value $Selector
     $expression = @"
 (function (sel) {
-  var el = document.querySelector(sel);
-  if (!el) { return 'NOTFOUND'; }
-  if (el.scrollIntoView) { el.scrollIntoView({ block: 'center' }); }
-  el.click();
-  return 'OK';
+$(Get-FrameDocsScript)
+  var docs = vouchDocs();
+  for (var i = 0; i < docs.list.length; i++) {
+    var el = docs.list[i].doc.querySelector(sel);
+    if (!el) { continue; }
+    if (el.scrollIntoView) { el.scrollIntoView({ block: 'center' }); }
+    el.click();
+    return 'OK';
+  }
+  return 'NOTFOUND|' + docs.blocked.length;
 })($literal)
 "@
-    $outcome = Invoke-CdpEval -Expression $expression
+    $outcome = [string](Invoke-CdpEval -Expression $expression)
     if ($outcome -ne 'OK') {
-        throw "No element matched the CSS selector '$Selector'."
+        $blocked = if ($outcome -match '\|(\d+)$') { [int]$Matches[1] } else { 0 }
+        throw "No element matched the CSS selector '$Selector'.$(Get-BlockedFrameNote -Count $blocked)"
     }
 }
 
@@ -1481,58 +1648,70 @@ function Invoke-ClickText {
         otherwise the partial match with the shortest label, i.e. the closest one. A
         partial match never selects a sign-out control unless the wanted text itself
         says so - clicking "Log out" for "Log" would end the audit profile's session.
+        The page is searched first, then its frames (same site only).
     #>
     $literal = ConvertTo-JsLiteral -Value $Text
     $expression = @"
 (function (wanted) {
+$(Get-FrameDocsScript)
   var target = String(wanted).replace(/\s+/g, ' ').trim().toLowerCase();
-  var nodes = Array.prototype.slice.call(document.querySelectorAll(
-    'a,button,[role=button],[role=tab],[role=menuitem],input[type=submit],input[type=button]'));
   var label = function (el) {
     var text = el.innerText || el.textContent || el.value || '';
     return String(text).replace(/\s+/g, ' ').trim().toLowerCase();
   };
-  var visible = function (el) {
-    var rect = el.getBoundingClientRect();
-    var style = window.getComputedStyle(el);
-    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-  };
   var signOut = /\b(log|sign)\s*-?\s*(out|off)\b/;
+  var docs = vouchDocs();
   var hiddenMatch = false;
   var exact = null;
   var partial = null;
-  for (var i = 0; i < nodes.length; i++) {
-    var text = label(nodes[i]);
-    if (text.indexOf(target) === -1) { continue; }
-    if (!visible(nodes[i])) { hiddenMatch = true; continue; }
-    if (text === target) { exact = nodes[i]; break; }
-    if (signOut.test(text) && !signOut.test(target)) { continue; }
-    if (!partial || text.length < label(partial).length) { partial = nodes[i]; }
+  for (var d = 0; d < docs.list.length && !exact; d++) {
+    var entry = docs.list[d];
+    var nodes = entry.doc.querySelectorAll(
+      'a,button,[role=button],[role=tab],[role=menuitem],input[type=submit],input[type=button]');
+    for (var i = 0; i < nodes.length; i++) {
+      var text = label(nodes[i]);
+      if (text.indexOf(target) === -1) { continue; }
+      if (!vouchVisible(entry, nodes[i])) { hiddenMatch = true; continue; }
+      if (text === target) { exact = nodes[i]; break; }
+      if (signOut.test(text) && !signOut.test(target)) { continue; }
+      if (!partial || text.length < label(partial).length) { partial = nodes[i]; }
+    }
   }
   var pick = exact || partial;
-  if (!pick) { return hiddenMatch ? 'HIDDEN' : 'NOTFOUND'; }
+  if (!pick) { return (hiddenMatch ? 'HIDDEN' : 'NOTFOUND') + '|' + docs.blocked.length; }
   if (pick.scrollIntoView) { pick.scrollIntoView({ block: 'center' }); }
   pick.click();
   return 'OK';
 })($literal)
 "@
-    $outcome = Invoke-CdpEval -Expression $expression
-    if ($outcome -eq 'HIDDEN') {
-        throw "Only hidden elements have the text '$Text'; nothing was clicked."
+    $outcome = [string](Invoke-CdpEval -Expression $expression)
+    $blocked = if ($outcome -match '\|(\d+)$') { [int]$Matches[1] } else { 0 }
+    if ($outcome -like 'HIDDEN*') {
+        throw "Only hidden elements have the text '$Text'; nothing was clicked.$(Get-BlockedFrameNote -Count $blocked)"
     }
     if ($outcome -ne 'OK') {
-        throw "No clickable element with the text '$Text' was found."
+        throw "No clickable element with the text '$Text' was found.$(Get-BlockedFrameNote -Count $blocked)"
     }
 }
 
 function Set-StepNavigationProbe {
     <#
-        Marks the document before a click. beforeunload fires as soon as a navigation
-        starts - before the server has answered - so a click that opens another page is
-        detectable even while the old page is still on screen.
+        Marks the page - and every frame in it from the same site - before a click.
+        beforeunload fires as soon as a navigation starts, before the server has
+        answered, so a click that opens another page (or loads another page inside a
+        frame) is detectable even while the old one is still on screen.
     #>
-    $expression = "window.__vouchMark = 1; window.__vouchLeaving = false; " +
-        "window.addEventListener('beforeunload', function () { window.__vouchLeaving = true; });"
+    $expression = @"
+(function () {
+$(Get-FrameDocsScript)
+  vouchDocs().list.forEach(function (entry) {
+    entry.win.__vouchMark = 1;
+    entry.win.__vouchLeaving = false;
+    entry.win.addEventListener('beforeunload', function () { entry.win.__vouchLeaving = true; });
+  });
+  return true;
+})()
+"@
     try { [void](Invoke-CdpEval -Expression $expression -TimeoutSec 10) }
     catch { Write-Verbose "Could not set the step navigation probe: $($_.Exception.Message)" }
 }
@@ -1541,20 +1720,58 @@ function Wait-StepNavigation {
     <#
         After a click: if it navigated (or started to), wait for the new document to
         finish loading so the screenshot does not show a half-loaded or the old page.
-        In-page changes (tabs, SPA routes) keep the marker and return immediately.
+        The same for frames: a click that loads another page inside a frame waits until
+        every frame has finished loading. In-page changes (tabs, SPA routes) keep the
+        markers and return immediately.
     #>
     param([Parameter(Mandatory)][int]$TimeoutSec)
 
+    $stateExpression = @"
+(function () {
+$(Get-FrameDocsScript)
+  if (typeof window.__vouchMark === 'undefined') { return 'new'; }
+  if (window.__vouchLeaving) { return 'leaving'; }
+  var list = vouchDocs().list;
+  for (var i = 1; i < list.length; i++) {
+    var w = list[i].win;
+    if (typeof w.__vouchMark === 'undefined' || w.__vouchLeaving || list[i].doc.readyState !== 'complete') { return 'frames'; }
+  }
+  return 'same';
+})()
+"@
     $probe = 'same'
     try {
-        $probe = [string](Invoke-CdpEval -TimeoutSec 10 -Expression (
-            "typeof window.__vouchMark === 'undefined' ? 'new' : (window.__vouchLeaving ? 'leaving' : 'same')"))
+        $probe = [string](Invoke-CdpEval -TimeoutSec 10 -Expression $stateExpression)
     }
     catch {
         # Evaluation can fail while a navigation commits; treat that as navigating.
         $probe = 'new'
     }
     if ($probe -eq 'same') { return }
+
+    if ($probe -eq 'frames') {
+        # A frame loaded a new page: wait until every frame document is complete and
+        # none is still on its way out.
+        $framesReady = @"
+(function () {
+$(Get-FrameDocsScript)
+  var list = vouchDocs().list;
+  for (var i = 1; i < list.length; i++) {
+    if (list[i].win.__vouchLeaving || list[i].doc.readyState !== 'complete') { return false; }
+  }
+  return true;
+})()
+"@
+        $deadline = (Get-Date).AddSeconds($TimeoutSec)
+        while ((Get-Date) -lt $deadline) {
+            $ready = $false
+            try { $ready = [bool](Invoke-CdpEval -TimeoutSec 10 -Expression $framesReady) }
+            catch { Write-Verbose "Frame readiness check failed: $($_.Exception.Message)" }
+            if ($ready) { return }
+            Start-Sleep -Milliseconds 250
+        }
+        throw "The click loaded a page inside a frame that did not finish loading within $TimeoutSec seconds."
+    }
 
     if (-not (Wait-PageReady -TimeoutSec $TimeoutSec -SameDocumentGraceSeconds $TimeoutSec)) {
         throw "The click opened a page that did not finish loading within $TimeoutSec seconds."
@@ -1872,7 +2089,12 @@ a { color: #12507d; }
         [void]$sb.AppendLine("<dt>Final URL</dt><dd>$(Encode-Html $finalUrlText)</dd>")
         $statusText = if ($item.HttpStatus -gt 0) { [string]$item.HttpStatus } else { 'not reported by the browser' }
         [void]$sb.AppendLine("<dt>HTTP status</dt><dd>$(Encode-Html $statusText)</dd>")
-        [void]$sb.AppendLine("<dt>Scroll capture</dt><dd>$(if ($item.ScrollFullPage) { 'Yes - full page in viewport segments' } else { 'No - single viewport' })</dd>")
+        $scrollText = if (-not $item.ScrollFullPage) { 'No - single viewport' }
+        else {
+            $area = if ($item.PSObject.Properties['ScrollArea'] -and $item.ScrollArea) { " (scrolled: $($item.ScrollArea))" } else { '' }
+            "Yes - full page in viewport segments$area"
+        }
+        [void]$sb.AppendLine("<dt>Scroll capture</dt><dd>$(Encode-Html $scrollText)</dd>")
         [void]$sb.AppendLine('</dl>')
 
         if (-not [string]::IsNullOrWhiteSpace($item.Notes)) {
@@ -2097,6 +2319,7 @@ function ConvertTo-RunSummaryJson {
                 Status         = $item.Status
                 HttpStatus     = $item.HttpStatus
                 ScrollFullPage = $item.ScrollFullPage
+                ScrollArea     = $(if ($item.PSObject.Properties['ScrollArea']) { $item.ScrollArea } else { '' })
                 Details        = @($item.Details)
                 Steps          = @($item.StepLog | ForEach-Object { [ordered]@{ Text = $_.Text; Ok = $_.Ok; Message = $_.Message } })
                 Captures       = @($item.Captures | ForEach-Object {
@@ -2349,6 +2572,7 @@ function Invoke-Main {
                 Notes          = $definition.Notes
                 StepsText      = $definition.StepsText
                 ScrollFullPage = $definition.ScrollFullPage
+                ScrollArea     = ''
                 Status         = 'OK'
                 HttpStatus     = 0
                 Details        = [System.Collections.Generic.List[string]]::new()
@@ -2458,11 +2682,25 @@ function Invoke-Main {
                 $viewportHeight = 0.0
                 if ($definition.ScrollFullPage) {
                     try {
-                        [void](Invoke-CdpEval -Expression 'window.scrollTo(0, 0)' -TimeoutSec 10)
+                        # Find what scrolls - the page, a panel inside it, or a frame - and start at its top.
+                        $scrollTarget = Invoke-CdpEval -Expression (Get-ScrollTargetScript) -TimeoutSec 20
                         Start-Sleep -Milliseconds ([int]($ScrollSettleSeconds * 1000))
 
-                        $viewportHeight = [double](Invoke-CdpEval -Expression 'window.innerHeight' -TimeoutSec 10)
-                        $pageHeight = [double](Invoke-CdpEval -Expression 'Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement.scrollHeight)' -TimeoutSec 10)
+                        $viewportHeight = [double]$scrollTarget.view
+                        $pageHeight = [double]$scrollTarget.total
+                        $item.ScrollArea = switch ([string]$scrollTarget.kind) {
+                            'window'  { 'the page' }
+                            'none'    { 'nothing to scroll - the content fits on one screen' }
+                            default   { [string]$scrollTarget.description }
+                        }
+                        foreach ($other in @($scrollTarget.others)) {
+                            if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
+                            $item.Details.Add("Another scrolling area ($other) was not scrolled; content hidden in it is not captured.")
+                        }
+                        foreach ($frameName in @($scrollTarget.blockedFrames)) {
+                            if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
+                            $item.Details.Add("A frame from another site ($frameName) cannot be scrolled; content hidden in it is not captured.")
+                        }
 
                         if ($viewportHeight -gt 0 -and $pageHeight -gt 0) {
                             $segmentCount = [int][Math]::Ceiling($pageHeight / $viewportHeight)
@@ -2490,14 +2728,14 @@ function Invoke-Main {
                     $recheckDone = $false
                     for ($segment = 0; $segment -lt $segmentCount; $segment++) {
                         $offset = [int]([Math]::Round($segment * $viewportHeight))
-                        [void](Invoke-CdpEval -Expression "window.scrollTo(0, $offset)" -TimeoutSec 10)
+                        [void](Invoke-CdpEval -Expression "window.__vouchTarget.to($offset)" -TimeoutSec 10)
                         Start-Sleep -Milliseconds ([int]($ScrollSettleSeconds * 1000))
 
                         # Lazy-loading pages grow after the first scroll; re-measure once only.
                         if (-not $recheckDone) {
                             $recheckDone = $true
                             try {
-                                $grownHeight = [double](Invoke-CdpEval -Expression 'Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement.scrollHeight)' -TimeoutSec 10)
+                                $grownHeight = [double](Invoke-CdpEval -Expression 'window.__vouchTarget.measure().total' -TimeoutSec 10)
                                 if ($grownHeight -gt 0) {
                                     $recomputed = [int][Math]::Ceiling($grownHeight / $viewportHeight)
                                     if ($recomputed -gt $segmentCount) {
@@ -2522,7 +2760,7 @@ function Invoke-Main {
                         Add-ItemCapture -Item $item -SegmentIndex ($segment + 1) -SegmentCount $segmentCount -PageUrl $segmentUrl -Context $captureContext
                     }
 
-                    try { [void](Invoke-CdpEval -Expression 'window.scrollTo(0, 0)' -TimeoutSec 10) }
+                    try { [void](Invoke-CdpEval -Expression 'window.__vouchTarget.to(0)' -TimeoutSec 10) }
                     catch { Write-Verbose "Could not scroll back to the top: $($_.Exception.Message)" }
                 }
                 else {
