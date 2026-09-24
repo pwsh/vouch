@@ -84,6 +84,32 @@ files without a "Start in" setting.
 | `2` | At least one item failed. |
 | `3` | Only with `-FailOnWarning`: nothing failed, but at least one item has a warning — for example an expired session redirecting to a sign-in page. Use this for scheduled jobs so an expired login does not look like a successful run. |
 
+## Keeping other applications out of the evidence
+
+Edge covers the whole screen while capturing, but the taskbar at the bottom (which has
+to be there for the clock) also shows every other application you have open. Add
+`-UseVirtualDesktop` to run the capture on a fresh virtual desktop (Task View):
+
+```powershell
+.\vouch.ps1 -UseVirtualDesktop
+.\Install-VouchSchedule.ps1 -At 07:30 -UseVirtualDesktop
+```
+
+The script opens a new desktop (as if you pressed Win+Ctrl+D), captures there, and
+closes it again at the end (Win+Ctrl+F4), which returns you to your own desktop. The
+taskbar then shows only the capture Edge — as long as Windows is set to show only the
+current desktop's windows on the taskbar (Settings → System → Multitasking → Desktops,
+the default). **Pinned taskbar icons still appear**, just without the "running" mark; for
+a completely bare taskbar, run captures from a dedicated Windows account with nothing
+pinned.
+
+Windows has no supported way for a script to create desktops, so the keyboard shortcut is
+used, and the documented desktop API then confirms that your other windows really stayed
+behind. The report's **Desktop** line says whether the separate desktop was confirmed;
+if it was not, the capture still runs, on your normal desktop. When an editor running as
+administrator is in front, Windows ignores the shortcut from a non-elevated scheduled run,
+so the script first moves focus to the taskbar and tries again.
+
 ## Running on a schedule
 
 `Install-VouchSchedule.ps1` sets up a Windows scheduled task that runs the capture for
@@ -102,7 +128,7 @@ you — no Task Scheduler clicking needed:
 
 Running the installer again replaces the task with the new settings. It uses
 `-Daily`, `-Weekdays` (default), `-Weekly` or `-AtLogOn`, plus `-SaveImages`,
-`-ImageFormat`, `-MaxRunHours` (default 2) and `-TaskName` if you want several schedules.
+`-ImageFormat`, `-UseVirtualDesktop`, `-MaxRunHours` (default 2) and `-TaskName` if you want several schedules.
 
 What the task does for you: it runs PowerShell 7 hidden in **your** signed-in session,
 starts in the script folder, writes a log of every run to `<reports>\logs\`, and passes
@@ -263,6 +289,7 @@ the taskbar strip is present, the exit code is right, and Edge is gone afterward
 ```powershell
 pwsh .\tests\live\Invoke-LiveTest.ps1                 # about 1 minute; hands off the keyboard and mouse
 pwsh .\tests\live\Invoke-LiveTest.ps1 -ViaScheduler   # same, through a temporary scheduled task
+pwsh .\tests\live\Invoke-LiveTest.ps1 -UseVirtualDesktop   # also checks the desktop was confirmed and closed
 ```
 
 It takes over the screen, needs internet access, and uses its own throwaway Edge profile

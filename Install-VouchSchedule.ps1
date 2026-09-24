@@ -82,6 +82,9 @@ param(
     [switch]$AllowWarnings,
 
     [Parameter(ParameterSetName = 'Install')]
+    [switch]$UseVirtualDesktop,
+
+    [Parameter(ParameterSetName = 'Install')]
     [ValidateRange(1, 24)]
     [int]$MaxRunHours = 2,
 
@@ -144,7 +147,8 @@ function Get-VouchTaskArguments {
         [bool]$SaveImages = $false,
         [bool]$FailOnWarning = $true,
         [string]$EdgeProfileDir = '',
-        [int]$DebugPort = 0
+        [int]$DebugPort = 0,
+        [bool]$UseVirtualDesktop = $false
     )
 
     $arguments = [System.Collections.Generic.List[string]]::new()
@@ -159,6 +163,7 @@ function Get-VouchTaskArguments {
     if ($FailOnWarning) { $arguments.Add('-FailOnWarning') }
     if ($EdgeProfileDir) { $arguments.Add('-EdgeProfileDir'); $arguments.Add((ConvertTo-TaskArgument -Value $EdgeProfileDir)) }
     if ($DebugPort -gt 0) { $arguments.Add('-DebugPort'); $arguments.Add([string]$DebugPort) }
+    if ($UseVirtualDesktop) { $arguments.Add('-UseVirtualDesktop') }
     # The JSON summary lets -Status report the last run's counts.
     $arguments.Add('-JsonSummary')
     $arguments.Add('-LogDir')
@@ -289,7 +294,7 @@ function Install-VouchTask {
     $action = New-ScheduledTaskAction -Execute (Get-PwshPath) -WorkingDirectory $PSScriptRoot -Argument (
         Get-VouchTaskArguments -ScriptPath $vouchScript -LogDir $logDir -CsvPath $csv -OutputDir $output `
             -ImageFormat $ImageFormat -SaveImages $SaveImages.IsPresent -FailOnWarning (-not $AllowWarnings) `
-            -EdgeProfileDir $edgeProfile -DebugPort $DebugPort)
+            -EdgeProfileDir $edgeProfile -DebugPort $DebugPort -UseVirtualDesktop $UseVirtualDesktop.IsPresent)
     $trigger = New-VouchTrigger -Schedule $Schedule -At $At -DaysOfWeek $DaysOfWeek -UserId $userId
     # Interactive: runs in your signed-in session, the only one with a desktop to capture.
     $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited

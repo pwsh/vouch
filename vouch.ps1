@@ -24,6 +24,11 @@
     example an expired session redirecting to a sign-in page). Without it, warnings
     exit with 0.
 
+.PARAMETER UseVirtualDesktop
+    Capture on a fresh virtual desktop (Task View) that the run opens and closes again,
+    so other open applications are not in the taskbar of the evidence. Pinned taskbar
+    icons still show. The report's Desktop line records whether the switch was confirmed.
+
 .PARAMETER JsonSummary
     Also write the results as JSON next to the report (same name, .json): run metadata
     and per-item status, URLs, details, steps and capture timestamps - no image data.
@@ -88,6 +93,8 @@ param(
 
     [switch]$JsonSummary,
 
+    [switch]$UseVirtualDesktop,
+
     [switch]$LoginSetup
 )
 
@@ -144,6 +151,42 @@ namespace Vouch
 
         [DllImport("user32.dll")]
         public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+    }
+
+    // The documented part of the virtual desktop API: it can tell which desktop a window
+    // is on, but it cannot create or switch desktops (that is done with the shell's own
+    // keyboard shortcuts).
+    [ComImport, Guid("a5cd92ff-29be-454c-8d04-d82879fb3f1b"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IVirtualDesktopManager
+    {
+        [PreserveSig] int IsWindowOnCurrentVirtualDesktop(IntPtr topLevelWindow, [MarshalAs(UnmanagedType.Bool)] out bool onCurrentDesktop);
+        [PreserveSig] int GetWindowDesktopId(IntPtr topLevelWindow, out Guid desktopId);
+        [PreserveSig] int MoveWindowToDesktop(IntPtr topLevelWindow, ref Guid desktopId);
+    }
+
+    [ComImport, Guid("aa509086-5ca9-4c25-8f95-589d3c07b48a")]
+    public class VirtualDesktopManagerClass { }
+
+    public static class VirtualDesktop
+    {
+        // 1 = on the current desktop, 0 = on another desktop, -1 = unknown.
+        public static int IsOnCurrent(IntPtr window)
+        {
+            try
+            {
+                var manager = (IVirtualDesktopManager)new VirtualDesktopManagerClass();
+                bool onCurrent;
+                if (manager.IsWindowOnCurrentVirtualDesktop(window, out onCurrent) != 0) { return -1; }
+                return onCurrent ? 1 : 0;
+            }
+            catch
+            {
+                return -1;
+            }
+        }
     }
 }
 '@
@@ -891,6 +934,118 @@ function Set-EdgeForeground {
     return $null
 }
 
+function Send-KeyChord {
+    # Presses the keys in order and releases them in reverse, like a person would.
+    param([Parameter(Mandatory)][byte[]]$Keys)
+    foreach ($key in $Keys) {
+        $flags = if ($key -eq 0x5B) { 1 } else { 0 }   # the Windows key is an extended key
+        [Vouch.Native]::keybd_event($key, 0, $flags, [UIntPtr]::Zero)
+    }
+    [array]::Reverse($Keys)
+    foreach ($key in $Keys) {
+        $flags = if ($key -eq 0x5B) { 3 } else { 2 }   # KEYEVENTF_KEYUP (| EXTENDEDKEY)
+        [Vouch.Native]::keybd_event($key, 0, $flags, [UIntPtr]::Zero)
+    }
+}
+
+function Get-TopLevelWindowHandles {
+    # Main windows of every process in this session. Called before the audit Edge starts,
+    # so these are all windows the capture desktop should leave behind.
+    $sessionId = (Get-Process -Id $PID).SessionId
+    return @(Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.SessionId -eq $sessionId -and $_.MainWindowHandle -ne [IntPtr]::Zero } |
+        ForEach-Object { $_.MainWindowHandle })
+}
+
+function New-CaptureDesktop {
+    <#
+        Opens a fresh virtual desktop (Win+Ctrl+D) so the capture happens where no other
+        application's window exists: the taskbar then shows only what runs on that
+        desktop, plus pinned icons and the clock. Windows has no supported API to create
+        desktops, so the shell shortcut is used, and the documented
+        IVirtualDesktopManager confirms the switch: every window that was open before
+        must now be on another desktop.
+    #>
+    $before = Get-TopLevelWindowHandles
+    # A window pinned to all desktops never leaves, so one window gone is proof enough.
+    $switched = { @($before | Where-Object { [Vouch.VirtualDesktop]::IsOnCurrent($_) -eq 0 }).Count -gt 0 }
+    $shortcut = [byte[]](0x5B, 0x11, 0x44)   # Win + Ctrl + D
+
+    $state = [pscustomobject]@{ Created = $true; Verified = $false; ReferenceWindows = $before; Note = '' }
+    if ($before.Count -eq 0) {
+        # Nothing to confirm with, so a single attempt: a retry could open a second desktop.
+        Send-KeyChord -Keys $shortcut
+        Start-Sleep -Milliseconds 1500
+        $state.Note = 'Separate virtual desktop requested (no other windows were open, so the switch could not be confirmed).'
+        return $state
+    }
+    if (Invoke-DesktopShortcut -Keys $shortcut -Done $switched) {
+        $state.Verified = $true
+        $state.Note = 'Captured on a separate virtual desktop; other applications stayed on the original desktop.'
+    }
+    else {
+        $state.Note = 'A separate virtual desktop was requested, but Windows did not switch to it; other applications may appear in the taskbar.'
+        # Nothing was switched, so there is nothing to close later.
+        $state.Created = $false
+    }
+    return $state
+}
+
+function Test-EdgeOnCaptureDesktop {
+    # $true when the audit Edge window is on the desktop currently shown.
+    $handle = Get-EdgeWindowHandle -TimeoutSec 10
+    if ($handle -eq [IntPtr]::Zero) { return $false }
+    return ([Vouch.VirtualDesktop]::IsOnCurrent($handle) -eq 1)
+}
+
+function Remove-CaptureDesktop {
+    <#
+        Closes the desktop the run opened (Win+Ctrl+F4), which returns the screen to the
+        previous desktop; windows still on it move there too. Only when the original
+        windows are still elsewhere - i.e. the capture desktop is the one showing - so
+        the user's own desktop is never the one closed.
+    #>
+    param([object]$State)
+    if ($null -eq $State -or -not $State.Created) { return }
+    $elsewhere = @($State.ReferenceWindows | Where-Object { [Vouch.VirtualDesktop]::IsOnCurrent($_) -eq 0 })
+    if ($elsewhere.Count -eq 0) {
+        Write-Verbose 'The original desktop is already showing; not closing anything.'
+        return
+    }
+    $backHome = { @($State.ReferenceWindows | Where-Object { [Vouch.VirtualDesktop]::IsOnCurrent($_) -eq 0 }).Count -eq 0 }
+    if (-not (Invoke-DesktopShortcut -Keys ([byte[]](0x5B, 0x11, 0x73)) -Done $backHome)) {   # Win + Ctrl + F4
+        Write-Host 'WARNING: the capture desktop could not be closed; close it in Task View (Win+Tab).' -ForegroundColor Yellow
+    }
+}
+
+function Invoke-DesktopShortcut {
+    <#
+        Sends a virtual desktop shortcut and returns whether -Done confirms it worked.
+        Windows discards simulated keys while an elevated window (e.g. an editor run as
+        administrator) is in front and the sender is not elevated - the normal case for a
+        scheduled run. The retry first hands focus to the taskbar, which runs with
+        normal rights, so the second attempt gets through.
+    #>
+    param(
+        [Parameter(Mandatory)][byte[]]$Keys,
+        [Parameter(Mandatory)][scriptblock]$Done
+    )
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        if ($attempt -eq 2) {
+            $taskbar = [Vouch.Native]::FindWindow('Shell_TrayWnd', $null)
+            if ($taskbar -eq [IntPtr]::Zero) { return $false }
+            [Vouch.Native]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)   # Alt: permits the focus change
+            [Vouch.Native]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+            [void][Vouch.Native]::SetForegroundWindow($taskbar)
+            Start-Sleep -Milliseconds 400
+        }
+        Send-KeyChord -Keys ([byte[]]$Keys.Clone())
+        Start-Sleep -Milliseconds 1500   # the switch animates
+        if (& $Done) { return $true }
+    }
+    return $false
+}
+
 function Get-ScreenCapture {
     <#
         Real screen capture of the primary display, so the taskbar clock is included in
@@ -1321,6 +1476,7 @@ a { color: #12507d; }
         [pscustomobject]@{ Label = 'Operating system';  Text = $Run.OperatingSystem },
         [pscustomobject]@{ Label = 'Browser';           Text = $Run.EdgeVersion },
         [pscustomobject]@{ Label = 'Browser instance';  Text = $Run.BrowserInstance },
+        [pscustomobject]@{ Label = 'Desktop';           Text = $(if ($Run.PSObject.Properties['CaptureDesktop']) { $Run.CaptureDesktop } else { '' }) },
         [pscustomobject]@{ Label = 'Capture tool';      Text = "vouch.ps1 v$($Run.ToolVersion)" },
         [pscustomobject]@{ Label = 'Definition file';   Text = $Run.CsvPath },
         [pscustomobject]@{ Label = 'Image format';      Text = $Run.ImageDescription },
@@ -1675,10 +1831,30 @@ function Invoke-Main {
     $imageExtension = if ($ImageFormat -eq 'png') { 'png' } else { 'jpg' }
     $runStart = [System.DateTimeOffset]::Now
     $items = [System.Collections.Generic.List[object]]::new()
+    $captureDesktop = $null
+    $desktopNote = 'The signed-in desktop (-UseVirtualDesktop not set)'
 
     try {
+        if ($UseVirtualDesktop) {
+            if ($null -ne (Get-DebugEndpointInfo -Port $DebugPort)) {
+                # An Edge that is already running keeps its window on its own desktop.
+                $desktopNote = 'No separate virtual desktop: an already running Edge was reused.'
+            }
+            else {
+                Write-Host 'Switching to a separate virtual desktop for the capture...'
+                $captureDesktop = New-CaptureDesktop
+                $desktopNote = $captureDesktop.Note
+            }
+            if (-not ($captureDesktop -and $captureDesktop.Verified)) { Write-Host "WARNING: $desktopNote" -ForegroundColor Yellow }
+        }
+
         $versionInfo = Start-EdgeDebug -EdgePath $edgePath -ProfileDir $profileDir -Port $DebugPort
         $script:CdpPort = $DebugPort
+
+        if ($null -ne $captureDesktop -and $captureDesktop.Verified -and -not (Test-EdgeOnCaptureDesktop)) {
+            $desktopNote = 'A separate virtual desktop was opened, but Edge did not appear on it; other applications may appear in the taskbar.'
+            Write-Host "WARNING: $desktopNote" -ForegroundColor Yellow
+        }
 
         $edgeVersion = 'unknown'
         if ($null -ne $versionInfo -and $versionInfo.PSObject.Properties['Browser']) {
@@ -1915,6 +2091,7 @@ function Invoke-Main {
         else {
             Stop-EdgeProcess
         }
+        Remove-CaptureDesktop -State $captureDesktop
     }
 
     $runEnd = [System.DateTimeOffset]::Now
@@ -1950,6 +2127,7 @@ function Invoke-Main {
         OperatingSystem  = (Get-OperatingSystemDescription)
         EdgeVersion      = $edgeVersion
         BrowserInstance  = $browserInstance
+        CaptureDesktop   = $desktopNote
         ToolVersion      = $script:ToolVersion
         CsvPath          = $resolvedCsvPath
         ImageFormat      = $ImageFormat

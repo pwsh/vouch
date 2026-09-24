@@ -22,6 +22,9 @@
       - the exit code is the one the expectations imply
       - the Edge the run launched is gone afterwards (DevTools port closed)
 
+    With -UseVirtualDesktop the capture runs on a fresh virtual desktop, and the report's
+    Desktop line must confirm it.
+
     With -ViaScheduler the run goes through Install-VouchSchedule.ps1 as a temporary
     scheduled task (installed, started, removed), covering the unattended path too.
 
@@ -36,6 +39,7 @@ param(
     [string]$CsvPath = (Join-Path -Path $PSScriptRoot -ChildPath 'public-sites.csv'),
     [string]$OutputDir = (Join-Path -Path $PSScriptRoot -ChildPath 'output'),
     [switch]$ViaScheduler,
+    [switch]$UseVirtualDesktop,
     [ValidateRange(1024, 65535)]
     [int]$DebugPort = 9333,
     [ValidateRange(1, 60)]
@@ -92,6 +96,15 @@ function Test-ImageContent {
     return $problems
 }
 
+function Get-VirtualDesktopCount {
+    # Undocumented but stable: 16 bytes (one GUID) per desktop. Test use only.
+    $key = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops' -ErrorAction SilentlyContinue
+    if ($null -eq $key -or -not $key.PSObject.Properties['VirtualDesktopIDs']) { return 1 }
+    $ids = [byte[]]$key.VirtualDesktopIDs
+    if ($ids.Length -eq 0) { return 1 }
+    return [int]($ids.Length / 16)
+}
+
 function Get-ExpectedCaptureCheck([string]$Text) {
     if ($Text -match '^(\d+)\+$') { return @{ Min = [int]$Matches[1]; Exact = -1 } }
     if ($Text -match '^\d+$') { return @{ Min = [int]$Text; Exact = [int]$Text } }
@@ -127,11 +140,12 @@ Start-Sleep -Seconds 3
 
 # --- run -----------------------------------------------------------------------
 
+$desktopsBefore = Get-VirtualDesktopCount
 $started = Get-Date
 if ($ViaScheduler) {
     $taskName = 'Vouch live test (temporary)'
     & $installer -TaskName $taskName -Schedule Weekly -DaysOfWeek Sunday -At 03:00 -CsvPath $CsvPath `
-        -OutputDir $runDir -SaveImages -AllowWarnings -EdgeProfileDir $profileDir -DebugPort $DebugPort 6>$null
+        -OutputDir $runDir -SaveImages -AllowWarnings -EdgeProfileDir $profileDir -DebugPort $DebugPort -UseVirtualDesktop:$UseVirtualDesktop 6>$null
     try {
         Start-ScheduledTask -TaskName $taskName
         $deadline = (Get-Date).AddMinutes($SchedulerTimeoutMinutes)
@@ -148,7 +162,7 @@ if ($ViaScheduler) {
 }
 else {
     & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -File $vouch -CsvPath $CsvPath -OutputDir $runDir `
-        -ReportName 'live-test.html' -SaveImages -JsonSummary -EdgeProfileDir $profileDir -DebugPort $DebugPort
+        -ReportName 'live-test.html' -SaveImages -JsonSummary -EdgeProfileDir $profileDir -DebugPort $DebugPort -UseVirtualDesktop:$UseVirtualDesktop
     $exitCode = $LASTEXITCODE
 }
 $elapsed = (Get-Date) - $started
@@ -205,10 +219,26 @@ else {
         }
     }
 
+    if ($UseVirtualDesktop) {
+        if ([string]$summary.Run.CaptureDesktop -like 'Captured on a separate virtual desktop*') {
+            Write-Host "  PASS  $($summary.Run.CaptureDesktop)" -ForegroundColor Green
+        }
+        else {
+            Add-Failure "virtual desktop not confirmed: $($summary.Run.CaptureDesktop)"
+        }
+    }
+
     # FAILED rows make vouch exit 2; warnings exit 0 here (no -FailOnWarning).
     $expectedExit = if (@($rows | Where-Object Expect -eq 'FAILED').Count -gt 0) { 2 } else { 0 }
     if ($exitCode -ne $expectedExit) { Add-Failure "exit code $exitCode, expected $expectedExit" }
     else { Write-Host "  PASS  exit code $exitCode" -ForegroundColor Green }
+}
+
+if ($UseVirtualDesktop) {
+    Start-Sleep -Seconds 1
+    $desktopsAfter = Get-VirtualDesktopCount
+    if ($desktopsAfter -ne $desktopsBefore) { Add-Failure "$desktopsBefore virtual desktop(s) before the run, $desktopsAfter after - the capture desktop was not closed" }
+    else { Write-Host "  PASS  capture desktop closed ($desktopsAfter desktop(s), as before)" -ForegroundColor Green }
 }
 
 # Edge must be shut down so the DevTools port does not stay open.

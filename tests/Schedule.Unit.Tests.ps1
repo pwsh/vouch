@@ -34,6 +34,9 @@ Describe 'Get-VouchTaskArguments' {
         $plain | Should -Not -Match 'EdgeProfileDir|DebugPort'
         $custom = Get-VouchTaskArguments -ScriptPath 'C:\v\vouch.ps1' -LogDir 'C:\v\logs' -EdgeProfileDir 'C:\P 2\' -DebugPort 9333
         $custom | Should -Match '-EdgeProfileDir "C:\\P 2" -DebugPort 9333'
+        $plain | Should -Not -Match 'UseVirtualDesktop'
+        Get-VouchTaskArguments -ScriptPath 'C:\v\vouch.ps1' -LogDir 'C:\v\logs' -UseVirtualDesktop $true |
+            Should -Match '-UseVirtualDesktop'
     }
 
     It 'splits back into the same arguments the way CreateProcess would' {
