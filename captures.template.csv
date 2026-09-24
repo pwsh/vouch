@@ -1,0 +1,11 @@
+Name,Url,Steps,ScrollFullPage,Notes
+Simple page - one screen,https://app.example.com/admin/security,,N,The page is right as it opens: one screenshot of what fits on the screen.
+Long list - whole page,https://app.example.com/admin/users?role=admin,,Y,Y captures the whole page as one screenshot per screenful - for user lists and logs.
+Click a tab by its words,https://app.example.com/settings,clicktext:Password Policy,N,Opens the page then clicks the tab or link showing these words (capital letters do not matter).
+Two clicks in a row,https://app.example.com/settings,clicktext:Security; clicktext:Multi-factor authentication,N,Steps run left to right; separate them with a semicolon.
+Slow page - wait first,https://reports.example.com/backup-status,wait:5,N,Waits 5 seconds for the page to fill in before the screenshot. 2.5 and 2,5 both work.
+Click then wait then capture all,https://app.example.com/audit,clicktext:Audit Log; wait:3,Y,Clicks a tab then waits for the table to load then captures the whole page.
+Click an exact element (selector),https://app.example.com/admin,click:#tab-roles,N,For when the same words appear twice: click: followed by a selector copied from Edge (F12 then right-click then Copy selector).
+Notes with commas,https://app.example.com/admin/retention,,N,"Put text that contains commas, like this one, in double quotes."
+Control reference in the notes,https://firewall.example.com/policies,,Y,ITGC-07 - firewall rules reviewed quarterly; check the last-modified date column.
+Page reached through a menu,https://portal.example.com/,clicktext:Administration; clicktext:Change approvals; wait:2,Y,Start from a page you can open directly then click through the menu to the evidence.

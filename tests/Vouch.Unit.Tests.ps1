@@ -124,6 +124,23 @@ Describe 'Import-CaptureDefinition' {
         $definitions[2].LineNumber | Should -Be 4
     }
 
+    It 'loads every example row of the copy-and-paste template' {
+        $template = Join-Path -Path $PSScriptRoot -ChildPath '..\captures.template.csv'
+        $definitions = Import-CaptureDefinition -Path $template 6>$null
+        $definitions.Count | Should -Be 10
+        ($definitions | Where-Object Name -eq 'Two clicks in a row').Steps.Count | Should -Be 2
+        ($definitions | Where-Object Name -eq 'Slow page - wait first').Steps[0].Argument | Should -Be 5
+        ($definitions | Where-Object Name -eq 'Click an exact element (selector)').Steps[0].Verb | Should -Be 'click'
+        ($definitions | Where-Object Name -eq 'Notes with commas').Notes | Should -BeLike '*commas, like this one, in*'
+    }
+
+    It 'loads the rows the getting-started guide shows for copying' {
+        $guide = Get-Content -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath '..\docs\getting-started.md') -Raw
+        $block = [regex]::Match($guide, '(?s)ready to paste into Notepad.*?```\r?\n(.*?)```').Groups[1].Value
+        $path = New-TestCsv $block
+        (Import-CaptureDefinition -Path $path 6>$null).Count | Should -Be 9
+    }
+
     It 'throws when the file is missing' {
         { Import-CaptureDefinition -Path (Join-Path $TestDrive 'nope.csv') } | Should -Throw '*not found*'
     }

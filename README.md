@@ -11,6 +11,14 @@ Pages taller than one screen are captured as a series of viewport segments as th
 script scrolls down. The report embeds every image as base64, so the one `.html` file
 can be attached to an audit workpaper and opened anywhere with no loose image files.
 
+> **New to Vouch, or not technical? Start with the
+> [step-by-step guide](docs/getting-started.md).** It covers installing, signing in,
+> writing the capture list, reading and sharing the report, scheduling, and what to do
+> when something goes wrong — in plain language, with a one-page quick reference.
+> For example rows to copy into your capture list, see
+> [`captures.template.csv`](captures.template.csv). This README is the technical
+> reference.
+
 ## Requirements
 
 - Windows 10 or 11.
@@ -44,6 +52,8 @@ one-time step. Repeat it whenever a session expires or you add a new application
 ## Usage
 
 1. Copy `captures.sample.csv` to `captures.csv` and edit it — one row per screenshot.
+   `captures.template.csv` has an example row for each common pattern (full page, tab
+   click, several steps, waits, selectors, quoted notes) to copy from.
 2. Run the script.
 3. Open the report it prints at the end.
 
