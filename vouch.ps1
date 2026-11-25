@@ -73,6 +73,22 @@
     First-run onboarding: opens Edge with the dedicated audit profile (no debugging
     flags) so you can sign in to your applications. Sessions persist for later runs.
 
+.PARAMETER NoPrompt
+    Never ask anything: a "pause" action is skipped and a page that is not ready (or
+    asks for a sign-in) is captured with a warning, as in a scheduled run. Without it,
+    a run started by a person shows the Vouch dialog for those (Continue / Wait /
+    Skip this page); a run started with pwsh -NonInteractive never does.
+
+.PARAMETER EventLogPath
+    Write the progress of the run to this file, one JSON object per line (for the
+    Vouch Designer and other programs that follow a run). Creating a file with the same
+    name plus ".stop" next to it stops the run cleanly: the report is still written for
+    what was captured so far.
+
+.PARAMETER TabId
+    Use this Edge tab (its DevTools target id, as listed by /json/list) instead of the
+    first one. Only for an Edge that is already running; the tab is never closed.
+
 .EXAMPLE
     .\vouch.ps1 -LoginSetup
 
@@ -141,7 +157,13 @@ param(
 
     [string]$Verify = '',
 
-    [switch]$LoginSetup
+    [switch]$LoginSetup,
+
+    [switch]$NoPrompt,
+
+    [string]$EventLogPath = '',
+
+    [string]$TabId = ''
 )
 
 Set-StrictMode -Version Latest
@@ -162,6 +184,17 @@ $script:ReusedEdge        = $false
 $script:PageZoomPercent   = 100
 # A zoom that a reconnect could not set again (Restore-CdpConnection); 0 = none.
 $script:PageZoomLost      = 0
+# The tab -TabId asked for (Get-CdpPageTarget); '' = the first web tab.
+$script:CdpTabId          = ''
+# Whether a person can answer the Vouch dialog (Test-InteractiveRun, set per run).
+$script:InteractiveRun    = $false
+# -EventLogPath of the current run ('' = no events, no stop file) and its run id.
+$script:EventLogPath      = ''
+$script:EventRunId        = ''
+# The page whose events are being written (its id, e.g. p001).
+$script:EventPageId       = ''
+# Set once the stop file has been seen (Test-StopRequested); stays set for the run.
+$script:StopRequested     = $false
 
 # DevTools binds to the IPv4 loopback only; "localhost" can resolve to ::1 and fail.
 $script:CdpHost = '127.0.0.1'
@@ -1441,13 +1474,11 @@ function Select-VouchPage {
 
 function Get-InactiveConfigSetting {
     <#
-        TEMPORARY - shrink as each setting starts working (prompts and pause actions,
-        report fields, zip, open when done).
+        TEMPORARY - shrink as each setting starts working (report fields, zip, open
+        when done).
         Settings the file may set that this engine does not apply yet. A non-default
         value is listed so the user is told it had no effect rather than finding out
         from the evidence. Returns the setting paths, each once.
-        The "pause" page action is listed as well: Invoke-PageAction skips it with a
-        warning until the prompt exists.
     #>
     param([Parameter(Mandatory)][System.Collections.IDictionary]$Config)
 
@@ -1459,7 +1490,7 @@ function Get-InactiveConfigSetting {
         if ($Value -is [string] -and [string]::IsNullOrWhiteSpace($Value) -and [string]::IsNullOrWhiteSpace([string]$Default)) { return }
         if ($Value -ne $Default -and -not $names.Contains($Name)) { $names.Add($Name) }
     }
-    $pageKeys = 'account', 'onNotReady', 'promptTimeoutSec'
+    $pageKeys = @('account')
     foreach ($key in $pageKeys) { & $check "defaults.$key" $Config['defaults'][$key] $defaults['defaults'][$key] }
     foreach ($key in 'embedImages', 'openReport') { & $check "output.$key" $Config['output'][$key] $defaults['output'][$key] }
     & $check 'output.zip.enabled' $Config['output']['zip']['enabled'] $false
@@ -1472,11 +1503,6 @@ function Get-InactiveConfigSetting {
         else { & $check "report.$key" $Config['report'][$key] $defaults['report'][$key] }
     }
     foreach ($page in $Config['pages']) {
-        foreach ($action in @($page['actions'])) {
-            if ($action -isnot [System.Collections.IDictionary]) { continue }
-            $type = Get-VouchActionType -Type $action['type']
-            if ($type -eq 'pause') { & $check 'page actions: pause' $true $false }
-        }
         if ($page['overrides'] -isnot [System.Collections.IDictionary]) { continue }
         foreach ($key in $pageKeys) { & $check "page overrides: $key" $page['overrides'][$key] $defaults['defaults'][$key] }
     }
@@ -1623,10 +1649,15 @@ function Get-CdpPageTarget {
         second tab that would then show up in every screenshot.
         Internal tabs (Test-InternalPageTarget) are never used: the run would navigate
         Edge's own dialog, and the real tab would stay behind it.
+        -TabId (default: $script:CdpTabId, set from -TabId for the whole run) picks one
+        tab by its target id - the Designer's visible tab, which is not necessarily the
+        first in the list. That tab must exist: opening another would capture a tab the
+        person is not looking at, so a missing one is an error.
     #>
     param(
         [Parameter(Mandatory)][int]$Port,
-        [double]$WaitSeconds = 0
+        [double]$WaitSeconds = 0,
+        [AllowEmptyString()][string]$TabId = $script:CdpTabId
     )
 
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
@@ -1639,6 +1670,19 @@ function Get-CdpPageTarget {
             Write-Verbose "Could not enumerate DevTools targets: $($_.Exception.Message)"
         }
 
+        if ($TabId) {
+            foreach ($target in $targets) {
+                if ($target.PSObject.Properties['id'] -and [string]$target.id -eq $TabId -and
+                    $target.PSObject.Properties['type'] -and $target.type -eq 'page' -and
+                    $target.PSObject.Properties['webSocketDebuggerUrl'] -and
+                    -not [string]::IsNullOrWhiteSpace($target.webSocketDebuggerUrl)) {
+                    return $target
+                }
+            }
+            if ((Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+            continue
+        }
+
         foreach ($target in $targets) {
             if ($target.PSObject.Properties['type'] -and $target.type -eq 'page' -and
                 $target.PSObject.Properties['webSocketDebuggerUrl'] -and
@@ -1649,6 +1693,10 @@ function Get-CdpPageTarget {
         }
         if ((Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
     } while ((Get-Date) -lt $deadline)
+
+    if ($TabId) {
+        throw "Edge has no open tab with the id '$TabId' (on port $Port). The tab may have been closed, or this Edge was started by this run and has none of the earlier tabs. Open the page again, or leave out -TabId to use the first tab."
+    }
 
     # Newer Chromium builds reject GET on /json/new; PUT is the supported verb.
     # GET is kept as a fallback for older builds.
@@ -1788,7 +1836,10 @@ function Receive-CdpMessage {
                 $result = $script:CdpSocket.ReceiveAsync($segment, $cts.Token).GetAwaiter().GetResult()
             }
             catch {
-                if ((Get-Date) -ge $Deadline) {
+                # The token's timer can fire a few milliseconds before Get-Date reaches
+                # the deadline; the cancellation is still the timeout, not some other
+                # failure, so it gets the same message.
+                if ($cts.IsCancellationRequested -or (Get-Date) -ge $Deadline) {
                     throw 'Timed out waiting for a response from the browser (DevTools WebSocket).'
                 }
                 throw
@@ -1984,6 +2035,8 @@ function Wait-PageReady {
         document is still current and already reports 'complete'. The marker set before
         navigating disambiguates. Same-document navigations (a #fragment) keep the marker
         forever, so after a grace period a completed document is accepted regardless.
+        Returns $false at once when the run is stopped (Test-StopRequested); the caller
+        tells that apart from a page that never loaded.
     #>
     param(
         [Parameter(Mandatory)][int]$TimeoutSec,
@@ -1995,6 +2048,7 @@ function Wait-PageReady {
     $deadline = $start.AddSeconds($TimeoutSec)
 
     while ((Get-Date) -lt $deadline) {
+        if (Test-StopRequested) { return $false }
         $state = $null
         try {
             $state = Invoke-CdpEval -Expression $expression -TimeoutSec 10
@@ -2099,7 +2153,7 @@ function Add-ZoomLostDetail {
     if ($lost -le 0) { return }
     $script:PageZoomLost = 0
     if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
-    $Item.Details.Add("The connection to Edge was lost and restored during this page, but the page zoom of $lost% could not be set again; the images taken after that show the page at 100%.")
+    $Item.Details.Add("The connection to Edge was lost and restored during this page, but the page zoom of $lost% could not be set again; any images of this page taken after that show it at 100%.")
 }
 
 function Get-SingleImagePlan {
@@ -2898,6 +2952,367 @@ function Get-ImagePixelSize {
 
 #endregion
 
+#region Progress events, stop and the Vouch dialog -----------------------------
+
+function Write-RunEvent {
+    <#
+        Appends one progress event to -EventLogPath: one JSON object per line (NDJSON,
+        UTF-8 without BOM, LF), so another process - the Designer - can follow the run by
+        reading new lines. The file is opened, appended and closed per event: every line
+        is on disk for the reader as soon as it is written, and the reader may keep the
+        file open (shared read/write access) without blocking the run. Events are a
+        convenience: a failure to write one is never a reason to fail the run.
+        Without an event log this returns at once.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Type,
+        [AllowNull()][System.Collections.IDictionary]$Data = $null
+    )
+    $path = $script:EventLogPath
+    if ([string]::IsNullOrEmpty($path)) { return }
+    try {
+        $record = [ordered]@{
+            ts    = [System.DateTimeOffset]::Now.ToString('yyyy-MM-ddTHH:mm:ss.fffzzz', [System.Globalization.CultureInfo]::InvariantCulture)
+            type  = $Type
+            runId = $script:EventRunId
+        }
+        # ts, type and runId belong to the envelope; a field of the same name cannot replace them.
+        if ($null -ne $Data) {
+            foreach ($key in @($Data.Keys)) {
+                if ([string]$key -notin 'ts', 'type', 'runId') { $record[[string]$key] = $Data[$key] }
+            }
+        }
+        $line = (ConvertTo-Json -InputObject $record -Compress -Depth 8) + "`n"
+        $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($line)
+        $stream = [System.IO.FileStream]::new($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write,
+            ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush()
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+    catch {
+        Write-Verbose "Could not write the '$Type' event to '$path': $($_.Exception.Message)"
+    }
+}
+
+function Get-StopFilePath {
+    # The file whose existence stops the run: the event log's name plus ".stop".
+    if ([string]::IsNullOrEmpty($script:EventLogPath)) { return '' }
+    return "$($script:EventLogPath).stop"
+}
+
+function Test-StopRequested {
+    <#
+        Whether the person stopped the run: the Designer (or anyone) creates
+        <EventLogPath>.stop. A file is the simplest signal two processes can share with
+        nothing to install. Once seen, the stop holds for the rest of the run, even if
+        the file is removed again. No event log means no stop, at no cost.
+    #>
+    if ($script:StopRequested) { return $true }
+    $stopFile = Get-StopFilePath
+    if (-not $stopFile) { return $false }
+    if ([System.IO.File]::Exists($stopFile)) {
+        $script:StopRequested = $true
+        Write-Host 'Stop requested: finishing the report for what has been captured so far.' -ForegroundColor Yellow
+        return $true
+    }
+    return $false
+}
+
+function Wait-Interruptible {
+    <#
+        Sleeps, but notices a stop within a fifth of a second, so a 60-second wait
+        action does not hold up a stopped run. Without an event log no stop can come,
+        and it is exactly one Start-Sleep, as before. Returns $false when it was stopped.
+    #>
+    param([Parameter(Mandatory)][double]$Milliseconds)
+    if ([string]::IsNullOrEmpty($script:EventLogPath)) {
+        Start-Sleep -Milliseconds ([int][Math]::Max(0, $Milliseconds))
+        return $true
+    }
+    $deadline = (Get-Date).AddMilliseconds([Math]::Max(0, $Milliseconds))
+    while ($true) {
+        if (Test-StopRequested) { return $false }
+        $left = ($deadline - (Get-Date)).TotalMilliseconds
+        if ($left -le 0) { return $true }
+        Start-Sleep -Milliseconds ([int][Math]::Ceiling([Math]::Min(200, $left)))
+    }
+}
+
+function Test-InteractiveRun {
+    <#
+        Whether a person can answer the Vouch dialog. Not with -NoPrompt; not in a
+        process without a desktop (UserInteractive is false for a task that runs whether
+        or not the user is signed in); and not when pwsh was started with
+        -NonInteractive, which is how the scheduled task starts it - that switch is not
+        visible to the script any other way, so pwsh's own command line is read, up to
+        -File/-Command (what follows belongs to the script). pwsh accepts any
+        abbreviation of -NonInteractive from -noni on, with -, -- or /.
+        -CommandLineArgs and -UserInteractive replace the real values (for tests).
+    #>
+    param(
+        [bool]$NoPrompt = $false,
+        [AllowNull()][string[]]$CommandLineArgs = $null,
+        [AllowNull()][object]$UserInteractive = $null
+    )
+    if ($NoPrompt) { return $false }
+    $desktop = if ($null -ne $UserInteractive) { [bool]$UserInteractive } else { [System.Environment]::UserInteractive }
+    if (-not $desktop) { return $false }
+    if ($null -eq $CommandLineArgs) { $CommandLineArgs = [System.Environment]::GetCommandLineArgs() }
+    for ($i = 1; $i -lt $CommandLineArgs.Count; $i++) {
+        $argument = [string]$CommandLineArgs[$i]
+        if ($argument -notmatch '^(?:--?|/)([A-Za-z]+)(?::.*)?$') {
+            # "pwsh script.ps1 ...": the first .ps1 is the script; its arguments follow.
+            if ($argument -match '(?i)\.ps1$') { break }
+            continue
+        }
+        $name = $Matches[1].ToLowerInvariant()
+        if ($name.StartsWith('noni') -and 'noninteractive'.StartsWith($name)) { return $false }
+        if ('file'.StartsWith($name) -or 'command'.StartsWith($name) -or 'encodedcommand'.StartsWith($name) -or
+            $name -in 'ec', 'cwa', 'commandwithargs') { break }
+    }
+    return $true
+}
+
+function Request-UserDecision {
+    <#
+        The one place where the run asks the person something (a pause, a page that is
+        not ready, a sign-in). Everything else calls this, so tests replace this one
+        function. When nobody can answer ($script:InteractiveRun is false: scheduled,
+        -NonInteractive, -NoPrompt) it returns the default at once, with no window, and
+        Prompted = $false so the caller can say nobody was asked. Otherwise the Vouch
+        dialog (Show-ContinueDialog) asks; a dialog that cannot be shown counts as
+        nobody there, because a run must never fail or hang over a question.
+        Returns { Decision = Continue|Wait|Skip; WaitSeconds; TimedOut; Prompted }.
+    #>
+    param(
+        [ValidateSet('pause', 'notReady', 'signIn')][string]$Kind = 'pause',
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Message,
+        [AllowEmptyString()][string]$PageName = '',
+        [ValidateSet('Continue', 'Skip')][string]$Default = 'Continue',
+        [int]$TimeoutSec = 300,
+        [int]$WaitSeconds = 30
+    )
+    if ($TimeoutSec -le 0) { $TimeoutSec = 300 }
+    $unanswered = [pscustomobject]@{ Decision = $Default; WaitSeconds = 0; TimedOut = $false; Prompted = $false }
+    if (-not $script:InteractiveRun) { return $unanswered }
+
+    Write-RunEvent -Type 'prompt' -Data ([ordered]@{
+        pageId = $script:EventPageId; kind = $Kind; title = $Title; message = $Message; pageName = $PageName
+        defaultDecision = $Default; timeoutSec = $TimeoutSec })
+    Write-Host "    Waiting for you in the Vouch dialog: $Title" -ForegroundColor Cyan
+    try {
+        $result = Show-ContinueDialog -Title $Title -Message $Message -PageName $PageName -Default $Default `
+            -TimeoutSec $TimeoutSec -WaitSeconds $WaitSeconds -StopFile (Get-StopFilePath)
+    }
+    catch {
+        Write-Host "WARNING: the Vouch dialog could not be shown, so the run carries on as if nobody were there: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-RunEvent -Type 'promptResult' -Data ([ordered]@{
+            pageId = $script:EventPageId; kind = $Kind; decision = $Default; waitSeconds = 0; timedOut = $false; shown = $false })
+        return $unanswered
+    }
+    $answer = [pscustomobject]@{
+        Decision    = [string]$result.Decision
+        WaitSeconds = [int]$result.WaitSeconds
+        TimedOut    = [bool]$result.TimedOut
+        Prompted    = $true
+    }
+    if ($answer.Decision -notin 'Continue', 'Wait', 'Skip') { $answer.Decision = $Default }
+    Write-RunEvent -Type 'promptResult' -Data ([ordered]@{
+        pageId = $script:EventPageId; kind = $Kind; decision = $answer.Decision; waitSeconds = $answer.WaitSeconds
+        timedOut = $answer.TimedOut; shown = $true })
+    return $answer
+}
+
+function New-ContinueDialog {
+    <#
+        Builds the Vouch dialog without showing it, so its logic can be tested without a
+        window. The handlers are closures over the dialog's own state, because they run
+        later, from the dialog's message loop (or a test), after this function returned.
+        They use only .NET, which a closure can always reach.
+        The countdown takes the default answer when -TimeoutSec runs out, so a forgotten
+        prompt never holds a run forever; the stop file closes it at once.
+        Returns { Form; State; Timer; ContinueButton; WaitButton; SkipButton; WaitInput;
+        Countdown }; State.Tick is the timer's handler.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Message,
+        [AllowEmptyString()][string]$PageName = '',
+        [ValidateSet('Continue', 'Skip')][string]$Default = 'Continue',
+        [int]$TimeoutSec = 300,
+        [int]$WaitSeconds = 30,
+        [AllowEmptyString()][string]$StopFile = ''
+    )
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    if ($TimeoutSec -le 0) { $TimeoutSec = 300 }
+    $WaitSeconds = [Math]::Min(3600, [Math]::Max(5, $WaitSeconds))
+
+    $state = @{
+        Decision = ''; WaitSeconds = $WaitSeconds; TimedOut = $false; Stopped = $false
+        Default = $Default; Deadline = [datetime]::Now.AddSeconds($TimeoutSec); StopFile = $StopFile; Tick = $null
+    }
+    $defaultText = if ($Default -eq 'Skip') { 'skip this page' } else { 'continue' }
+    $countdownFormat = "If nobody answers, Vouch will $defaultText in {0}:{1:d2}."
+
+    $form = [System.Windows.Forms.Form]::new()
+    $form.Text = "Vouch - $Title"
+    $form.TopMost = $true
+    $form.ShowInTaskbar = $true
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+    $form.AutoSize = $true
+    $form.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $form.Font = [System.Drawing.SystemFonts]::MessageBoxFont
+    $form.Padding = [System.Windows.Forms.Padding]::new(10)
+
+    $layout = [System.Windows.Forms.TableLayoutPanel]::new()
+    $layout.AutoSize = $true
+    $layout.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $layout.ColumnCount = 1
+    $newLabel = {
+        param([string]$Text, [bool]$Bold = $false)
+        $label = [System.Windows.Forms.Label]::new()
+        $label.AutoSize = $true
+        $label.MaximumSize = [System.Drawing.Size]::new(420, 0)
+        $label.Margin = [System.Windows.Forms.Padding]::new(0, 0, 0, 8)
+        $label.Text = $Text
+        if ($Bold) { $label.Font = [System.Drawing.Font]::new($form.Font, [System.Drawing.FontStyle]::Bold) }
+        return $label
+    }
+    $layout.Controls.Add((& $newLabel $Title $true))
+    if ($PageName) { $layout.Controls.Add((& $newLabel "Page: $PageName")) }
+    $layout.Controls.Add((& $newLabel $Message))
+    $countdown = & $newLabel ''
+    $layout.Controls.Add($countdown)
+
+    $buttons = [System.Windows.Forms.FlowLayoutPanel]::new()
+    $buttons.AutoSize = $true
+    $buttons.WrapContents = $false
+    $continueButton = [System.Windows.Forms.Button]::new()
+    $continueButton.Text = 'Continue'
+    $continueButton.AutoSize = $true
+    $waitInput = [System.Windows.Forms.NumericUpDown]::new()
+    $waitInput.Minimum = 5
+    $waitInput.Maximum = 3600
+    $waitInput.Value = $WaitSeconds
+    $waitInput.Width = 60
+    $waitInput.Margin = [System.Windows.Forms.Padding]::new(12, 5, 0, 0)
+    $waitButton = [System.Windows.Forms.Button]::new()
+    $waitButton.Text = "Wait $WaitSeconds s more"
+    $waitButton.AutoSize = $true
+    $skipButton = [System.Windows.Forms.Button]::new()
+    $skipButton.Text = 'Skip this page'
+    $skipButton.AutoSize = $true
+    $skipButton.Margin = [System.Windows.Forms.Padding]::new(12, 3, 3, 3)
+    foreach ($control in $continueButton, $waitInput, $waitButton, $skipButton) { $buttons.Controls.Add($control) }
+    $layout.Controls.Add($buttons)
+    $form.Controls.Add($layout)
+    $form.AcceptButton = $continueButton
+
+    $timer = [System.Windows.Forms.Timer]::new()
+    $timer.Interval = 250
+
+    $tick = {
+        if ($state.Decision) { return }
+        if ($state.StopFile -and [System.IO.File]::Exists($state.StopFile)) {
+            $state.Stopped = $true
+            $state.Decision = 'Skip'
+            $form.Close()
+            return
+        }
+        $left = [int][Math]::Ceiling(($state.Deadline - [datetime]::Now).TotalSeconds)
+        if ($left -le 0) {
+            $state.Decision = $state.Default
+            $state.TimedOut = $true
+            $form.Close()
+            return
+        }
+        $countdown.Text = $countdownFormat -f [int][Math]::Floor($left / 60), ($left % 60)
+    }.GetNewClosure()
+    $state.Tick = $tick
+    $timer.add_Tick($tick)
+
+    $continueButton.add_Click({ $state.Decision = 'Continue'; $form.Close() }.GetNewClosure())
+    $skipButton.add_Click({ $state.Decision = 'Skip'; $form.Close() }.GetNewClosure())
+    $waitButton.add_Click({
+        $state.WaitSeconds = [int]$waitInput.Value
+        $state.Decision = 'Wait'
+        $form.Close()
+    }.GetNewClosure())
+    $waitInput.add_ValueChanged({ $waitButton.Text = "Wait $([int]$waitInput.Value) s more" }.GetNewClosure())
+    # Closed with the window's X: the same as letting the countdown run out, without the wait.
+    $form.add_FormClosing({ if (-not $state.Decision) { $state.Decision = $state.Default } }.GetNewClosure())
+    # Bottom right of the main display, over as little of the page as possible.
+    $form.add_Load({
+        $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        $form.Location = [System.Drawing.Point]::new($area.Right - $form.Width - 16, $area.Bottom - $form.Height - 16)
+    }.GetNewClosure())
+    # A pwsh started hidden or minimised gives its first window that style (measured):
+    # the dialog would exist but never appear. SW_RESTORE shows it normally, TopMost
+    # keeps it above a maximised Edge.
+    $form.add_Shown({
+        [void][Vouch.Native]::ShowWindow($form.Handle, 9)   # SW_RESTORE
+        $form.Activate()
+        $timer.Start()
+    }.GetNewClosure())
+
+    & $tick
+    return [pscustomobject]@{
+        Form = $form; State = $state; Timer = $timer; ContinueButton = $continueButton; WaitButton = $waitButton
+        SkipButton = $skipButton; WaitInput = $waitInput; Countdown = $countdown
+    }
+}
+
+function Show-ContinueDialog {
+    <#
+        Shows the Vouch dialog (New-ContinueDialog) and waits for the answer. Edge covers
+        the screen during a run, and the Designer panel with it, so the question comes
+        from a TopMost window of the engine itself; the same window serves a run started
+        from a console. The dialog must never be in the evidence: it is closed and
+        disposed, Edge is brought back to the front and the screen given a moment to
+        repaint before this returns - and every screenshot is taken after it returns.
+        Returns { Decision = Continue|Wait|Skip; WaitSeconds; TimedOut }.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Message,
+        [AllowEmptyString()][string]$PageName = '',
+        [ValidateSet('Continue', 'Skip')][string]$Default = 'Continue',
+        [int]$TimeoutSec = 300,
+        [int]$WaitSeconds = 30,
+        [AllowEmptyString()][string]$StopFile = ''
+    )
+    $dialog = New-ContinueDialog -Title $Title -Message $Message -PageName $PageName -Default $Default `
+        -TimeoutSec $TimeoutSec -WaitSeconds $WaitSeconds -StopFile $StopFile
+    try {
+        [void]$dialog.Form.ShowDialog()
+    }
+    finally {
+        $dialog.Timer.Stop()
+        $dialog.Timer.Dispose()
+        $dialog.Form.Dispose()
+        [System.Windows.Forms.Application]::DoEvents()
+        $handle = Get-EdgeWindowHandle -TimeoutSec 1
+        if ($handle -ne [IntPtr]::Zero) { [void][Vouch.Native]::SetForegroundWindow($handle) }
+        # Lets the window manager finish removing the dialog before anything is captured.
+        Start-Sleep -Milliseconds 500
+    }
+    $state = $dialog.State
+    $decision = if ($state.Decision) { [string]$state.Decision } else { $Default }
+    return [pscustomobject]@{ Decision = $decision; WaitSeconds = [int]$state.WaitSeconds; TimedOut = [bool]$state.TimedOut }
+}
+
+#endregion
+
 #region Row execution ---------------------------------------------------------
 
 function Get-SafeFileName {
@@ -3348,8 +3763,9 @@ function Wait-PageElement {
         #grid, then click #grid tr" behaves the way it reads. Visible, because many
         applications put the element in the page at once and only show it when its data
         has arrived. Polling, like Wait-PageReady: no event pump is needed.
-        Returns $true when it appeared, $false on timeout; throws for a selector the
-        browser cannot read, because waiting would never end well.
+        Returns $true when it appeared, $false on timeout (and at once when the run is
+        stopped); throws for a selector the browser cannot read, because waiting would
+        never end well.
     #>
     param(
         [Parameter(Mandatory)][string]$Selector,
@@ -3377,7 +3793,7 @@ $(Get-FrameDocsScript)
         catch { Write-Verbose "Element check failed (the page may be loading): $($_.Exception.Message)" }
         if ($state -eq 'FOUND') { return $true }
         if ($state -eq 'INVALID') { throw "'$Selector' is not a CSS selector the browser understands." }
-        if ((Get-Date) -ge $deadline) { return $false }
+        if ((Get-Date) -ge $deadline -or (Test-StopRequested)) { return $false }
         Start-Sleep -Milliseconds 250
     }
 }
@@ -3455,13 +3871,15 @@ $(Get-FrameDocsScript)
             $ready = $false
             try { $ready = [bool](Invoke-CdpEval -TimeoutSec 10 -Expression $framesReady) }
             catch { Write-Verbose "Frame readiness check failed: $($_.Exception.Message)" }
-            if ($ready) { return }
+            if ($ready -or (Test-StopRequested)) { return }
             Start-Sleep -Milliseconds 250
         }
         throw "The click loaded a page inside a frame that did not finish loading within $TimeoutSec seconds."
     }
 
     if (-not (Wait-PageReady -TimeoutSec $TimeoutSec -SameDocumentGraceSeconds $TimeoutSec)) {
+        # A stopped run ends the page anyway; the page is not at fault.
+        if (Test-StopRequested) { return }
         throw "The click opened a page that did not finish loading within $TimeoutSec seconds."
     }
 }
@@ -3571,34 +3989,30 @@ function Invoke-PageAction {
             'click' {
                 Set-StepNavigationProbe
                 Invoke-ClickSelector -Selector ([string]$Action['selector'])
-                Start-Sleep -Milliseconds ([int]($Settings.SettleSeconds * 1000))
+                [void](Wait-Interruptible -Milliseconds ([int]($Settings.SettleSeconds * 1000)))
                 Wait-StepNavigation -TimeoutSec $navigationTimeoutSec
             }
             'clickText' {
                 Set-StepNavigationProbe
                 Invoke-ClickText -Text ([string]$Action['text'])
-                Start-Sleep -Milliseconds ([int]($Settings.SettleSeconds * 1000))
+                [void](Wait-Interruptible -Milliseconds ([int]($Settings.SettleSeconds * 1000)))
                 Wait-StepNavigation -TimeoutSec $navigationTimeoutSec
             }
             'wait' {
-                Start-Sleep -Milliseconds ([int]([double]$Action['seconds'] * 1000))
+                [void](Wait-Interruptible -Milliseconds ([int]([double]$Action['seconds'] * 1000)))
             }
             'waitFor' {
                 $timeout = if ($Action.Contains('timeoutSec') -and $null -ne $Action['timeoutSec']) { [double]$Action['timeoutSec'] } else { $navigationTimeoutSec }
                 $selector = [string]$Action['selector']
                 if (-not (Wait-PageElement -Selector $selector -TimeoutSec $timeout)) {
+                    if (Test-StopRequested) { throw 'Stopped by the user before the element showed.' }
                     # Invariant: "1.5 second(s)", not "1,5" on a German PC.
                     $seconds = ([double]$timeout).ToString([System.Globalization.CultureInfo]::InvariantCulture)
                     throw "No visible element matched '$selector' within $seconds second(s); the next actions ran anyway."
                 }
             }
             'pause' {
-                # TEMPORARY (until the prompt exists): listed by Get-InactiveConfigSetting too.
-                $entry.Message = 'skipped: pause is not available yet'
-                if ($null -ne $Item) {
-                    if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
-                    $Item.Details.Add("The pause action ($Text) was skipped: pause is not available yet in this version of Vouch.")
-                }
+                Invoke-PauseAction -Action $Action -Settings $Settings -Text $Text -Item $Item -Entry $entry
             }
             default {
                 throw "Unknown action '$($Action['type'])'."
@@ -3610,6 +4024,199 @@ function Invoke-PageAction {
         $entry.Message = $_.Exception.Message
     }
     return $entry
+}
+
+function Invoke-PauseAction {
+    <#
+        A "pause" action: the run waits until the person has done something in the Edge
+        window (an MFA prompt, choosing a view) and says so in the Vouch dialog.
+        Request-UserDecision alone knows whether anyone can answer. When nobody can (a
+        scheduled run, -NoPrompt), the pause is passed over at once with a warning:
+        waiting for an answer that never comes would only delay the evidence.
+        Wait waits (a stop still ends it) and asks again. Skip ends the page: the log
+        entry gets EndPage, and the screenshots already taken are kept. When the dialog
+        times out its default is Continue - the page was meant to carry on after the
+        pause - and the item says nobody answered.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Action,
+        [Parameter(Mandatory)][object]$Settings,
+        [AllowEmptyString()][string]$Text = '',
+        [object]$Item = $null,
+        [Parameter(Mandatory)][object]$Entry
+    )
+    $message = [string]$Action['message']
+    if ([string]::IsNullOrWhiteSpace($message)) {
+        $message = 'Vouch has paused so you can do something in the Edge window first, for example sign in or open the right view. Click Continue when the page is ready.'
+    }
+    $pageName = if ($null -ne $Item) { [string]$Item.Name } else { '' }
+    $policy = Get-NotReadyPolicy -Settings $Settings
+    $addDetail = {
+        param([string]$Line)
+        if ($null -eq $Item) { return }
+        if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+        $Item.Details.Add($Line)
+    }
+
+    while ($true) {
+        $answer = Request-UserDecision -Kind 'pause' -Title 'Vouch is paused' -Message $message -PageName $pageName `
+            -Default 'Continue' -TimeoutSec $policy.PromptTimeoutSec
+        if (Test-StopRequested) {
+            $Entry.Message = 'stopped by the user'
+            return
+        }
+        if (-not $answer.Prompted) {
+            $Entry.Message = 'skipped: nobody was there to answer'
+            & $addDetail "The pause ($Text) was skipped because nobody was there to answer it (an unattended run, or -NoPrompt); the actions after it ran straight away."
+            return
+        }
+        if ($answer.Decision -eq 'Wait') {
+            [void](Wait-Interruptible -Milliseconds ([Math]::Max(1, [int]$answer.WaitSeconds) * 1000))
+            continue
+        }
+        if ($answer.Decision -eq 'Skip') {
+            $taken = if ($null -ne $Item) { $Item.Captures.Count } else { 0 }
+            $kept = if ($taken -gt 0) { " The $taken screenshot(s) taken before it are kept." } else { ' No screenshot of it had been taken yet.' }
+            $Entry.Message = 'the user skipped the rest of the page'
+            $Entry | Add-Member -NotePropertyName EndPage -NotePropertyValue $true
+            & $addDetail "Skipped by the user at the pause ($Text): the rest of this page was not run.$kept"
+            return
+        }
+        if ($answer.TimedOut) {
+            $Entry.Message = "continued: nobody answered within $($policy.PromptTimeoutSec) seconds"
+            & $addDetail "Nobody answered the pause ($Text) within $($policy.PromptTimeoutSec) seconds, so Vouch carried on without it."
+        }
+        else {
+            $Entry.Message = 'continued by the user'
+        }
+        return
+    }
+}
+
+function Get-NotReadyPolicy {
+    <#
+        What a page does when it is not ready or asks for a sign-in (onNotReady: warn or
+        prompt) and how long the Vouch dialog waits for an answer. Settings built
+        without the page-level values (the single-page callers and the tests) mean what
+        a run without a configuration file always meant: warn, 300 seconds.
+    #>
+    param([Parameter(Mandatory)][object]$Settings)
+    $onNotReady = 'warn'
+    if ($Settings.PSObject.Properties['OnNotReady'] -and [string]$Settings.OnNotReady -eq 'prompt') { $onNotReady = 'prompt' }
+    $timeoutSec = 300
+    if ($Settings.PSObject.Properties['PromptTimeoutSec'] -and [int]$Settings.PromptTimeoutSec -gt 0) { $timeoutSec = [int]$Settings.PromptTimeoutSec }
+    return [pscustomobject]@{ OnNotReady = $onNotReady; PromptTimeoutSec = $timeoutSec }
+}
+
+function Resolve-PageNotReady {
+    <#
+        A page that did not finish loading, or did not show its wait-for element, in
+        time. With onNotReady "warn", or when nobody can answer, the page is captured as
+        it is with today's warning. With "prompt" the person decides in the Vouch dialog:
+        Wait runs -Recheck again for the extra seconds (it returns as soon as the page is
+        ready) and asks again if it is still not; Continue captures it as it is, with a
+        warning; Skip ends the page. -Recheck takes the seconds to wait and returns
+        $true once the page is ready.
+        Returns 'ready', 'continued', 'skipped' or 'stopped'.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Item,
+        [Parameter(Mandatory)][scriptblock]$Recheck,
+        # What did not happen, e.g. "finish loading" or "show '#grid'".
+        [Parameter(Mandatory)][string]$Awaited,
+        [Parameter(Mandatory)][int]$WaitedSec,
+        [Parameter(Mandatory)][object]$Policy
+    )
+    $warn = {
+        param([string]$Line)
+        if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+        $Item.Details.Add($Line)
+    }
+    $waited = $WaitedSec
+    if ($Policy.OnNotReady -ne 'prompt') {
+        & $warn "The page did not $Awaited within $waited seconds; it was captured in whatever state it had reached."
+        return 'continued'
+    }
+
+    while ($true) {
+        $message = "The page did not $Awaited within $waited seconds. If it needs something from you (for example a sign-in, " +
+            'a confirmation or a choice), do that in the Edge window first. Then choose Wait to give it more time, ' +
+            'Continue to capture it as it is now, or Skip this page.'
+        $answer = Request-UserDecision -Kind 'notReady' -Title 'The page is not ready' -Message $message -PageName ([string]$Item.Name) `
+            -Default 'Continue' -TimeoutSec $Policy.PromptTimeoutSec
+        if (Test-StopRequested) { return 'stopped' }
+        if (-not $answer.Prompted) {
+            & $warn "The page did not $Awaited within $waited seconds; it was captured in whatever state it had reached."
+            return 'continued'
+        }
+        if ($answer.Decision -eq 'Wait') {
+            $extra = [Math]::Max(1, [int]$answer.WaitSeconds)
+            $ready = [bool](& $Recheck $extra)
+            $waited += $extra
+            if (Test-StopRequested) { return 'stopped' }
+            if ($ready) { return 'ready' }
+            continue
+        }
+        if ($answer.Decision -eq 'Skip') {
+            & $warn "Skipped by the user: the page did not $Awaited within $waited seconds, so it was not captured."
+            return 'skipped'
+        }
+        if ($answer.TimedOut) {
+            & $warn "The page did not $Awaited within $waited seconds and nobody answered the Vouch dialog within $($Policy.PromptTimeoutSec) seconds; it was captured in whatever state it had reached."
+        }
+        else {
+            & $warn "The page did not $Awaited within $waited seconds; it was captured as it was, as chosen in the Vouch dialog."
+        }
+        return 'continued'
+    }
+}
+
+function Get-SignInDetail {
+    <#
+        Whether the page the browser ended up on looks like a sign-in page instead of the
+        one requested, as the detail text the item gets, or '' when it does not. Two
+        signs: a redirect to another site (not just http -> https), or - on the same
+        site - a sign-in URL or a visible password field (Test-LoginRedirect). Read
+        again after a sign-in prompt, so both visits are judged the same way.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RequestedUrl,
+        [AllowEmptyString()][string]$FinalUrl = '',
+        [bool]$BrowserErrorPage = $false
+    )
+    $requestedOrigin = Get-OriginFromUrl -Url $RequestedUrl
+    $finalOrigin = Get-OriginFromUrl -Url $FinalUrl
+    if (-not [string]::IsNullOrWhiteSpace($finalOrigin) -and
+        -not [string]::IsNullOrWhiteSpace($requestedOrigin) -and
+        $finalOrigin -ne $requestedOrigin -and
+        -not (Test-HttpsUpgrade -RequestedUrl $RequestedUrl -FinalUrl $FinalUrl)) {
+        return "Redirected to $finalOrigin - possible login required."
+    }
+    if ($BrowserErrorPage -or [string]::IsNullOrWhiteSpace($FinalUrl)) { return '' }
+    $hasPasswordField = $false
+    try {
+        $hasPasswordField = [bool](Invoke-CdpEval -TimeoutSec 10 -Expression (
+            "Array.prototype.some.call(document.querySelectorAll('input[type=password]'), " +
+            "function (e) { var r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; })"))
+    }
+    catch {
+        Write-Verbose "Could not look for a password field: $($_.Exception.Message)"
+    }
+    if (Test-LoginRedirect -RequestedUrl $RequestedUrl -FinalUrl $FinalUrl -HasPasswordField $hasPasswordField) {
+        return "Redirected to a sign-in page ($(([Uri]$FinalUrl).AbsolutePath)) - the session has probably expired. Run -LoginSetup."
+    }
+    return ''
+}
+
+function Add-StopDetail {
+    <#
+        The page that was running when the person stopped the run: a WARNING (the page
+        did nothing wrong, but its evidence is incomplete), said once.
+    #>
+    param([Parameter(Mandatory)][object]$Item)
+    $line = 'Stopped by the user: the run ended here, so the rest of this page was not captured.'
+    if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+    if (-not $Item.Details.Contains($line)) { $Item.Details.Add($line) }
 }
 
 function Add-StepFailureDetail {
@@ -3747,6 +4354,11 @@ function Add-ItemCapture {
         else {
             $screenText = '{0}x{1} Edge window at ({2},{3}) of the {4}x{5} primary display' -f $windowRectangle.Width, $windowRectangle.Height,
                 ($windowRectangle.X + $screenBounds.X), ($windowRectangle.Y + $screenBounds.Y), $screenBounds.Width, $screenBounds.Height
+            $partial = Get-PartialWindowDetail -WindowBounds $windowBounds -Visible $windowRectangle
+            if ($partial) {
+                if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+                if (-not $Item.Details.Contains($partial)) { $Item.Details.Add($partial) }
+            }
         }
     }
 
@@ -3790,6 +4402,27 @@ function Add-ItemCapture {
     $Item.Captures.Add((New-CaptureRecord -Bytes $bytes -Url $PageUrl -SegmentIndex $SegmentIndex -SegmentCount $SegmentCount `
         -FilePath $filePath -FileName $fileName -CapturedAt $capturedAt -CaptureNumber $CaptureNumber -Label $Label `
         -CaptureArea $area -ZoomPercent $ZoomPercent))
+    Write-RunEvent -Type 'capture' -Data ([ordered]@{
+        pageId = $script:EventPageId; pageIndex = $Item.Index; captureNumber = $CaptureNumber; label = $Label
+        segment = $SegmentIndex; segmentCount = $SegmentCount; fileName = $fileName; area = $area; zoomPercent = $ZoomPercent
+        url = $PageUrl; capturedAt = $Item.Captures[$Item.Captures.Count - 1].CapturedAt })
+}
+
+function Get-PartialWindowDetail {
+    <#
+        The detail for an Edge window that is only partly on the main display (moved
+        half off it, or spread over two monitors): the image shows only the part on the
+        main display. Up to 8 px a side is ignored - GetWindowRect, the fallback when
+        DWM cannot answer, counts invisible borders that stick out that far on a
+        maximised window. '' when the window is (all but) entirely visible. Pure.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Drawing.Rectangle]$WindowBounds,
+        [Parameter(Mandatory)][System.Drawing.Rectangle]$Visible
+    )
+    if ($WindowBounds.Width - $Visible.Width -le 16 -and $WindowBounds.Height - $Visible.Height -le 16) { return '' }
+    return 'Part of the Edge window is outside the main display, so the images show only the part on it ({0}x{1} of the {2}x{3} window).' -f
+        $Visible.Width, $Visible.Height, $WindowBounds.Width, $WindowBounds.Height
 }
 
 function Get-CaptureManifest {
@@ -4465,8 +5098,9 @@ function Get-RunSettingDefinition {
         The one list of run-level settings: the script parameter each one comes from, the
         type it is used as, and where a configuration file keeps it. Resolve-RunSettings
         and Invoke-Main both read it, so a setting added here is picked up by both.
-        Settings without a config location (CsvPath, ConfigPath, Only, Verify, LoginSetup)
-        are command-line only: they choose what the run does, not how it captures.
+        Settings without a config location (CsvPath, ConfigPath, Only, Verify, LoginSetup,
+        NoPrompt, EventLogPath, TabId) are command-line only: they choose what the run
+        does or how it is driven, not how it captures.
     #>
     return @(
         [pscustomobject]@{ Name = 'CsvPath';              Type = 'string'; Section = '';         Key = '' }
@@ -4492,6 +5126,11 @@ function Get-RunSettingDefinition {
         [pscustomobject]@{ Name = 'LoginSetup';           Type = 'bool';   Section = '';         Key = '' }
         [pscustomobject]@{ Name = 'ConfigPath';           Type = 'string'; Section = '';         Key = '' }
         [pscustomobject]@{ Name = 'Only';                 Type = 'list';   Section = '';         Key = '' }
+        # Run plumbing for the Designer and the scheduler: how this run is driven, never
+        # part of a configuration file.
+        [pscustomobject]@{ Name = 'NoPrompt';             Type = 'bool';   Section = '';         Key = '' }
+        [pscustomobject]@{ Name = 'EventLogPath';         Type = 'string'; Section = '';         Key = '' }
+        [pscustomobject]@{ Name = 'TabId';                Type = 'string'; Section = '';         Key = '' }
     )
 }
 
@@ -4647,14 +5286,17 @@ function Get-PageSettings {
     if ($Definition.PSObject.Properties['Overrides'] -and $Definition.Overrides -is [System.Collections.IDictionary]) {
         $overrides = @{ defaults = $Definition.Overrides }
     }
+    # The page-level keys are decided by the second loop alone (schema default <
+    # configuration < page override), also the two that are run settings as well.
+    $pageLevelKeys = 'account', 'captureArea', 'zoomPercent', 'waitFor', 'onNotReady', 'promptTimeoutSec'
     foreach ($setting in @(Get-RunSettingDefinition | Where-Object Section -eq 'defaults')) {
-        if ($BoundNames -contains $setting.Name) { continue }
+        if ($BoundNames -contains $setting.Name -or $pageLevelKeys -contains $setting.Key) { continue }
         $fromPage = Get-ConfigValue -Config $overrides -Section 'defaults' -Key $setting.Key
         if ($fromPage.Found) { $page[$setting.Name] = ConvertTo-SettingValue -Type $setting.Type -Value $fromPage.Value }
     }
 
     $schemaDefaults = Get-DefaultVouchConfig
-    foreach ($key in 'account', 'captureArea', 'zoomPercent', 'waitFor', 'onNotReady', 'promptTimeoutSec') {
+    foreach ($key in $pageLevelKeys) {
         $name = $key.Substring(0, 1).ToUpperInvariant() + $key.Substring(1)
         # -CaptureArea / -ZoomPercent typed on the command line: already in the run settings.
         if ($BoundNames -contains $name) { continue }
@@ -4816,7 +5458,7 @@ function Invoke-ScrollCapture {
             # Find what scrolls - the page, a panel inside it, or a frame - and start at its top.
             $scrollTarget = Invoke-CdpEval -TimeoutSec 20 -Expression (
                 Get-ScrollTargetScript -Mode $ScrollMode -Selector $ScrollSelector -ExplicitSelectors $ExplicitAreas)
-            Start-Sleep -Milliseconds $scrollSettleMs
+            [void](Wait-Interruptible -Milliseconds $scrollSettleMs)
 
             $viewportHeight = [double]$scrollTarget.view
             $pageHeight = [double]$scrollTarget.total
@@ -4865,6 +5507,7 @@ function Invoke-ScrollCapture {
                     $plan = Get-SingleImagePlan -CssHeight $content.Height -DevicePixelRatio $content.DevicePixelRatio -ZoomPercent $script:PageZoomPercent
                     if ($plan.Fits) {
                         $singleClip = @{ x = 0; y = 0; width = [Math]::Ceiling($content.Width); height = [Math]::Ceiling($content.Height) }
+                        $singleContent = $content
                     }
                     else {
                         & $addDetail ("The page is too tall for one image ({0} pixels; images cannot be taller than 16,384), so {1} was taken as screen-sized segments." -f
@@ -4882,8 +5525,32 @@ function Invoke-ScrollCapture {
     }
 
     if ($null -ne $singleClip) {
+        if (Test-StopRequested) {
+            Add-StopDetail -Item $Item
+            return
+        }
         $singleUrl = if ($BrowserErrorPage) { $Item.FinalUrl } else { Get-CurrentPageUrl }
+        $before = $Item.Captures.Count
         & $shoot 1 1 $singleUrl $singleClip
+        # Content that loads while the image is taken (lazy loading) makes the page
+        # taller than the image planned for it: say so rather than let a cut-off image
+        # pass as the whole page.
+        if ($Item.Captures.Count -gt $before) {
+            try {
+                $record = $Item.Captures[$Item.Captures.Count - 1]
+                $imageHeight = (Get-ImagePixelSize -Bytes ([Convert]::FromBase64String($record.Base64))).Height
+                # Planned at the zoom the image really got (a reconnect can change it).
+                $planned = Get-SingleImagePlan -CssHeight ([Math]::Ceiling($singleContent.Height)) -DevicePixelRatio $singleContent.DevicePixelRatio -ZoomPercent $record.ZoomPercent
+                $after = Get-PageContentSize
+                $afterPlan = Get-SingleImagePlan -CssHeight $after.Height -DevicePixelRatio $after.DevicePixelRatio -ZoomPercent $record.ZoomPercent
+                $problem = Get-TallImageProblem -ImageHeight $imageHeight -PlannedHeight $planned.OutputHeight `
+                    -HeightAfter $afterPlan.OutputHeight -What $theCapture
+                if ($problem) { & $addDetail $problem }
+            }
+            catch {
+                Write-Verbose "Could not check the height of the one tall image: $($_.Exception.Message)"
+            }
+        }
         return
     }
 
@@ -4898,9 +5565,16 @@ function Invoke-ScrollCapture {
     if ($scrolls -and $segmentCount -gt 1 -and $viewportHeight -gt 0) {
         $recheckDone = $false
         for ($segment = 0; $segment -lt $segmentCount; $segment++) {
+            if (Test-StopRequested) {
+                Add-StopDetail -Item $Item
+                break
+            }
             $offset = [int]([Math]::Round($segment * $viewportHeight))
             [void](Invoke-CdpEval -Expression "window.__vouchTarget.to($offset)" -TimeoutSec 10)
-            Start-Sleep -Milliseconds $scrollSettleMs
+            if (-not (Wait-Interruptible -Milliseconds $scrollSettleMs)) {
+                Add-StopDetail -Item $Item
+                break
+            }
 
             # Lazy-loading pages grow after the first scroll; re-measure once only.
             if (-not $recheckDone) {
@@ -4935,8 +5609,32 @@ function Invoke-ScrollCapture {
         catch { Write-Verbose "Could not scroll back to the top: $($_.Exception.Message)" }
     }
     else {
+        if (Test-StopRequested) {
+            Add-StopDetail -Item $Item
+            return
+        }
         & $shoot 1 1 $Item.FinalUrl $null
     }
+}
+
+function Get-TallImageProblem {
+    <#
+        Checks one tall page image after it was taken. Its height must be what was
+        planned (the document's height x pixel ratio x zoom), and the document must not
+        have grown since: lazy content that loads during the capture makes the page
+        longer than the image, whose bottom then misses it. 2 px are allowed for
+        rounding. Returns the detail text, or '' when the image is whole. Pure.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$ImageHeight,
+        [Parameter(Mandatory)][int]$PlannedHeight,
+        [int]$HeightAfter = 0,
+        [string]$What = 'the capture'
+    )
+    $expected = [Math]::Max($PlannedHeight, $HeightAfter)
+    if ([Math]::Abs($ImageHeight - $PlannedHeight) -le 2 -and $HeightAfter -le $ImageHeight + 2) { return '' }
+    return ("The one tall image of {0} is {1} pixels high, but the page measured {2} pixels; content that loaded or changed while it was taken may be missing from it." -f
+        $What, $ImageHeight.ToString([System.Globalization.CultureInfo]::InvariantCulture), $expected.ToString([System.Globalization.CultureInfo]::InvariantCulture))
 }
 
 function Invoke-CaptureItem {
@@ -4965,6 +5663,13 @@ function Invoke-CaptureItem {
     if ($null -eq $Item) { $Item = New-CaptureItem -Definition $Definition }
     $navigationTimeoutSec = $Settings.NavigationTimeoutSec
     $settleSeconds = $Settings.SettleSeconds
+    $script:EventPageId = if ($Definition.PSObject.Properties['Id']) { [string]$Definition.Id } else { '' }
+    $policy = Get-NotReadyPolicy -Settings $Settings
+    # Ends the page early (stopped, or skipped by the person) with its summary line.
+    $endPage = {
+        param([string]$Why)
+        Write-RowStatus -Message "    $($Item.Status) - $($Item.Captures.Count) capture(s) - $Why" -Status $Item.Status
+    }
 
     Write-Host ("[{0}/{1}] {2} - {3}" -f $Definition.Index, $ItemCount, $Definition.Name, $Definition.Url)
 
@@ -5019,56 +5724,88 @@ function Invoke-CaptureItem {
         }
 
         if (-not (Wait-PageReady -TimeoutSec $navigationTimeoutSec)) {
-            if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
-            $Item.Details.Add("The page did not finish loading within $navigationTimeoutSec seconds; it was captured in whatever state it had reached.")
+            $outcome = 'stopped'
+            if (-not (Test-StopRequested)) {
+                $outcome = Resolve-PageNotReady -Item $Item -Awaited 'finish loading' -WaitedSec $navigationTimeoutSec -Policy $policy `
+                    -Recheck { param($Seconds) Wait-PageReady -TimeoutSec $Seconds -SameDocumentGraceSeconds 0 }
+            }
+            if ($outcome -eq 'stopped') { Add-StopDetail -Item $Item; & $endPage 'stopped by the user'; return $Item }
+            if ($outcome -eq 'skipped') { & $endPage 'skipped by the user'; return $Item }
         }
 
-        Start-Sleep -Milliseconds ([int]($settleSeconds * 1000))
+        if (-not (Wait-Interruptible -Milliseconds ([int]($settleSeconds * 1000)))) {
+            Add-StopDetail -Item $Item; & $endPage 'stopped by the user'; return $Item
+        }
 
         # Chromium exposes the HTTP status of the main document on the
-        # PerformanceNavigationTiming entry; older builds return 0.
-        try {
-            $statusValue = Invoke-CdpEval -Expression "(performance.getEntriesByType('navigation')[0]||{}).responseStatus||0" -TimeoutSec 10
-            if ($null -ne $statusValue) { $Item.HttpStatus = [int]$statusValue }
-        }
-        catch {
-            $Item.Details.Add("The HTTP status could not be read from the page: $($_.Exception.Message)")
-        }
-
-        if ($Item.HttpStatus -ge 400) {
-            $Item.Status = 'FAILED'
-            $Item.Details.Add("The server returned HTTP $($Item.HttpStatus). The error page is captured below as evidence.")
-        }
-
-        # Edge's error page lives at chrome-error://; the browser stayed on the
-        # requested URL, so record that rather than report a redirect.
-        $Item.FinalUrl = if ($browserErrorPage) { $Definition.Url } else { Get-CurrentPageUrl }
-        $requestedOrigin = Get-OriginFromUrl -Url $Definition.Url
-        $finalOrigin = Get-OriginFromUrl -Url $Item.FinalUrl
-        $signInShown = $false
-        if (-not [string]::IsNullOrWhiteSpace($finalOrigin) -and
-            -not [string]::IsNullOrWhiteSpace($requestedOrigin) -and
-            $finalOrigin -ne $requestedOrigin -and
-            -not (Test-HttpsUpgrade -RequestedUrl $Definition.Url -FinalUrl $Item.FinalUrl)) {
-            if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
-            $Item.Details.Add("Redirected to $finalOrigin - possible login required.")
-            $signInShown = $true
-        }
-        elseif (-not $browserErrorPage -and -not [string]::IsNullOrWhiteSpace($Item.FinalUrl)) {
-            $hasPasswordField = $false
+        # PerformanceNavigationTiming entry; older builds return 0. Read again after a
+        # sign-in prompt opened the page a second time.
+        $httpReported = @{ Done = $false }
+        $readPageState = {
             try {
-                $hasPasswordField = [bool](Invoke-CdpEval -TimeoutSec 10 -Expression (
-                    "Array.prototype.some.call(document.querySelectorAll('input[type=password]'), " +
-                    "function (e) { var r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; })"))
+                $statusValue = Invoke-CdpEval -Expression "(performance.getEntriesByType('navigation')[0]||{}).responseStatus||0" -TimeoutSec 10
+                if ($null -ne $statusValue) { $Item.HttpStatus = [int]$statusValue }
             }
             catch {
-                Write-Verbose "Could not look for a password field: $($_.Exception.Message)"
+                $Item.Details.Add("The HTTP status could not be read from the page: $($_.Exception.Message)")
             }
-            if (Test-LoginRedirect -RequestedUrl $Definition.Url -FinalUrl $Item.FinalUrl -HasPasswordField $hasPasswordField) {
-                if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
-                $Item.Details.Add("Redirected to a sign-in page ($(([Uri]$Item.FinalUrl).AbsolutePath)) - the session has probably expired. Run -LoginSetup.")
-                $signInShown = $true
+
+            if ($Item.HttpStatus -ge 400 -and -not $httpReported.Done) {
+                $httpReported.Done = $true
+                $Item.Status = 'FAILED'
+                $Item.Details.Add("The server returned HTTP $($Item.HttpStatus). The error page is captured below as evidence.")
             }
+
+            # Edge's error page lives at chrome-error://; the browser stayed on the
+            # requested URL, so record that rather than report a redirect.
+            $Item.FinalUrl = if ($browserErrorPage) { $Definition.Url } else { Get-CurrentPageUrl }
+        }
+        & $readPageState
+        $signInDetail = Get-SignInDetail -RequestedUrl $Definition.Url -FinalUrl $Item.FinalUrl -BrowserErrorPage $browserErrorPage
+
+        # A sign-in page with onNotReady "prompt": the person signs in in the Edge window
+        # and says so; the page is then opened again ONCE. A page that still asks for a
+        # sign-in keeps the usual warning - never a loop.
+        if ($signInDetail -and $policy.OnNotReady -eq 'prompt') {
+            $where = if ($signInDetail -like 'Redirected to a sign-in page*') { "a sign-in page ($(([Uri]$Item.FinalUrl).AbsolutePath))" } else { "another site ($(Get-OriginFromUrl -Url $Item.FinalUrl))" }
+            $message = "Edge was sent to $where instead of this page, so it probably needs you to sign in. Sign in in the Edge window " +
+                '(including any MFA prompt), then click Continue: Vouch opens the page again and captures it. Skip this page leaves it out.'
+            while ($true) {
+                $answer = Request-UserDecision -Kind 'signIn' -Title 'Sign-in needed' -Message $message -PageName ([string]$Item.Name) `
+                    -Default 'Continue' -TimeoutSec $policy.PromptTimeoutSec
+                if (Test-StopRequested) { Add-StopDetail -Item $Item; & $endPage 'stopped by the user'; return $Item }
+                if (-not $answer.Prompted) { break }
+                if ($answer.Decision -eq 'Wait') {
+                    [void](Wait-Interruptible -Milliseconds ([Math]::Max(1, [int]$answer.WaitSeconds) * 1000))
+                    continue
+                }
+                if ($answer.Decision -eq 'Skip') {
+                    if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+                    $Item.Details.Add("Skipped by the user: the page asked for a sign-in. $signInDetail")
+                    & $endPage 'skipped by the user'
+                    return $Item
+                }
+                # Continue (also when nobody answered: opening the page again costs little).
+                if ((Get-CurrentPageUrl) -ne $Definition.Url) {
+                    Set-NavigationMarker
+                    [void](Send-CdpCommand -Method 'Page.navigate' -Params @{ url = $Definition.Url } -TimeoutSec $navigationTimeoutSec)
+                    if (-not (Wait-PageReady -TimeoutSec $navigationTimeoutSec) -and -not (Test-StopRequested)) {
+                        if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+                        $Item.Details.Add("The page did not finish loading within $navigationTimeoutSec seconds after the sign-in; it was captured in whatever state it had reached.")
+                    }
+                    if (-not (Wait-Interruptible -Milliseconds ([int]($settleSeconds * 1000)))) {
+                        Add-StopDetail -Item $Item; & $endPage 'stopped by the user'; return $Item
+                    }
+                }
+                & $readPageState
+                $signInDetail = Get-SignInDetail -RequestedUrl $Definition.Url -FinalUrl $Item.FinalUrl -BrowserErrorPage $browserErrorPage
+                break
+            }
+        }
+        $signInShown = [bool]$signInDetail
+        if ($signInShown) {
+            if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+            $Item.Details.Add($signInDetail)
         }
 
         # The page's wait-for element (defaults.waitFor or its override): the page is
@@ -5076,19 +5813,22 @@ function Invoke-CaptureItem {
         # never show it - waiting the full timeout there would only delay the run.
         $readySelector = if ($Settings.PSObject.Properties['WaitFor']) { [string]$Settings.WaitFor } else { '' }
         if (-not [string]::IsNullOrWhiteSpace($readySelector) -and $Item.Status -ne 'FAILED' -and -not $signInShown) {
-            $readyProblem = ''
+            $outcome = 'ready'
             try {
                 if (-not (Wait-PageElement -Selector $readySelector -TimeoutSec $navigationTimeoutSec)) {
-                    $readyProblem = "The page did not show '$readySelector' within $navigationTimeoutSec seconds; it was captured in whatever state it had reached."
+                    $outcome = 'stopped'
+                    if (-not (Test-StopRequested)) {
+                        $outcome = Resolve-PageNotReady -Item $Item -Awaited "show '$readySelector'" -WaitedSec $navigationTimeoutSec -Policy $policy `
+                            -Recheck { param($Seconds) Wait-PageElement -Selector $readySelector -TimeoutSec $Seconds }
+                    }
                 }
             }
             catch {
-                $readyProblem = "Vouch could not wait for '$readySelector': $($_.Exception.Message)"
-            }
-            if ($readyProblem) {
                 if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
-                $Item.Details.Add($readyProblem)
+                $Item.Details.Add("Vouch could not wait for '$readySelector': $($_.Exception.Message)")
             }
+            if ($outcome -eq 'stopped') { Add-StopDetail -Item $Item; & $endPage 'stopped by the user'; return $Item }
+            if ($outcome -eq 'skipped') { & $endPage 'skipped by the user'; return $Item }
         }
 
         $actions = Get-DefinitionActionList -Definition $Definition
@@ -5108,7 +5848,19 @@ function Invoke-CaptureItem {
         $failedSteps = 0
         $stepsSinceUrl = 0
         $failureLine = -1
+        $actionEvent = {
+            param([int]$Position, [object]$Action, [object]$Entry)
+            Write-RunEvent -Type 'action' -Data ([ordered]@{
+                pageId = $script:EventPageId; pageIndex = $Item.Index; index = $Position + 1; actionType = [string]$Action['type']
+                text = [string]$Entry.Text; ok = [bool]$Entry.Ok; message = [string]$Entry.Message })
+        }
+        $endedEarly = ''
         for ($position = 0; $position -lt $actions.Count; $position++) {
+            if (Test-StopRequested) {
+                Add-StopDetail -Item $Item
+                $endedEarly = 'stopped by the user'
+                break
+            }
             $action = $actions[$position]
             if ($action['type'] -eq 'capture') {
                 $captureNumber++
@@ -5122,6 +5874,7 @@ function Invoke-CaptureItem {
                     -CaptureNumber $captureNumber -BrowserErrorPage $browserErrorPage -ExplicitAreas $explicitAreas `
                     -PropagateCaptureError:$implied
                 if (-not $implied) { $Item.StepLog.Add($entry) }
+                & $actionEvent $position $action $entry
                 continue
             }
 
@@ -5129,14 +5882,21 @@ function Invoke-CaptureItem {
             if ($action['type'] -in 'click', 'clickText', 'wait' -and $stepTexts.Count -gt 0) { $text = $stepTexts.Dequeue() }
             $entry = Invoke-PageAction -Action $action -Settings $Settings -Text $text -Item $Item
             $Item.StepLog.Add($entry)
+            & $actionEvent $position $action $entry
             $stepsSinceUrl++
-            if (-not $entry.Ok) { $failedSteps++ }
+            # An action cut short by a stop did not fail; the stop detail says what happened.
+            if (-not $entry.Ok -and -not (Test-StopRequested)) { $failedSteps++ }
+            if ($entry.PSObject.Properties['EndPage'] -and $entry.EndPage) {
+                $endedEarly = 'skipped by the user'
+                break
+            }
         }
         $failureLine = Add-StepFailureDetail -Item $Item -Failed $failedSteps -Total $stepCount -Position $failureLine
         if ($stepsSinceUrl -gt 0 -and -not $browserErrorPage) { $Item.FinalUrl = Get-CurrentPageUrl }
 
         $summary = "    $($Item.Status) - $($Item.Captures.Count) capture(s)"
-        if ($Item.Details.Count -gt 0) { $summary += " - $($Item.Details[0])" }
+        if ($endedEarly) { $summary += " - $endedEarly" }
+        elseif ($Item.Details.Count -gt 0) { $summary += " - $($Item.Details[0])" }
         Write-RowStatus -Message $summary -Status $Item.Status
     }
     catch {
@@ -5169,12 +5929,17 @@ function Invoke-Main {
     }
     $split = Split-BoundParameter -InScope $inScope -BoundParameters $BoundParameters
     $boundNames = [string[]]@($split.Bound.Keys)
-    if ($boundNames -contains 'CsvPath' -and $boundNames -contains 'ConfigPath') {
-        throw 'Use either -CsvPath or -ConfigPath, not both. -CsvPath reads the pages from a CSV file; -ConfigPath reads the pages and all settings from a configuration file.'
-    }
 
     # The configuration path is command-line only, so it is known before the file is read.
     $settings = Resolve-RunSettings -BoundParameters $split.Bound -Defaults $split.Defaults -Config $null
+
+    # Events and the stop file first, so that even a run that cannot start says why.
+    Initialize-RunEvent -EventLogPath $settings.EventLogPath
+    $script:CdpTabId = $settings.TabId
+
+    if ($boundNames -contains 'CsvPath' -and $boundNames -contains 'ConfigPath') {
+        throw 'Use either -CsvPath or -ConfigPath, not both. -CsvPath reads the pages from a CSV file; -ConfigPath reads the pages and all settings from a configuration file.'
+    }
     $config = $null
     if ($settings.ConfigPath -and -not $settings.Verify) {
         $config = Import-VouchConfig -Path $settings.ConfigPath
@@ -5263,7 +6028,7 @@ function Invoke-Main {
     $imageExtension = if ($settings.ImageFormat -eq 'png') { 'png' } else { 'jpg' }
     $screenBounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
     $captureContext = @{
-        RunId      = [guid]::NewGuid().ToString()
+        RunId      = $script:EventRunId
         Format     = $settings.ImageFormat
         Quality    = $settings.JpegQuality
         Extension  = $imageExtension
@@ -5275,6 +6040,10 @@ function Invoke-Main {
     $items = [System.Collections.Generic.List[object]]::new()
     $captureDesktop = $null
     $desktopNote = 'The signed-in desktop (-UseVirtualDesktop not set)'
+    $script:InteractiveRun = Test-InteractiveRun -NoPrompt $settings.NoPrompt
+    Write-RunEvent -Type 'runStart' -Data ([ordered]@{
+        toolVersion = $script:ToolVersion; pageCount = $definitions.Count; reportPath = $reportPath
+        source = $sourcePath; interactive = $script:InteractiveRun; stopFile = (Get-StopFilePath); processId = $PID })
 
     try {
         if ($settings.UseVirtualDesktop) {
@@ -5309,26 +6078,41 @@ function Invoke-Main {
             throw 'Could not obtain a DevTools page target from Edge.'
         }
         Connect-CdpSocket -WebSocketUrl ([string]$target.webSocketDebuggerUrl)
-        if ($script:LaunchedEdge) { Close-OtherPageTargets -Port $settings.DebugPort -KeepId ([string]$target.id) }
+        if ($script:LaunchedEdge -and -not $settings.TabId) { Close-OtherPageTargets -Port $settings.DebugPort -KeepId ([string]$target.id) }
 
+        $position = 0
         foreach ($definition in $definitions) {
+            # A stop ends the run between pages: the pages not started are not reported.
+            if (Test-StopRequested) { break }
+            $position++
             # Added before the page is visited, so it is reported whatever happens to it.
             $item = New-CaptureItem -Definition $definition
             $items.Add($item)
+            $pageId = if ($definition.PSObject.Properties['Id']) { [string]$definition.Id } else { '' }
+            Write-RunEvent -Type 'pageStart' -Data ([ordered]@{
+                pageId = $pageId; pageIndex = $definition.Index; index = $position; total = $definitions.Count
+                name = [string]$definition.Name; url = [string]$definition.Url })
             $pageSettings = Get-PageSettings -Settings $settings -Definition $definition -Config $config -BoundNames $boundNames
             [void](Invoke-CaptureItem -Definition $definition -Item $item -ItemCount $definitions.Count `
                 -Settings $pageSettings -CaptureContext $captureContext)
+            Write-RunEvent -Type 'pageEnd' -Data ([ordered]@{
+                pageId = $pageId; pageIndex = $item.Index; index = $position; total = $definitions.Count
+                status = $item.Status; details = @($item.Details); captureCount = $item.Captures.Count
+                finalUrl = [string]$item.FinalUrl; stopped = [bool]$script:StopRequested })
         }
     }
     finally {
         # A zoom must not outlive the run, also when it failed or reused an Edge that
-        # stays open (closing the connection drops it too; this makes it certain).
-        if ($null -ne $script:CdpSocket) {
+        # stays open. Only over a live connection: a dead one took its zoom with it,
+        # and reconnecting just to clear it could open a tab in a reused Edge.
+        if (Test-CdpSocketOpen) {
             try { Clear-PageZoom }
             catch { Write-Verbose "Could not remove the page zoom: $($_.Exception.Message)" }
         }
         $script:PageZoomPercent = 100
+        $script:InteractiveRun = $false
         Close-CdpSocket
+        $script:CdpTabId = ''
         if ($settings.KeepBrowserOpen) {
             if ($script:LaunchedEdge) { Write-Host 'Leaving Edge open (-KeepBrowserOpen).' }
         }
@@ -5406,10 +6190,64 @@ function Invoke-Main {
     }
 
     Write-Host ''
+    if ($script:StopRequested) {
+        Write-Host "Stopped by the user after $($items.Count) of $($definitions.Count) page(s)." -ForegroundColor Yellow
+    }
     Write-Host "Done. $($items.Count) item(s): $okCount OK, $warnCount warning(s), $failCount failed. $captureCount screenshot(s)." -ForegroundColor Cyan
     if ($settings.SaveImages) { Write-Host "Individual images: $imagesDir" }
     Write-Host "Report: $reportPath ($reportSizeMb MB)" -ForegroundColor Cyan
     if ($summaryPath) { Write-Host "Summary: $summaryPath" }
+    Write-RunEvent -Type 'runEnd' -Data ([ordered]@{
+        exitCode = $script:ExitCode; reportPath = $reportPath; jsonSummaryPath = $summaryPath
+        counts = [ordered]@{
+            pages = $definitions.Count; run = $items.Count; ok = $okCount; warning = $warnCount; failed = $failCount
+            notRun = $definitions.Count - $items.Count; captures = [int]$captureCount }
+        stopped = [bool]$script:StopRequested })
+}
+
+function Initialize-RunEvent {
+    <#
+        Prepares the progress events and the stop file for one run (-EventLogPath). The
+        path is made absolute (the Designer and the run need not share a working folder)
+        and its folder created. A stop file left over from an earlier run with the same
+        path is removed: it would otherwise stop this run before its first page. The run
+        id is made here so every event, the images and the report carry the same one.
+        Without a path, events and stops are off.
+    #>
+    param([AllowEmptyString()][string]$EventLogPath = '')
+    $script:EventRunId = [guid]::NewGuid().ToString()
+    $script:StopRequested = $false
+    $script:EventPageId = ''
+    $script:EventLogPath = ''
+    if ([string]::IsNullOrWhiteSpace($EventLogPath)) { return }
+    $path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($EventLogPath)
+    try {
+        $folder = Split-Path -Path $path -Parent
+        if ($folder -and -not (Test-Path -LiteralPath $folder)) { [void](New-Item -ItemType Directory -Path $folder -Force) }
+        $stale = "$path.stop"
+        if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Force }
+    }
+    catch {
+        Write-Verbose "Could not prepare the event log '$path': $($_.Exception.Message)"
+    }
+    $script:EventLogPath = $path
+}
+
+function Test-CdpSocketOpen {
+    # True only for a DevTools connection that is open now (not closed or aborted).
+    return $null -ne $script:CdpSocket -and $script:CdpSocket.State -eq [System.Net.WebSockets.WebSocketState]::Open
+}
+
+function Write-RunFailedEvent {
+    <#
+        The events of a run that ended with an error (exit code 1): what went wrong and
+        a runEnd, so a program following the event log is never left waiting for an end
+        that does not come. Called from the script's own error handler.
+    #>
+    param([AllowEmptyString()][string]$Message = '')
+    Write-RunEvent -Type 'error' -Data ([ordered]@{ message = $Message })
+    Write-RunEvent -Type 'runEnd' -Data ([ordered]@{
+        exitCode = 1; reportPath = ''; jsonSummaryPath = ''; counts = $null; stopped = [bool]$script:StopRequested })
 }
 
 $transcribing = Start-RunLog -Directory (Get-RunLogDirectory -BoundParameters $PSBoundParameters -LogDir $LogDir -ConfigPath $ConfigPath)
@@ -5421,6 +6259,7 @@ catch {
     Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
     if ($null -ne $_.ScriptStackTrace) { Write-Verbose $_.ScriptStackTrace }
     $script:ExitCode = 1
+    Write-RunFailedEvent -Message $_.Exception.Message
 }
 finally {
     if ($transcribing) {

@@ -11,6 +11,9 @@
     Tests tagged KnownIssue assert the correct behaviour for bugs that are not fixed yet
     and are expected to fail. Use -ExcludeKnownIssues for a green/red regression signal.
 
+    Tests tagged Interactive show a real window on the desktop (the Vouch dialog) and
+    are left out unless -IncludeInteractive is given.
+
 .EXAMPLE
     .\tests\Invoke-Tests.ps1
 
@@ -24,6 +27,8 @@
 param(
     [switch]$UnitOnly,
     [switch]$ExcludeKnownIssues,
+    # Also run the tests that show a real window (tag Interactive).
+    [switch]$IncludeInteractive,
     # Test another copy of vouch.ps1 instead of the one next to this folder.
     [string]$ScriptPath = '',
     # Also write NUnit XML results here (for CI).
@@ -47,7 +52,10 @@ $config.Run.Path = if ($UnitOnly) {
 else { $PSScriptRoot }
 $config.Run.Exit = $true
 $config.Output.Verbosity = 'Detailed'
-if ($ExcludeKnownIssues) { $config.Filter.ExcludeTag = @('KnownIssue') }
+$excludeTags = @()
+if ($ExcludeKnownIssues) { $excludeTags += 'KnownIssue' }
+if (-not $IncludeInteractive) { $excludeTags += 'Interactive' }
+if ($excludeTags.Count -gt 0) { $config.Filter.ExcludeTag = $excludeTags }
 if ($ResultPath) {
     $config.TestResult.Enabled = $true
     $config.TestResult.OutputPath = $ResultPath

@@ -23,6 +23,11 @@ BeforeAll {
 
     $script:Web = "http://localhost:$($script:WebPort)"
 
+    # A test run inside Invoke-Main counts as interactive (pwsh on a desktop): no test
+    # may ever reach the real Vouch dialog. Tests that need answers mock
+    # Request-UserDecision or Show-ContinueDialog themselves.
+    Mock Show-ContinueDialog { throw 'A test reached the real Vouch dialog; mock Request-UserDecision or Show-ContinueDialog.' }
+
     function Connect-TestPage {
         Close-CdpSocket
         $target = Get-CdpPageTarget -Port $script:CdpPort
@@ -764,7 +769,8 @@ Describe 'Page actions (one page at a time, desktop functions mocked)' -Tag 'Int
                 [string]$WaitFor = '',
                 [int]$TimeoutSec = 10,
                 # Screenshot calls (1, 2, ...) that throw.
-                [int[]]$FailShots = @()
+                [int[]]$FailShots = @(),
+                [string]$OnNotReady = 'warn'
             )
             $global:VouchShots.Clear()
             $global:VouchShotCalls = 0
@@ -776,6 +782,7 @@ Describe 'Page actions (one page at a time, desktop functions mocked)' -Tag 'Int
             }
             $config = Get-DefaultVouchConfig
             $config['defaults']['waitFor'] = $WaitFor
+            $config['defaults']['onNotReady'] = $OnNotReady
             $settings = Get-PageSettings -Settings $run -Definition $definition -Config $config
             $context = @{
                 RunId = [guid]::NewGuid().ToString(); Format = 'jpeg'; Quality = 85; Extension = 'jpg'
@@ -1002,17 +1009,159 @@ Describe 'Page actions (one page at a time, desktop functions mocked)' -Tag 'Int
         $item.Captures.Count | Should -Be 1
     }
 
-    It 'skips a pause with a warning and runs the rest of the page' {
+    It 'skips a pause with a warning when nobody can answer, and runs the rest of the page' {
+        $script:InteractiveRun = $false
         $result = Invoke-TestPage -Url "$Web/tabs" -Actions @(
             [ordered]@{ type = 'pause'; message = 'Sign in' }
             [ordered]@{ type = 'clickText'; text = 'General' }
             (New-Capture))
         $item = $result.Item
         $item.Status | Should -Be 'WARNING'
-        ($item.Details -join ' ') | Should -Match 'pause is not available yet'
+        ($item.Details -join ' ') | Should -Match 'The pause \(pause:Sign in\) was skipped because nobody was there to answer it'
         @($item.StepLog | ForEach-Object { "$($_.Text)|$($_.Ok)" }) | Should -Be @('pause:Sign in|True', 'clicktext:General|True')
-        $item.StepLog[0].Message | Should -BeLike '*not available yet*'
+        $item.StepLog[0].Message | Should -Be 'skipped: nobody was there to answer'
         $result.Shots | Should -Be @('General')
+    }
+
+    Context 'answers from the person (Request-UserDecision mocked)' {
+        BeforeAll {
+            function New-Answer([string]$Decision, [int]$WaitSeconds = 0, [bool]$TimedOut = $false) {
+                [pscustomobject]@{ Decision = $Decision; WaitSeconds = $WaitSeconds; TimedOut = $TimedOut; Prompted = $true }
+            }
+            $global:VouchAnswers = [System.Collections.Generic.Queue[object]]::new()
+            $global:VouchAsked = [System.Collections.Generic.List[string]]::new()
+            # Each call takes the next prepared answer; an answer may first do something
+            # in the browser, as the person would (a script block before it in the queue).
+            Mock Request-UserDecision {
+                $global:VouchAsked.Add($Kind)
+                $next = $global:VouchAnswers.Dequeue()
+                if ($next -is [scriptblock]) { [void](& $next); $next = $global:VouchAnswers.Dequeue() }
+                $next
+            }
+        }
+        BeforeEach {
+            $global:VouchAnswers.Clear()
+            $global:VouchAsked.Clear()
+        }
+        AfterAll { Remove-Variable -Name VouchAnswers, VouchAsked -Scope Global -ErrorAction SilentlyContinue }
+
+        It 'a pause answered with Continue carries on with no warning' {
+            $global:VouchAnswers.Enqueue((New-Answer 'Continue'))
+            $result = Invoke-TestPage -Url "$Web/tabs" -Actions @(
+                [ordered]@{ type = 'pause'; message = 'Complete MFA' }
+                [ordered]@{ type = 'clickText'; text = 'General' }
+                (New-Capture))
+            $result.Item.Status | Should -Be 'OK' -Because ($result.Item.Details -join ' | ')
+            @($global:VouchAsked) | Should -Be @('pause')
+            Should -Invoke Request-UserDecision -Times 1 -Exactly -ParameterFilter { $Message -eq 'Complete MFA' -and $Default -eq 'Continue' -and $TimeoutSec -eq 300 }
+            $result.Item.StepLog[0].Message | Should -Be 'continued by the user'
+            $result.Shots | Should -Be @('General')
+        }
+
+        It 'a pause answered with Wait waits, then asks again' {
+            $global:VouchAnswers.Enqueue((New-Answer 'Wait' 1))
+            $global:VouchAnswers.Enqueue((New-Answer 'Continue'))
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            $result = Invoke-TestPage -Url "$Web/ok" -Actions @([ordered]@{ type = 'pause' }, (New-Capture))
+            $watch.Stop()
+            $result.Item.Status | Should -Be 'OK' -Because ($result.Item.Details -join ' | ')
+            @($global:VouchAsked) | Should -Be @('pause', 'pause')
+            $watch.Elapsed.TotalSeconds | Should -BeGreaterOrEqual 1
+            $result.Item.Captures.Count | Should -Be 1
+        }
+
+        It 'a pause answered with Skip ends the page and keeps the screenshots already taken' {
+            $global:VouchAnswers.Enqueue((New-Answer 'Skip'))
+            $result = Invoke-TestPage -Url "$Web/tabs" -Actions @(
+                (New-Capture 'Before')
+                [ordered]@{ type = 'pause'; message = 'Check the tab' }
+                [ordered]@{ type = 'clickText'; text = 'General' }
+                (New-Capture 'After'))
+            $item = $result.Item
+            $item.Status | Should -Be 'WARNING'
+            $item.Captures.Count | Should -Be 1
+            @($item.StepLog.Text) | Should -Be @('capture:Before', 'pause:Check the tab')
+            ($item.Details -join ' ') | Should -Match 'Skipped by the user at the pause \(pause:Check the tab\): the rest of this page was not run\. The 1 screenshot\(s\) taken before it are kept\.'
+        }
+
+        It 'a pause nobody answers in time carries on, with a warning' {
+            $global:VouchAnswers.Enqueue((New-Answer 'Continue' 0 $true))
+            $result = Invoke-TestPage -Url "$Web/ok" -Actions @([ordered]@{ type = 'pause'; message = 'MFA' }, (New-Capture))
+            $result.Item.Status | Should -Be 'WARNING'
+            ($result.Item.Details -join ' ') | Should -Match 'Nobody answered the pause \(pause:MFA\) within 300 seconds'
+            $result.Item.Captures.Count | Should -Be 1
+        }
+
+        It 'a page that waits for the person: Wait, the person confirms, and the page is captured as ready' {
+            $key = [guid]::NewGuid().ToString('n')
+            $global:VouchGateOpen = "fetch('/gate/open?key=$key').then(function (r) { return r.status; })"
+            $global:VouchAnswers.Enqueue({ Invoke-CdpEval -Expression $global:VouchGateOpen -TimeoutSec 10 })
+            $global:VouchAnswers.Enqueue((New-Answer 'Wait' 20))
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            $result = Invoke-TestPage -Url "$Web/gate?key=$key" -WaitFor '#content' -OnNotReady 'prompt' -TimeoutSec 2 `
+                -Probe "getComputedStyle(document.getElementById('content')).display" -Actions @((New-Capture))
+            $watch.Stop()
+            $result.Item.Status | Should -Be 'OK' -Because ($result.Item.Details -join ' | ')
+            @($global:VouchAsked) | Should -Be @('notReady')
+            Should -Invoke Request-UserDecision -Times 1 -Exactly -ParameterFilter { $Message -like "*did not show '#content' within 2 seconds*" }
+            $result.Shots | Should -Be @('block')
+            $watch.Elapsed.TotalSeconds | Should -BeLessThan 12 -Because 'the wait ends as soon as the content shows, not after 20 s'
+        }
+
+        It 'a page that is not ready, answered with Continue, is captured as it is with a warning' {
+            $global:VouchAnswers.Enqueue((New-Answer 'Continue'))
+            $result = Invoke-TestPage -Url "$Web/gate?key=$([guid]::NewGuid().ToString('n'))" -WaitFor '#content' -OnNotReady 'prompt' -TimeoutSec 2 `
+                -Probe "getComputedStyle(document.getElementById('content')).display" -Actions @((New-Capture))
+            $result.Item.Status | Should -Be 'WARNING'
+            @($result.Item.Details) | Should -Contain "The page did not show '#content' within 2 seconds; it was captured as it was, as chosen in the Vouch dialog."
+            $result.Shots | Should -Be @('none')
+        }
+
+        It 'a page that is not ready, answered with Skip, is not captured' {
+            $global:VouchAnswers.Enqueue((New-Answer 'Skip'))
+            $result = Invoke-TestPage -Url "$Web/gate?key=$([guid]::NewGuid().ToString('n'))" -WaitFor '#content' -OnNotReady 'prompt' -TimeoutSec 2 -Actions @((New-Capture))
+            $result.Item.Status | Should -Be 'WARNING'
+            $result.Item.Captures.Count | Should -Be 0
+            @($result.Item.Details) | Should -Contain "Skipped by the user: the page did not show '#content' within 2 seconds, so it was not captured."
+        }
+
+        It 'with onNotReady "warn" nobody is asked, as before' {
+            $result = Invoke-TestPage -Url "$Web/gate?key=x" -WaitFor '#content' -TimeoutSec 1 -Actions @((New-Capture))
+            Should -Invoke Request-UserDecision -Times 0 -Exactly
+            @($result.Item.Details) | Should -Contain "The page did not show '#content' within 1 seconds; it was captured in whatever state it had reached."
+        }
+
+        It 'a sign-in page: the person signs in, Continue opens the page again once and captures it' {
+            $key = [guid]::NewGuid().ToString('n')
+            $global:VouchSignIn = "fetch('/signin?key=$key').then(function (r) { return r.status; })"
+            $global:VouchAnswers.Enqueue({ Invoke-CdpEval -Expression $global:VouchSignIn -TimeoutSec 10 })
+            $global:VouchAnswers.Enqueue((New-Answer 'Continue'))
+            $result = Invoke-TestPage -Url "$Web/protected?key=$key" -OnNotReady 'prompt' -Actions @((New-Capture))
+            $item = $result.Item
+            $item.Status | Should -Be 'OK' -Because ($item.Details -join ' | ')
+            @($global:VouchAsked) | Should -Be @('signIn')
+            $item.FinalUrl | Should -Be "$Web/protected?key=$key"
+            $result.Shots | Should -Be @('Protected')
+            $item.HttpStatus | Should -Be 200
+        }
+
+        It 'a sign-in page that still asks for a sign-in after Continue keeps the warning, without asking again' {
+            $global:VouchAnswers.Enqueue((New-Answer 'Continue'))
+            $result = Invoke-TestPage -Url "$Web/protected?key=nobody" -OnNotReady 'prompt' -Actions @((New-Capture))
+            $item = $result.Item
+            $item.Status | Should -Be 'WARNING'
+            @($global:VouchAsked) | Should -Be @('signIn')
+            @($item.Details | Where-Object { $_ -like 'Redirected to a sign-in page (/login)*' }).Count | Should -Be 1
+            $item.Captures.Count | Should -Be 1
+        }
+
+        It 'a sign-in page answered with Skip is not captured' {
+            $global:VouchAnswers.Enqueue((New-Answer 'Skip'))
+            $result = Invoke-TestPage -Url "$Web/protected?key=nobody" -OnNotReady 'prompt' -Actions @((New-Capture))
+            $result.Item.Status | Should -Be 'WARNING'
+            $result.Item.Captures.Count | Should -Be 0
+            ($result.Item.Details -join ' ') | Should -Match '^Skipped by the user: the page asked for a sign-in\. Redirected to a sign-in page'
+        }
     }
 }
 
@@ -1167,7 +1316,7 @@ Describe 'Page zoom (headless Edge)' -Tag 'Integration' {
         (Get-ImageMetadata -Bytes $later).ZoomPercent | Should -Be 100
         (Get-ImagePixelSize -Bytes $later).Width | Should -Be ($script:BaseSize.width - 15) -Because 'an unscaled page image is the page width without the scroll bar'
         $item.Status | Should -Be 'WARNING'
-        @($item.Details | Where-Object { $_ -like '*page zoom of 150% could not be set again; the images taken after that show the page at 100%*' }).Count |
+        @($item.Details | Where-Object { $_ -like '*page zoom of 150% could not be set again; any images of this page taken after that show it at 100%*' }).Count |
             Should -Be 1 -Because ($item.Details -join ' | ')
         Get-CaptureAreaText -Area page -ZoomPercent 150 -Captures @($item.Captures) | Should -Match 'page zoom 100% for \d+ of \d+ image\(s\), 150% for 1 of'
         $script:PageZoomPercent | Should -Be 100
@@ -1405,6 +1554,50 @@ Describe 'Capture area: page content as PNG, and the end of a failed run' -Tag '
         $item.Captures[0].FileName | Should -Be '004_Png_seg01.png'
     }
 
+    It 'warns when the page grew while its one tall image was being taken' {
+        $script:RealContentSize = ${function:Get-PageContentSize}
+        $global:VouchSizeCalls = 0
+        # The second measurement, after the image, finds 2000 px of lazily loaded content.
+        Mock Get-PageContentSize {
+            $global:VouchSizeCalls++
+            $size = & $script:RealContentSize
+            if ($global:VouchSizeCalls -ge 2) { $size.Height += 2000 }
+            $size
+        }
+        $definition = ConvertTo-CaptureDefinition -Index 5 -Page ([ordered]@{ name = 'Grows'; url = "$Web/tall?px=3000"
+                actions = @([ordered]@{ type = 'capture'; scroll = [ordered]@{ mode = 'page'; as = 'single' } }) })
+        $run = Resolve-RunSettings -BoundParameters @{ CaptureArea = 'page' } -Config $null -Defaults @{
+            NavigationTimeoutSec = 10; SettleSeconds = 0.1; ScrollSettleSeconds = 0.1; MaxScrollSegments = 10 }
+        $context = @{ RunId = [guid]::NewGuid().ToString(); Format = 'jpeg'; Quality = 85; Extension = 'jpg'; SaveImages = $false; ImagesDir = ''; Screen = '1x1' }
+        $item = Invoke-CaptureItem -Definition $definition -Settings $run -CaptureContext $context 6>$null
+        $item.Captures.Count | Should -Be 1
+        $item.Status | Should -Be 'WARNING'
+        @($item.Details) | Should -Be @('The one tall image of the capture is 3016 pixels high, but the page measured 5016 pixels; content that loaded or changed while it was taken may be missing from it.')
+        $global:VouchSizeCalls | Should -Be 2
+        Remove-Variable -Name VouchSizeCalls -Scope Global
+    }
+
+    It 'does not reconnect at the end of the run to clear a zoom on a connection that died' {
+        Close-CdpSocket
+        $global:VouchDead = @{ Clears = 0 }
+        Mock Clear-PageZoom { $global:VouchDead.Clears++ }
+        Mock Invoke-CaptureItem { Set-PageZoom -Percent 150; $script:CdpSocket.Abort() }
+        $tabsBefore = @(Get-DevToolsTargetList -Port $script:CdpPort | Where-Object type -eq 'page').Count
+        $config = Get-DefaultVouchConfig
+        $config['browser']['profileDir'] = $script:ProfileDir
+        $config['browser']['debugPort'] = $script:CdpPort
+        $config['output']['dir'] = 'out'
+        $config['pages'].Add([ordered]@{ name = 'Plain'; url = "$Web/ok" })
+        $path = Join-Path -Path $TestDrive -ChildPath 'dead.json'
+        [System.IO.File]::WriteAllText($path, ($config | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+
+        Invoke-Main -BoundParameters @{ ConfigPath = $path } 6>$null
+        $global:VouchDead.Clears | Should -Be 0
+        $script:PageZoomPercent | Should -Be 100
+        @(Get-DevToolsTargetList -Port $script:CdpPort | Where-Object type -eq 'page').Count | Should -Be $tabsBefore
+        Remove-Variable -Name VouchDead -Scope Global
+    }
+
     It 'clears the zoom on the open connection when the run fails' {
         Close-CdpSocket
         $script:RealClearForFailure = ${function:Clear-PageZoom}
@@ -1498,6 +1691,16 @@ Describe 'Capture area: Edge window (window position mocked)' -Tag 'Integration'
         $item.Captures[0].CaptureArea | Should -Be 'screen'
         (Get-ImageMetadata -Bytes ([Convert]::FromBase64String($item.Captures[0].Base64))).CaptureArea | Should -Be 'screen'
         Should -Invoke Get-ScreenCapture -Times 1 -Exactly
+    }
+
+    It 'says so when part of the window is off the main display' {
+        Mock Get-EdgeWindowBounds { [System.Drawing.Rectangle]::new(1600, 50, 640, 480) }
+        $item = Invoke-WindowPage
+        $item.Status | Should -Be 'WARNING'
+        @($item.Details) | Should -Be @('Part of the Edge window is outside the main display, so the images show only the part on it (320x480 of the 640x480 window).')
+        $item.Captures[0].CaptureArea | Should -Be 'window'
+        $image = [System.Drawing.Bitmap]::new([System.IO.MemoryStream]::new([Convert]::FromBase64String($item.Captures[0].Base64)))
+        try { @($image.Width, $image.Height) | Should -Be @(320, 480) } finally { $image.Dispose() }
     }
 }
 
@@ -1639,5 +1842,221 @@ Describe 'Running from another working directory (scheduled-task style)' -Tag 'I
         $output | Should -Match 'ERROR:'
         # With the CSV found, the run stops at "no capture rows" instead of "not found".
         $output | Should -Not -Match 'Capture definition CSV not found'
+    }
+}
+
+Describe 'Progress events, stop and -TabId (headless Edge, desktop functions mocked)' -Tag 'Integration' {
+    BeforeAll {
+        Close-CdpSocket
+        Mock Set-EdgeForeground { $null }
+        Mock Get-ScreenCapture {
+            $bitmap = [System.Drawing.Bitmap]::new(16, 10)
+            try {
+                if ($Metadata) { Set-JpegMetadata -Image $bitmap -Metadata $Metadata }
+                $stream = [System.IO.MemoryStream]::new()
+                $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                , $stream.ToArray()
+            }
+            finally { $bitmap.Dispose() }
+        }
+
+        function New-RunConfig {
+            param([string]$Folder, [object[]]$Pages)
+            $config = Get-DefaultVouchConfig
+            $config['browser']['profileDir'] = $script:ProfileDir
+            $config['browser']['debugPort'] = $script:CdpPort
+            $config['defaults']['navigationTimeoutSec'] = 5
+            $config['defaults']['settleSeconds'] = 0.1
+            $config['defaults']['scrollSettleSeconds'] = 0.1
+            $config['output']['dir'] = 'out'
+            $config['output']['reportName'] = 'run.html'
+            foreach ($page in $Pages) { $config['pages'].Add($page) }
+            $path = Join-Path -Path $TestDrive -ChildPath $Folder
+            [void](New-Item -ItemType Directory -Path $path -Force)
+            $file = Join-Path -Path $path -ChildPath 'run.json'
+            [System.IO.File]::WriteAllText($file, ($config | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+            return $file
+        }
+        function Read-RunEvent([string]$Path) {
+            @(Get-Content -LiteralPath $Path -Encoding utf8 | ForEach-Object { $_ | ConvertFrom-Json })
+        }
+        function New-TestTab([string]$Url) {
+            Invoke-RestMethod -Method Put -Uri "http://127.0.0.1:$($script:CdpPort)/json/new?$Url" -NoProxy
+        }
+        function Remove-TestTab([string]$Id) {
+            try { [void](Invoke-RestMethod -Uri "http://127.0.0.1:$($script:CdpPort)/json/close/$Id" -NoProxy) } catch { Write-Verbose 'already closed' }
+        }
+    }
+    AfterAll {
+        $script:EventLogPath = ''
+        $script:StopRequested = $false
+        $script:CdpTabId = ''
+    }
+
+    It 'Get-CdpPageTarget -TabId picks the named tab among two web tabs, and refuses an unknown id' {
+        $first = New-TestTab "$Web/ok?tab=first"
+        $second = New-TestTab "$Web/ok?tab=second"
+        try {
+            (Get-CdpPageTarget -Port $script:CdpPort -TabId $second.id).id | Should -Be $second.id
+            (Get-CdpPageTarget -Port $script:CdpPort -TabId $first.id).id | Should -Be $first.id
+            $before = @(Get-DevToolsTargetList -Port $script:CdpPort | Where-Object type -eq 'page').Count
+            { Get-CdpPageTarget -Port $script:CdpPort -TabId 'NO-SUCH-TAB' -WaitSeconds 1 } | Should -Throw "*no open tab with the id 'NO-SUCH-TAB'*"
+            @(Get-DevToolsTargetList -Port $script:CdpPort | Where-Object type -eq 'page').Count | Should -Be $before -Because 'no tab is opened instead'
+        }
+        finally {
+            Remove-TestTab $first.id
+            Remove-TestTab $second.id
+        }
+    }
+
+    It 'logs a two-page run as one valid JSON event per line, in order, in the tab named by -TabId' {
+        $tab = New-TestTab 'about:blank'
+        try {
+            $file = New-RunConfig -Folder 'events' -Pages @(
+                [ordered]@{ id = 'gate'; name = 'Gate'; url = "$Web/gate?key=$([guid]::NewGuid().ToString('n'))"
+                    overrides = [ordered]@{ waitFor = '#content'; onNotReady = 'prompt'; promptTimeoutSec = 60 } }
+                [ordered]@{ id = 'plain'; name = 'Plain'; url = "$Web/ok" })
+            $log = Join-Path -Path $TestDrive -ChildPath 'events\progress.ndjson'
+            Mock Test-InteractiveRun { $true }
+            Mock Show-ContinueDialog { [pscustomobject]@{ Decision = 'Skip'; WaitSeconds = 0; TimedOut = $false } }
+
+            Invoke-Main -BoundParameters @{ ConfigPath = $file; EventLogPath = $log; TabId = [string]$tab.id } 6>$null
+            $script:ExitCode | Should -Be 0
+
+            $lines = @(Get-Content -LiteralPath $log -Encoding utf8)
+            foreach ($line in $lines) { { $line | ConvertFrom-Json } | Should -Not -Throw -Because $line }
+            $events = Read-RunEvent $log
+            @($events.type) | Should -Be @('runStart', 'pageStart', 'prompt', 'promptResult', 'pageEnd', 'pageStart', 'capture', 'action', 'pageEnd', 'runEnd')
+            @($events.runId | Sort-Object -Unique).Count | Should -Be 1
+
+            $runStart = $events[0]
+            $runStart.toolVersion | Should -Be $script:ToolVersion
+            $runStart.pageCount | Should -Be 2
+            Split-Path -Path $runStart.reportPath -Leaf | Should -Be 'run.html'
+            $runStart.interactive | Should -BeTrue
+            $runStart.stopFile | Should -Be "$log.stop"
+
+            $events[1].pageId | Should -Be 'gate'
+            $events[1].index | Should -Be 1
+            $events[1].total | Should -Be 2
+            $events[1].name | Should -Be 'Gate'
+            $events[2].kind | Should -Be 'notReady'
+            $events[2].pageId | Should -Be 'gate'
+            $events[2].timeoutSec | Should -Be 60
+            $events[3].decision | Should -Be 'Skip'
+            $events[4].status | Should -Be 'WARNING'
+            $events[4].captureCount | Should -Be 0
+            @($events[4].details) -join ' ' | Should -Match 'Skipped by the user'
+
+            $events[5].pageId | Should -Be 'plain'
+            $events[5].url | Should -Be "$Web/ok"
+            $events[6].fileName | Should -Be '002_Plain_seg01.jpg'
+            $events[6].area | Should -Be 'screen'
+            $events[6].segment | Should -Be 1
+            $events[6].captureNumber | Should -Be 1
+            $events[7].actionType | Should -Be 'capture'
+            $events[7].index | Should -Be 1
+            $events[7].ok | Should -BeTrue
+            $events[8].status | Should -Be 'OK'
+            $events[8].finalUrl | Should -Be "$Web/ok"
+            $events[8].captureCount | Should -Be 1
+
+            $runEnd = $events[9]
+            $runEnd.exitCode | Should -Be 0
+            $runEnd.stopped | Should -BeFalse
+            $runEnd.reportPath | Should -Be $runStart.reportPath
+            $runEnd.reportPath | Should -Exist
+            $runEnd.counts.ok | Should -Be 1
+            $runEnd.counts.warning | Should -Be 1
+            $runEnd.counts.captures | Should -Be 1
+            $runEnd.counts.notRun | Should -Be 0
+
+            # The run used the named tab, and left it open.
+            $after = @(Get-DevToolsTargetList -Port $script:CdpPort | Where-Object { $_.id -eq $tab.id })
+            $after.Count | Should -Be 1
+            $after[0].url | Should -Be "$Web/ok"
+            $script:CdpTabId | Should -Be '' -Because 'the tab choice ends with the run'
+            $script:InteractiveRun | Should -BeFalse -Because 'the prompt setting ends with the run'
+        }
+        finally {
+            Remove-TestTab $tab.id
+            $script:EventLogPath = ''
+        }
+    }
+
+    It 'stops within about 2 seconds when the stop file appears during a long wait, and still writes the report' {
+        $file = New-RunConfig -Folder 'stop' -Pages @(
+            [ordered]@{ id = 'long'; name = 'Long wait'; url = "$Web/ok"; actions = @(
+                    [ordered]@{ type = 'capture'; label = 'Before' }
+                    [ordered]@{ type = 'wait'; seconds = 60 }
+                    [ordered]@{ type = 'capture'; label = 'After' }) }
+            [ordered]@{ id = 'next'; name = 'Never reached'; url = "$Web/ok" })
+        $log = Join-Path -Path $TestDrive -ChildPath 'stop\progress.ndjson'
+        # Another thread plays the Designer: once the wait has begun, it asks the run to stop.
+        $job = Start-ThreadJob -ArgumentList $log -ScriptBlock {
+            param($Log)
+            $deadline = (Get-Date).AddSeconds(60)
+            while ((Get-Date) -lt $deadline) {
+                $text = ''
+                try {
+                    $stream = [System.IO.FileStream]::new($Log, 'Open', 'Read', 'ReadWrite, Delete')
+                    try { $text = [System.IO.StreamReader]::new($stream).ReadToEnd() } finally { $stream.Dispose() }
+                }
+                catch { $text = '' }
+                if ($text -match '"type":"action"') { break }
+                Start-Sleep -Milliseconds 100
+            }
+            Start-Sleep -Milliseconds 1000
+            [System.IO.File]::WriteAllText("$Log.stop", '')
+            [datetime]::Now
+        }
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            Invoke-Main -BoundParameters @{ ConfigPath = $file; EventLogPath = $log } 6>$null
+            $ended = [datetime]::Now
+        }
+        finally {
+            $stoppedAt = $job | Wait-Job -Timeout 70 | Receive-Job
+            $job | Remove-Job -Force
+        }
+        $watch.Stop()
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 30 -Because 'the 60 s wait was cut short'
+        ($ended - $stoppedAt).TotalSeconds | Should -BeLessThan 2.5
+
+        $events = Read-RunEvent $log
+        $runEnd = $events[-1]
+        $runEnd.type | Should -Be 'runEnd'
+        $runEnd.stopped | Should -BeTrue
+        $runEnd.exitCode | Should -Be 0
+        $runEnd.counts.run | Should -Be 1
+        $runEnd.counts.notRun | Should -Be 1
+        $pageEnd = @($events | Where-Object type -eq 'pageEnd')
+        $pageEnd.Count | Should -Be 1
+        $pageEnd[0].status | Should -Be 'WARNING'
+        $pageEnd[0].stopped | Should -BeTrue
+        $pageEnd[0].captureCount | Should -Be 1
+        @($pageEnd[0].details) | Should -Contain 'Stopped by the user: the run ended here, so the rest of this page was not captured.'
+        @($events | Where-Object type -eq 'pageStart').Count | Should -Be 1
+
+        $runEnd.reportPath | Should -Exist
+        @(Test-ReportIntegrity -Path $runEnd.reportPath | Where-Object { -not $_.Ok }) | Should -BeNullOrEmpty
+        $script:StopRequested = $false
+        $script:EventLogPath = ''
+    }
+
+    It 'the real script logs an error and a runEnd when the run cannot start' {
+        $folder = Join-Path -Path $TestDrive -ChildPath 'broken'
+        [void](New-Item -ItemType Directory -Path $folder)
+        $config = Join-Path -Path $folder -ChildPath 'empty.json'
+        Set-Content -LiteralPath $config -Value '{ "schemaVersion": 1, "pages": [] }' -Encoding utf8
+        $log = Join-Path -Path $folder -ChildPath 'events.ndjson'
+        $pwsh = (Get-Process -Id $PID).Path
+        $process = Start-Process -FilePath $pwsh -NoNewWindow -Wait -PassThru -RedirectStandardOutput (Join-Path $folder 'out.txt') `
+            -ArgumentList @('-NoProfile', '-NonInteractive', '-File', "`"$script:VouchPath`"", '-ConfigPath', "`"$config`"", '-EventLogPath', "`"$log`"")
+        $process.ExitCode | Should -Be 1
+        $events = Read-RunEvent $log
+        @($events.type) | Should -Be @('error', 'runEnd')
+        $events[0].message | Should -Match 'has no pages'
+        $events[1].exitCode | Should -Be 1
     }
 }

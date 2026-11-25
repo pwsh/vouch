@@ -338,6 +338,7 @@ Describe 'Resolve-RunSettings' {
             JsonSummary = [switch]$false; UseVirtualDesktop = [switch]$false; Verify = ''
             LoginSetup = [switch]$false; ConfigPath = ''; Only = [string[]]@()
             CaptureArea = 'screen'; ZoomPercent = 100
+            NoPrompt = [switch]$false; EventLogPath = ''; TabId = ''
         }
         $config = '{
             "browser":  { "profileDir": "C:\\cfg-profile", "debugPort": 9333, "keepBrowserOpen": true },
@@ -962,7 +963,7 @@ Describe 'Configuration file' {
     }
 
     Context 'Get-InactiveConfigSetting for page actions' {
-        It 'lists pause actions, and no longer lists waitFor or one-tall-image captures' {
+        It 'no longer lists pause actions, waitFor or one-tall-image captures' {
             $config = Get-DefaultVouchConfig
             $config['defaults']['waitFor'] = '#ready'
             $config['pages'].Add([ordered]@{ overrides = [ordered]@{ waitFor = '#grid' }; actions = @(
@@ -971,8 +972,15 @@ Describe 'Configuration file' {
                     [ordered]@{ type = 'capture'; scroll = [ordered]@{ mode = 'auto'; as = 'single' } }
                     [ordered]@{ type = 'capture'; scroll = [ordered]@{ mode = 'none'; as = 'single' } }
                     [ordered]@{ type = 'pause' }) })
-            $inactive = Get-InactiveConfigSetting -Config $config
-            $inactive | Should -Be @('page actions: pause')
+            (Get-InactiveConfigSetting -Config $config).Count | Should -Be 0
+        }
+
+        It 'no longer lists onNotReady or promptTimeoutSec, which now work' {
+            $config = Get-DefaultVouchConfig
+            $config['defaults']['onNotReady'] = 'prompt'
+            $config['defaults']['promptTimeoutSec'] = 60
+            $config['pages'].Add([ordered]@{ overrides = [ordered]@{ onNotReady = 'prompt'; promptTimeoutSec = 30 } })
+            (Get-InactiveConfigSetting -Config $config).Count | Should -Be 0
         }
     }
 
@@ -1254,7 +1262,7 @@ Describe 'Page zoom: the device metrics override' {
         Add-ZoomLostDetail -Item $item
         Add-ZoomLostDetail -Item $item
         $item.Status | Should -Be 'WARNING'
-        @($item.Details) | Should -Be @('The connection to Edge was lost and restored during this page, but the page zoom of 150% could not be set again; the images taken after that show the page at 100%.')
+        @($item.Details) | Should -Be @('The connection to Edge was lost and restored during this page, but the page zoom of 150% could not be set again; any images of this page taken after that show it at 100%.')
         $script:PageZoomLost | Should -Be 0
     }
 
@@ -1432,5 +1440,329 @@ Describe 'A waitFor action that times out, on a German PC' {
             -Settings ([pscustomobject]@{ NavigationTimeoutSec = 30; SettleSeconds = 0 })
         $entry.Ok | Should -BeFalse
         $entry.Message | Should -BeLike "*'#late' within 1.5 second(s)*"
+    }
+}
+
+Describe 'Test-InteractiveRun' {
+    It 'is <Expected> for <Case>' -ForEach @(
+        @{ Case = 'a console run'; NoPrompt = $false; Desktop = $true; CommandLine = @('pwsh.dll', '-NoProfile', '-File', 'vouch.ps1'); Expected = $true }
+        @{ Case = '-NoPrompt'; NoPrompt = $true; Desktop = $true; CommandLine = @('pwsh.dll', '-File', 'vouch.ps1'); Expected = $false }
+        @{ Case = 'no desktop (UserInteractive false)'; NoPrompt = $false; Desktop = $false; CommandLine = @('pwsh.dll', '-File', 'vouch.ps1'); Expected = $false }
+        @{ Case = 'the scheduled task (-NonInteractive)'; NoPrompt = $false; Desktop = $true
+           CommandLine = @('pwsh.dll', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', 'C:\v\vouch.ps1', '-CsvPath', 'x.csv'); Expected = $false }
+        @{ Case = '-noni'; NoPrompt = $false; Desktop = $true; CommandLine = @('pwsh.dll', '-noni', '-f', 'vouch.ps1'); Expected = $false }
+        @{ Case = '/NonInteractive'; NoPrompt = $false; Desktop = $true; CommandLine = @('pwsh.dll', '/NonInteractive', '-File', 'vouch.ps1'); Expected = $false }
+        @{ Case = '--noninteractive'; NoPrompt = $false; Desktop = $true; CommandLine = @('pwsh.dll', '--noninteractive', '-c', 'x'); Expected = $false }
+        @{ Case = 'a script argument after -File'; NoPrompt = $false; Desktop = $true; CommandLine = @('pwsh.dll', '-File', 'vouch.ps1', '-NonInteractive'); Expected = $true }
+        @{ Case = 'a script argument after an implied file'; NoPrompt = $false; Desktop = $true; CommandLine = @('pwsh.dll', 'C:\v\vouch.ps1', '-noni'); Expected = $true }
+        @{ Case = '-NoLogo (not -noni)'; NoPrompt = $false; Desktop = $true; CommandLine = @('pwsh.dll', '-NoLogo', '-No', '-File', 'vouch.ps1'); Expected = $true }
+        @{ Case = 'the Designer child (hidden window)'; NoPrompt = $false; Desktop = $true; CommandLine = @('pwsh.dll', '-NoProfile', '-WindowStyle', 'Hidden', '-File', 'vouch.ps1', '-EventLogPath', 'e.ndjson'); Expected = $true }
+    ) {
+        Test-InteractiveRun -NoPrompt $NoPrompt -UserInteractive $Desktop -CommandLineArgs $CommandLine | Should -Be $Expected
+    }
+
+    It 'reads the real process when nothing is passed' {
+        Test-InteractiveRun | Should -BeOfType [bool]
+        Test-InteractiveRun -NoPrompt $true | Should -BeFalse
+    }
+}
+
+Describe 'Request-UserDecision' {
+    BeforeEach {
+        $script:EventLogPath = ''
+        $script:InteractiveRun = $false
+        Mock Show-ContinueDialog { [pscustomobject]@{ Decision = 'Wait'; WaitSeconds = 45; TimedOut = $false } }
+    }
+    AfterEach {
+        $script:EventLogPath = ''
+        $script:InteractiveRun = $false
+    }
+
+    It 'returns the default at once, with no window, when nobody can answer' {
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $answer = Request-UserDecision -Title 'T' -Message 'M' -PageName 'P' -Default 'Skip' -TimeoutSec 300
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 1
+        $answer.Decision | Should -Be 'Skip'
+        $answer.Prompted | Should -BeFalse
+        $answer.TimedOut | Should -BeFalse
+        Should -Invoke Show-ContinueDialog -Times 0 -Exactly
+    }
+
+    It 'asks through the dialog in an interactive run, and logs the question and the answer' {
+        $script:InteractiveRun = $true
+        $script:EventLogPath = Join-Path -Path $TestDrive -ChildPath 'ask.ndjson'
+        $script:EventPageId = 'p004'
+        $answer = Request-UserDecision -Kind 'notReady' -Title 'Not ready' -Message 'Waiting for #grid' -PageName 'Users' -TimeoutSec 120 6>$null
+        $answer.Decision | Should -Be 'Wait'
+        $answer.WaitSeconds | Should -Be 45
+        $answer.Prompted | Should -BeTrue
+        Should -Invoke Show-ContinueDialog -Times 1 -Exactly -ParameterFilter { $TimeoutSec -eq 120 -and $Default -eq 'Continue' -and $PageName -eq 'Users' }
+        $events = @(Get-Content -LiteralPath $script:EventLogPath | ForEach-Object { $_ | ConvertFrom-Json })
+        @($events.type) | Should -Be @('prompt', 'promptResult')
+        $events[0].kind | Should -Be 'notReady'
+        $events[0].message | Should -Be 'Waiting for #grid'
+        $events[0].pageId | Should -Be 'p004'
+        $events[0].timeoutSec | Should -Be 120
+        $events[1].decision | Should -Be 'Wait'
+        $events[1].waitSeconds | Should -Be 45
+        $events[1].shown | Should -BeTrue
+        $script:EventPageId = ''
+    }
+
+    It 'carries on as if nobody were there when the dialog cannot be shown' {
+        $script:InteractiveRun = $true
+        Mock Show-ContinueDialog { throw 'no desktop' }
+        $answer = Request-UserDecision -Title 'T' -Message 'M' 6>$null
+        $answer.Decision | Should -Be 'Continue'
+        $answer.Prompted | Should -BeFalse
+    }
+}
+
+Describe 'The Vouch dialog, built but not shown' {
+    BeforeAll { Add-Type -AssemblyName System.Windows.Forms }
+    BeforeEach { $script:Dialogs = [System.Collections.Generic.List[object]]::new() }
+    AfterEach { foreach ($d in $script:Dialogs) { $d.Timer.Dispose(); $d.Form.Dispose() } }
+
+    It 'counts down and takes the default answer when the time runs out' {
+        $dialog = New-ContinueDialog -Title 'Paused' -Message 'Sign in' -PageName 'Payroll' -Default 'Skip' -TimeoutSec 125
+        $script:Dialogs.Add($dialog)
+        $dialog.Countdown.Text | Should -Match '^If nobody answers, Vouch will skip this page in 2:0[45]\.$'
+        $dialog.WaitButton.Text | Should -Be 'Wait 30 s more'
+        $dialog.Form.TopMost | Should -BeTrue
+        $dialog.State.Deadline = [datetime]::Now.AddSeconds(-1)
+        & $dialog.State.Tick
+        $dialog.State.Decision | Should -Be 'Skip'
+        $dialog.State.TimedOut | Should -BeTrue
+    }
+
+    It 'closes with Skip as soon as the stop file appears' {
+        $stop = Join-Path -Path $TestDrive -ChildPath 'run.ndjson.stop'
+        $dialog = New-ContinueDialog -Title 'Paused' -Message 'm' -StopFile $stop
+        $script:Dialogs.Add($dialog)
+        & $dialog.State.Tick
+        $dialog.State.Decision | Should -Be ''
+        Set-Content -LiteralPath $stop -Value ''
+        & $dialog.State.Tick
+        $dialog.State.Decision | Should -Be 'Skip'
+        $dialog.State.Stopped | Should -BeTrue
+        $dialog.State.TimedOut | Should -BeFalse
+    }
+
+    It 'answers <Expected> for its button' -ForEach @(
+        @{ Button = 'ContinueButton'; Expected = 'Continue' }
+        @{ Button = 'SkipButton'; Expected = 'Skip' }
+        @{ Button = 'WaitButton'; Expected = 'Wait' }
+    ) {
+        $dialog = New-ContinueDialog -Title 'Paused' -Message 'm' -WaitSeconds 30
+        $script:Dialogs.Add($dialog)
+        $dialog.WaitInput.Value = 90
+        $dialog.WaitButton.Text | Should -Be 'Wait 90 s more'
+        # PerformClick needs a window on screen; OnClick runs the same handler.
+        $onClick = [System.Windows.Forms.Button].GetMethod('OnClick', [System.Reflection.BindingFlags]'NonPublic, Instance')
+        [void]$onClick.Invoke($dialog.$Button, @([System.EventArgs]::Empty))
+        $dialog.State.Decision | Should -Be $Expected
+        $dialog.State.TimedOut | Should -BeFalse
+        if ($Expected -eq 'Wait') { $dialog.State.WaitSeconds | Should -Be 90 }
+    }
+
+    It 'keeps the wait between 5 seconds and an hour' {
+        $low = New-ContinueDialog -Title 'T' -Message 'm' -WaitSeconds 1
+        $high = New-ContinueDialog -Title 'T' -Message 'm' -WaitSeconds 99999
+        $script:Dialogs.Add($low); $script:Dialogs.Add($high)
+        $low.WaitInput.Value | Should -Be 5
+        $high.WaitInput.Value | Should -Be 3600
+    }
+}
+
+Describe 'The real Vouch dialog (opt-in: shows a window for 2 seconds)' -Tag 'Interactive' {
+    It 'appears, counts down and closes itself with the default answer' {
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+        Initialize-NativeInterop
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $answer = Show-ContinueDialog -Title 'Vouch test' -Message 'This window closes by itself.' -PageName 'Test' -TimeoutSec 2
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 6
+        $answer.Decision | Should -Be 'Continue'
+        $answer.TimedOut | Should -BeTrue
+    }
+}
+
+Describe 'Progress events' {
+    BeforeEach { $script:EventRunId = 'run-1' }
+    AfterEach { $script:EventLogPath = ''; $script:EventRunId = '' }
+
+    It 'writes nothing, and no file, without an event log' {
+        $script:EventLogPath = ''
+        Write-RunEvent -Type 'runStart' -Data @{ pageCount = 1 }
+        @(Get-ChildItem -LiteralPath $TestDrive -Filter '*.ndjson').Count | Should -Be 0
+    }
+
+    It 'writes one JSON object per line that reads back with ConvertFrom-Json' {
+        $script:EventLogPath = Join-Path -Path $TestDrive -ChildPath 'events.ndjson'
+        $details = [System.Collections.Generic.List[string]]::new()
+        $details.Add('Line one "quoted"'); $details.Add("two`nlines")
+        Write-RunEvent -Type 'pageEnd' -Data ([ordered]@{ type = 'not the envelope'; runId = 'x'; pageId = 'p001'; status = 'WARNING'; details = @($details); captureCount = 2; finalUrl = 'https://x/ä' })
+        Write-RunEvent -Type 'runEnd' -Data ([ordered]@{ exitCode = 0; counts = [ordered]@{ ok = 1 }; stopped = $false })
+        $bytes = [System.IO.File]::ReadAllBytes($script:EventLogPath)
+        $bytes[0] | Should -Be ([byte][char]'{') -Because 'no BOM'
+        $lines = [System.Text.Encoding]::UTF8.GetString($bytes) -split "`n"
+        $lines.Count | Should -Be 3
+        $lines[2] | Should -Be ''
+        $first = $lines[0] | ConvertFrom-Json
+        $first.type | Should -Be 'pageEnd'
+        $first.runId | Should -Be 'run-1'
+        # ConvertFrom-Json turns the time into a DateTime; the raw text is what a reader sees.
+        $lines[0] | Should -Match '^\{"ts":"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}[+-]\d\d:\d\d","type":"pageEnd","runId":"run-1",'
+        @($first.details) | Should -Be @('Line one "quoted"', "two`nlines")
+        $first.finalUrl | Should -Be 'https://x/ä'
+        ($lines[1] | ConvertFrom-Json).counts.ok | Should -Be 1
+    }
+
+    It 'keeps writing while another program holds the file open' {
+        $script:EventLogPath = Join-Path -Path $TestDrive -ChildPath 'tailed.ndjson'
+        Write-RunEvent -Type 'runStart'
+        $reader = [System.IO.FileStream]::new($script:EventLogPath, 'Open', 'Read', 'ReadWrite, Delete')
+        try {
+            Write-RunEvent -Type 'pageStart' -Data @{ index = 1 }
+            $text = [System.IO.StreamReader]::new($reader).ReadToEnd()
+            @($text -split "`n" | Where-Object { $_ }).Count | Should -Be 2
+        }
+        finally { $reader.Dispose() }
+    }
+
+    It 'never fails the run when the file cannot be written' {
+        $script:EventLogPath = Join-Path -Path $TestDrive -ChildPath 'no such folder\e.ndjson'
+        { Write-RunEvent -Type 'runStart' } | Should -Not -Throw
+    }
+
+    It 'writes the error and a runEnd for a run that failed' {
+        $script:EventLogPath = Join-Path -Path $TestDrive -ChildPath 'failed.ndjson'
+        Write-RunFailedEvent -Message 'Edge did not start'
+        $events = @(Get-Content -LiteralPath $script:EventLogPath | ForEach-Object { $_ | ConvertFrom-Json })
+        @($events.type) | Should -Be @('error', 'runEnd')
+        $events[0].message | Should -Be 'Edge did not start'
+        $events[1].exitCode | Should -Be 1
+        $events[1].stopped | Should -BeFalse
+    }
+}
+
+Describe 'Stop file' {
+    AfterEach {
+        $script:EventLogPath = ''
+        $script:StopRequested = $false
+    }
+
+    It 'never stops a run without an event log' {
+        Initialize-RunEvent -EventLogPath ''
+        Test-StopRequested | Should -BeFalse
+        Get-StopFilePath | Should -Be ''
+    }
+
+    It 'stops once the event log name plus .stop exists, and stays stopped' {
+        $path = Join-Path -Path $TestDrive -ChildPath 'stop\run.ndjson'
+        Initialize-RunEvent -EventLogPath $path
+        Test-Path -LiteralPath (Split-Path $path) | Should -BeTrue -Because 'the folder is created'
+        Get-StopFilePath | Should -Be "$path.stop"
+        Test-StopRequested | Should -BeFalse
+        Set-Content -LiteralPath "$path.stop" -Value ''
+        Test-StopRequested 6>$null | Should -BeTrue
+        Remove-Item -LiteralPath "$path.stop"
+        Test-StopRequested | Should -BeTrue
+    }
+
+    It 'removes a stop file left over from an earlier run, and gives each run its own id' {
+        $path = Join-Path -Path $TestDrive -ChildPath 'stale.ndjson'
+        Set-Content -LiteralPath "$path.stop" -Value ''
+        Initialize-RunEvent -EventLogPath $path
+        $first = $script:EventRunId
+        "$path.stop" | Should -Not -Exist
+        Test-StopRequested | Should -BeFalse
+        Initialize-RunEvent -EventLogPath $path
+        $script:EventRunId | Should -Not -Be $first
+    }
+
+    It 'sleeps in one piece without an event log, exactly as before' {
+        Initialize-RunEvent -EventLogPath ''
+        Mock Start-Sleep { }
+        Wait-Interruptible -Milliseconds 730 | Should -BeTrue
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Milliseconds -eq 730 }
+    }
+
+    It 'notices a stop within a second during a long wait' {
+        $path = Join-Path -Path $TestDrive -ChildPath 'waiting.ndjson'
+        Initialize-RunEvent -EventLogPath $path
+        Set-Content -LiteralPath "$path.stop" -Value ''
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        Wait-Interruptible -Milliseconds 60000 6>$null | Should -BeFalse
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 1
+    }
+}
+
+Describe 'Receive-CdpMessage when the timeout fires a moment early' {
+    It 'says it timed out, not "The operation was canceled."' {
+        # The cancellation token fires while Get-Date still reads just before the deadline.
+        $script:FakeDeadline = [datetime]::Now.AddMinutes(5)
+        $deadline = $script:FakeDeadline
+        Mock Get-Date { $script:FakeDeadline.AddMilliseconds(-150) }
+        $fake = [pscustomobject]@{}
+        $fake | Add-Member -MemberType ScriptMethod -Name ReceiveAsync -Value {
+            param($Segment, $Token)
+            [System.Threading.Tasks.Task]::Delay([System.Threading.Timeout]::Infinite, $Token)
+        }
+        $saved = $script:CdpSocket
+        $script:CdpSocket = $fake
+        try {
+            { Receive-CdpMessage -Deadline $deadline } | Should -Throw 'Timed out waiting for a response from the browser*'
+        }
+        finally { $script:CdpSocket = $saved }
+    }
+}
+
+Describe 'Small checks added with the prompts' {
+    It 'Test-CdpSocketOpen is false for no socket and for a socket that is not open' {
+        $saved = $script:CdpSocket
+        try {
+            $script:CdpSocket = $null
+            Test-CdpSocketOpen | Should -BeFalse
+            $script:CdpSocket = [System.Net.WebSockets.ClientWebSocket]::new()
+            Test-CdpSocketOpen | Should -BeFalse
+            $script:CdpSocket.Abort()
+            Test-CdpSocketOpen | Should -BeFalse
+        }
+        finally {
+            if ($script:CdpSocket) { $script:CdpSocket.Dispose() }
+            $script:CdpSocket = $saved
+        }
+    }
+
+    It 'Get-TallImageProblem accepts a whole image and flags a page that grew (<Case>)' -ForEach @(
+        @{ Case = 'whole'; Image = 5016; Planned = 5016; After = 5016; Problem = $false }
+        @{ Case = 'rounding'; Image = 4525; Planned = 4524; After = 4524; Problem = $false }
+        @{ Case = 'grew while captured'; Image = 5016; Planned = 5016; After = 7016; Problem = $true }
+        @{ Case = 'image not the planned height'; Image = 4000; Planned = 5016; After = 5016; Problem = $true }
+    ) {
+        $text = Get-TallImageProblem -ImageHeight $Image -PlannedHeight $Planned -HeightAfter $After -What "the capture 'All'"
+        if ($Problem) { $text | Should -Match "^The one tall image of the capture 'All' is $Image pixels high, but the page measured \d+ pixels" }
+        else { $text | Should -Be '' }
+    }
+
+    It 'Get-PartialWindowDetail says when part of the window is off the main display (<Case>)' -ForEach @(
+        @{ Case = 'all on it'; Window = @(100, 50, 640, 480); Visible = @(100, 50, 640, 480); Expected = '' }
+        @{ Case = 'maximised, borders counted'; Window = @(-8, -8, 1936, 1056); Visible = @(0, 0, 1920, 1040); Expected = '' }
+        @{ Case = 'half off to the right'; Window = @(1600, 100, 640, 480); Visible = @(1600, 100, 320, 480)
+           Expected = 'Part of the Edge window is outside the main display, so the images show only the part on it (320x480 of the 640x480 window).' }
+    ) {
+        $w = [System.Drawing.Rectangle]::new($Window[0], $Window[1], $Window[2], $Window[3])
+        $v = [System.Drawing.Rectangle]::new($Visible[0], $Visible[1], $Visible[2], $Visible[3])
+        Get-PartialWindowDetail -WindowBounds $w -Visible $v | Should -Be $Expected
+    }
+
+    It 'Get-NotReadyPolicy reads onNotReady and the prompt timeout, with safe defaults' {
+        $policy = Get-NotReadyPolicy -Settings ([pscustomobject]@{ NavigationTimeoutSec = 30 })
+        $policy.OnNotReady | Should -Be 'warn'
+        $policy.PromptTimeoutSec | Should -Be 300
+        $policy = Get-NotReadyPolicy -Settings ([pscustomobject]@{ OnNotReady = 'prompt'; PromptTimeoutSec = 45 })
+        $policy.OnNotReady | Should -Be 'prompt'
+        $policy.PromptTimeoutSec | Should -Be 45
     }
 }

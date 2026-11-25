@@ -48,8 +48,34 @@ while ($listener.IsListening) {
                 Send-Response $context $code $body
             }
             '^/protected$' {
-                # Same-origin login redirect: the common shape of an expired session.
-                Send-Response $context 302 '' @{ Location = "$base/login?returnUrl=%2Fprotected" }
+                # Same-origin login redirect: the common shape of an expired session. With
+                # ?key=K and the cookie /signin?key=K sets, the real page (a signed-in session).
+                $key = [string]$query['key']
+                $session = if ($key) { $context.Request.Cookies["session_$key"] } else { $null }
+                if ($null -ne $session -and $session.Value -eq '1') {
+                    Send-Response $context 200 (Page 'Protected' "<h1 id='secret'>Protected content</h1>")
+                }
+                else {
+                    Send-Response $context 302 '' @{ Location = "$base/login?returnUrl=%2Fprotected" }
+                }
+            }
+            '^/signin$' {
+                # What signing in does: a session cookie for /protected?key=K.
+                $key = [string]$query['key']
+                Send-Response $context 200 (Page 'Signed in' 'signed in') @{ 'Set-Cookie' = "session_$key=1; Path=/" }
+            }
+            '^/gate$' {
+                # Content that needs the person: a placeholder until /gate/open?key=K sets
+                # the cookie (the person confirming something), then #content shows.
+                $key = [string]$query['key']
+                $body = "<p id='placeholder'>Please confirm in the browser</p><div id='content' style='display:none'>Gate content</div>" +
+                    "<script>setInterval(function () { if (document.cookie.indexOf('gate_$key=open') >= 0) {" +
+                    " document.getElementById('content').style.display = 'block'; document.getElementById('placeholder').style.display = 'none'; } }, 200);</script>"
+                Send-Response $context 200 (Page 'Gate' $body)
+            }
+            '^/gate/open$' {
+                $key = [string]$query['key']
+                Send-Response $context 200 (Page 'Gate open' 'open') @{ 'Set-Cookie' = "gate_$key=open; Path=/" }
             }
             '^/xredirect$' {
                 $to = $query['to']
