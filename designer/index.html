@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Vouch Designer</title>
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to the settings</a>
+<div class="app" id="app">
+  <header class="topbar">
+    <div class="file-row">
+      <div class="file-name">
+        <span class="app-name">Vouch Designer</span>
+        <h1 id="file-title" class="file-title">Starting…</h1>
+        <span id="dirty-marker" class="dirty-marker" hidden>Not saved</span>
+      </div>
+      <p id="file-path" class="file-path"></p>
+    </div>
+    <div class="toolbar" role="toolbar" aria-label="File" id="file-toolbar"></div>
+    <div class="tabs" role="tablist" aria-label="Sections" id="tabs"></div>
+  </header>
+  <div id="banner" class="banner" role="alert" hidden></div>
+  <div id="issues" class="issues" hidden></div>
+  <main id="main" class="main" tabindex="-1">
+    <section id="panel-pages" class="tabpanel" role="tabpanel" aria-labelledby="tab-pages" tabindex="-1"></section>
+    <section id="panel-output" class="tabpanel" role="tabpanel" aria-labelledby="tab-output" tabindex="-1" hidden></section>
+    <section id="panel-report" class="tabpanel" role="tabpanel" aria-labelledby="tab-report" tabindex="-1" hidden></section>
+    <section id="panel-run" class="tabpanel" role="tabpanel" aria-labelledby="tab-run" tabindex="-1" hidden></section>
+  </main>
+  <noscript><p class="noscript">The Vouch Designer needs JavaScript, which is switched off in this window.</p></noscript>
+</div>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<div id="announcer" class="visually-hidden" aria-live="polite"></div>
+<dialog id="modal" class="modal" aria-labelledby="modal-title" aria-describedby="modal-body">
+  <h2 id="modal-title" class="modal-title"></h2>
+  <div id="modal-body" class="modal-body"></div>
+  <div id="modal-buttons" class="modal-buttons"></div>
+</dialog>
+</body>
+</html>
