@@ -676,6 +676,27 @@ Describe 'Configuration file' {
             $config['pages'][0]['actions'].Count | Should -Be 0
         }
 
+        It 'treats blank text like a missing key when the default is not blank' {
+            $folder = Join-Path -Path $TestDrive -ChildPath 'blank dir'
+            [void](New-Item -ItemType Directory -Path $folder -Force)
+            $blank = Import-VouchConfig -Path (Write-TestConfig -Folder $folder -Json '{ "schemaVersion": 1, "output": { "dir": "  " }, "report": { "title": "" }, "pages": [] }')
+            $missing = Import-VouchConfig -Path (Write-TestConfig -Folder $folder -Json '{ "schemaVersion": 1, "pages": [] }')
+            $blank['output']['dir'] | Should -Be $missing['output']['dir']
+            $blank['output']['dir'] | Should -Be (Join-Path $folder 'reports')
+            $blank['report']['title'] | Should -Be 'Audit Evidence Report'
+            # A blank default stays blank: "" is a real choice there.
+            $blank['report']['classification'] | Should -Be ''
+            $blank['output']['logDir'] | Should -Be ''
+        }
+
+        It 'reads a configuration given as a PowerShell drive path (TestDrive:\)' {
+            $path = Write-TestConfig -Json '{ "schemaVersion": 1, "output": { "dir": "out", "logDir": "logs" }, "pages": [] }'
+            $drivePath = 'TestDrive:\' + (Split-Path -Path $path -Leaf)
+            $config = Import-VouchConfig -Path $drivePath
+            $config['output']['dir'] | Should -Be (Join-Path $TestDrive 'out')
+            Get-RunLogDirectory -BoundParameters @{} -LogDir 'C:\D' -ConfigPath $drivePath | Should -Be (Join-Path $TestDrive 'logs')
+        }
+
         It 'lists every problem with its place in the file and launches nothing' {
             $path = Write-TestConfig -Json '{ "schemaVersion": 1, "browser": { "debugPort": "x" }, "pages": [ { "name": "A" } ] }'
             $output = & { try { Import-VouchConfig -Path $path } catch { "THROWN: $($_.Exception.Message)" } } 6>&1 | Out-String

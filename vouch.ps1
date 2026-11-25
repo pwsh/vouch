@@ -606,7 +606,11 @@ function Get-VouchActionSchema {
 }
 
 function New-VouchConfigNode {
-    # Builds the default values for one object of the schema, recursively.
+    <#
+        The default values of one schema object, built fresh on every call: the defaults
+        are handed out as live dictionaries that callers fill in and change, so two
+        configurations (or two pages) must never share one.
+    #>
     param([Parameter(Mandatory)][System.Collections.IDictionary]$Keys)
     $node = [ordered]@{}
     foreach ($key in $Keys.Keys) {
@@ -711,7 +715,11 @@ function ConvertFrom-VouchJson {
 }
 
 function Format-VouchConfigValue {
-    # How a value is shown in a validation message: as it would look in the file.
+    <#
+        Shows a value in a validation message the way it looks in the file ("2" in
+        quotes, true, a list [ ]), not as PowerShell prints it (System.Collections...,
+        True): the reader is looking at the JSON and must recognise what is meant.
+    #>
     param([AllowNull()][object]$Value)
     if ($null -eq $Value) { return 'null' }
     if ($Value -is [bool]) { return $(if ($Value) { 'true' } else { 'false' }) }
@@ -723,7 +731,11 @@ function Format-VouchConfigValue {
 }
 
 function Test-VouchConfigNumber {
-    # Numbers only: a bool or "30" in quotes is not a number, whatever PowerShell would cast.
+    <#
+        Numbers only: PowerShell would happily cast true or "30" in quotes to a number,
+        so a range check with -lt / -gt alone accepts values the file format does not.
+        NaN and infinity are refused as well, because every comparison with them is false.
+    #>
     param([AllowNull()][object]$Value, [switch]$Whole)
     $isNumber = $Value -is [long] -or $Value -is [int] -or $Value -is [double] -or $Value -is [decimal]
     if (-not $isNumber) { return $false }
@@ -733,6 +745,11 @@ function Test-VouchConfigNumber {
 }
 
 function Add-VouchConfigProblem {
+    <#
+        One place that builds a problem record { Path; Message }, so errors and warnings
+        have the same shape everywhere: the console listing and the Designer both show
+        the path next to the message and must not have to guess the format.
+    #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$List,
         [Parameter(Mandatory)][AllowEmptyString()][string]$Path,
@@ -850,7 +867,11 @@ function Get-VouchPageId {
 }
 
 function Get-VouchActionType {
-    # The action type in the spelling the schema uses, or '' when it is not one.
+    <#
+        The action type in the spelling the schema uses, or '' when it is not one. People
+        write "clicktext" or "ClickText" by hand; -eq ignores case, and every later
+        comparison can then use the one canonical spelling.
+    #>
     param([AllowNull()][object]$Type)
     if ($Type -isnot [string]) { return '' }
     foreach ($known in (Get-VouchActionSchema).Keys) {
@@ -860,6 +881,13 @@ function Get-VouchActionType {
 }
 
 function Test-VouchPageAction {
+    <#
+        Checks one page action. The type decides which keys are allowed, so the type is
+        checked first and the rest only when it is known: an unknown type would otherwise
+        produce a warning for every key it has, burying the one real mistake. Required
+        values and the "area needs a selector" rule are checked here because the schema
+        alone cannot express them.
+    #>
     param(
         [AllowNull()][object]$Action,
         [Parameter(Mandatory)][string]$Path,
@@ -902,6 +930,12 @@ function Test-VouchPageAction {
 }
 
 function Test-VouchConfigPageList {
+    <#
+        Checks the page list. Pages need rules the generic object check cannot express:
+        name and url are required, the url must be http(s), ids must be unique (compared
+        without regard to capitals, including the p001... ids given to pages without one,
+        because -Only matches that way), and actions is a list of objects of several kinds.
+    #>
     param(
         [AllowNull()][object]$Pages,
         [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Errors,
@@ -993,8 +1027,13 @@ function Test-VouchConfig {
 }
 
 function Complete-VouchConfigNode {
-    # Fills missing or null keys from the defaults and writes enum values in the
-    # schema's spelling ("PNG" -> "png"). Only for a node that passed validation.
+    <#
+        Fills missing or null keys from the defaults and writes enum values in the
+        schema's spelling ("PNG" -> "png"). Only for a node that passed validation.
+        Blank text counts as missing when the default is not blank: "dir": "" and no
+        "dir" must send the report to the same folder, and a blank report title must not
+        print an empty heading. (Resolve-RunSettings already treats blank as "default".)
+    #>
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Node,
         [Parameter(Mandatory)][System.Collections.IDictionary]$Keys
@@ -1009,7 +1048,8 @@ function Complete-VouchConfigNode {
         elseif ($spec.Type -eq 'pages') {
             if ($null -eq $value) { $Node[$key] = [System.Collections.Generic.List[object]]::new() }
         }
-        elseif ($null -eq $value) {
+        elseif ($null -eq $value -or ($value -is [string] -and [string]::IsNullOrWhiteSpace($value) -and
+                $spec.Contains('Default') -and -not [string]::IsNullOrWhiteSpace([string]$spec.Default))) {
             if ($spec.Contains('Default')) { $Node[$key] = $spec.Default }
         }
         elseif ($spec.Type -eq 'enum') {
@@ -1074,7 +1114,7 @@ function Import-VouchConfig {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "Configuration file not found: $Path`nCreate one from captures.sample.json, or pass -CsvPath instead."
     }
-    $fullPath = (Resolve-Path -LiteralPath $Path).Path
+    $fullPath = (Resolve-Path -LiteralPath $Path).ProviderPath
     try {
         $config = ConvertFrom-VouchJson -Text ([System.IO.File]::ReadAllText($fullPath))
     }
@@ -1172,7 +1212,12 @@ function ConvertTo-NormalizedActionList {
 }
 
 function ConvertTo-LegacyStepText {
-    # One action as the CSV-style text the report's steps column and step log show.
+    <#
+        One action as the CSV-style text the report's steps column and step log show
+        ("clicktext:Audit Log", "wait:2.5"). The report predates configuration files and
+        auditors already read this notation, so every action kind gets a text in it.
+        Numbers use the invariant culture: wait:2,5 on a German PC would not read back.
+    #>
     param([Parameter(Mandatory)][System.Collections.IDictionary]$Action)
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
     switch ($Action['type']) {
@@ -3590,7 +3635,7 @@ function Get-RunLogDirectory {
     if ($null -ne $BoundParameters -and @($BoundParameters.Keys) -contains 'LogDir') { return $LogDir }
     if ([string]::IsNullOrWhiteSpace($ConfigPath)) { return $LogDir }
     try {
-        $fullPath = (Resolve-Path -LiteralPath $ConfigPath -ErrorAction Stop).Path
+        $fullPath = (Resolve-Path -LiteralPath $ConfigPath -ErrorAction Stop).ProviderPath
         $config = ConvertFrom-VouchJson -Text ([System.IO.File]::ReadAllText($fullPath))
         $fromConfig = Get-ConfigValue -Config $config -Section 'output' -Key 'logDir'
         if ($fromConfig.Found -and $fromConfig.Value -is [string]) {
@@ -3941,7 +3986,7 @@ function Invoke-Main {
     }
 
     if ($null -ne $config) {
-        $sourcePath = (Resolve-Path -LiteralPath $settings.ConfigPath).Path
+        $sourcePath = (Resolve-Path -LiteralPath $settings.ConfigPath).ProviderPath
         $allDefinitions = [System.Collections.Generic.List[object]]::new()
         foreach ($page in $config['pages']) {
             $allDefinitions.Add((ConvertTo-CaptureDefinition -Page $page -Index ($allDefinitions.Count + 1)))
