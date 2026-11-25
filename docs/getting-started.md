@@ -387,6 +387,10 @@ The **Output** tab holds the settings for the whole run.
 - **Capture on a separate, empty virtual desktop** — Vouch opens an empty Windows desktop
   for the run and closes it again at the end, so other programs do not appear in the
   taskbar of the screenshots. Your windows are untouched. Pinned taskbar icons still show.
+  For a full run started from the Designer, the Designer closes the audit browser it
+  opened, the run opens its own on the new desktop, and the Designer connects again
+  afterwards — this way of running has not yet been tried on a real screen, so check the
+  first such report.
 
 **Logs and results**
 
@@ -394,7 +398,8 @@ The **Output** tab holds the settings for the whole run.
   [step 1](#1-what-vouch-does-and-what-you-get). On by default; it also goes into the zip.
 - **Write a JSON summary** — the results as a `.json` file for monitoring tools.
 - **Count warnings as failure** — a run with warnings then counts as not passed (exit
-  code 3), so a scheduled task shows it as failed. Without it, warnings count as success.
+  code 3). Without it, warnings count as success. Scheduled runs always count warnings
+  as failure (see [step 18](#18-run-it-on-a-schedule-optional)).
 - **Console transcript folder (optional)** — a raw copy of everything the Vouch console
   shows, for troubleshooting scheduled runs. This is not the capture log.
 
@@ -537,7 +542,8 @@ its `images` folder next to it.
 
 **What a successful check proves:**
 
-- the report contains only what Vouch itself writes, in the way Vouch writes it;
+- the report's layout, styling and pictures are only what Vouch itself writes, in the way
+  Vouch writes them (its words are not covered — see below);
 - every picture the report shows is a screenshot whose fingerprint matches the one
   printed for it, shown under the page it belongs to — or the one small company logo;
 - the capture time and address stored inside each picture match the report;
@@ -556,13 +562,15 @@ its `images` folder next to it.
   pictures and new fingerprints gets a report that passes. **Only the manifest hash you
   wrote down at the time shows that a report is the original.** If it matches the one in
   the report and the check passes, the pictures are exactly those taken.
-- anything about the **logo**: it is not checked (it can only appear small, at the top).
+- anything about the **logo**: it is not checked, so a small logo (up to 220 × 64
+  pixels, at the top) can be added or exchanged without the check noticing.
 - anything about the capture log, the JSON summary or the zip.
 
-**A report edited by hand usually stops verifying, even if the edit was honest** — for
-example a paragraph added, or the file saved again by a program that changes its layout
-or its text encoding. Keep the report as Vouch made it, and put your comments in the
-workpaper instead.
+**Which hand edits stop a report verifying:** changes to its structure, even honest ones —
+a paragraph or comment added, the file saved again by a program that changes its layout
+or its text encoding, changed styling, or any change to a picture. **Changing words does
+not** (see *What it does not prove*). Keep the report as Vouch made it, and put your
+comments in the workpaper instead.
 
 ## 17. Run without the Designer
 
@@ -634,11 +642,14 @@ In the same PowerShell window, from the Vouch folder:
 
 If you change the configuration later, just save it: the task runs the file as it is at
 that time. (The output folder of a task is read from the file too, unless you typed
-`-OutputDir` when setting it up.)
+`-OutputDir` when setting it up.) **If you change the output folder, run the Schedule it
+command again**: the folder for the console transcripts (`logs` inside the output
+folder) is fixed when the task is set up, and `-Status` looks there.
 
-**Warnings in scheduled runs:** a scheduled task reports a run with warnings as a
-success unless **Count warnings as failure** is on in the Output tab. Turn it on if you
-want an expired login to show up as a failed task (*Last Run Result 0x3*).
+**Warnings in scheduled runs:** scheduled runs always count warnings as failure,
+whatever the file's **Count warnings as failure** setting says, so an expired login shows
+up as a failed task (*Last Run Result 0x3*), never as a success. To allow warnings, add
+`-AllowWarnings` to the Schedule it command.
 
 **Keeping the screen from locking at the scheduled time** (if you use a set time rather
 than *AtLogOn*): open **Settings** → **System** → **Power** (Windows 11: **Power &
@@ -648,8 +659,10 @@ scheduled time; if your organisation locks screens automatically, use *AtLogOn*.
 ## 19. When a page needs more time or your input
 
 In a run **you** started (from the Designer or a PowerShell window), Vouch can stop and
-ask you in the **Vouch dialog**, a small window that appears at the bottom right, above
-the audit browser. It does so:
+ask you in the **Vouch dialog**, a small window that Vouch places at the bottom right of
+the screen, in front of the audit browser. (Its placement and focus have not yet been
+checked on every real screen; if you do not see it, look for *Vouch* on the taskbar.) It
+does so:
 
 - at a **pause** step (window title *Vouch - Vouch is paused*), with your message;
 - when a page is **not ready** in time (*Vouch - The page is not ready*) — only if *When
@@ -696,25 +709,23 @@ often its own address.
 
 **While you pick:**
 
-- The page's own buttons, links and fields do not act on your clicks or keys. But **a
-  page that watches every click or key anywhere** ("click anywhere to close", its own
-  keyboard shortcuts) may still react.
-- **Keys:** Esc cancels; the arrow keys, Page Up/Down, Home/End and Space scroll; other
-  keys do not reach the page's buttons, links and fields. The browser's own shortcuts
-  (F5, Ctrl+F, zoom) still work — F5 really reloads the page. To work with the keyboard
-  instead, cancel and type the words or the selector in the Designer.
-- A page's **Alt + letter** shortcuts cannot be switched off; Vouch refuses such a pick
-  and says so.
-- **Typing that does not come from plain keys** — an input method for Chinese, Japanese
-  or Korean, the emoji panel (Win + .), clipboard history (Win + V), voice typing — is
-  held back where possible; if a field in the page starts to change anyway, picking
-  stops and says so. Check that field afterwards.
-- Starting a pick takes the keyboard focus away from the page; click where you want to
-  continue afterwards.
-- Most menus stay open while you point. A menu built as a sealed page component closes
-  when you click.
+- **Esc** (in the browser) or **Cancel picking** stops; the arrow keys, Page Up/Down and
+  Space scroll the page. To work with the keyboard instead, cancel and type the words or
+  the selector in the Designer.
+- The page's own buttons, links and fields do not act on your click. But a page that
+  watches **every** click or key anywhere ("click anywhere to close", its own keyboard
+  shortcuts) may still react, and your click counts as you using the page, which pages
+  can use to play sound, open pop-ups or go full screen.
 - If the page reloads by itself during a pick, your clicks do nothing for a moment until
-  Vouch's layer is back.
+  Vouch's layer is back — **except inside a part of the page from another website**,
+  where a click acts normally during that moment.
+- Vouch stops picking, and says why, rather than go on unprotected: when the page keeps
+  removing Vouch's layer, or when a field in the page starts to change (for example
+  while you type with an input method or the emoji panel). Check such a field, then pick
+  again or type the selector.
+
+More detail is in the README, under
+[What the picker cannot do](../README.md#what-the-picker-cannot-do).
 
 **Other limits:**
 
@@ -747,7 +758,7 @@ A CSV run in this version also writes, compared with earlier versions:
 The columns of a CSV file are **Name**, **Url**, **Steps** (optional:
 `clicktext:Words`, `wait:3`, `click:#selector`, separated by `;`), **ScrollFullPage**
 (`Y`/`N`) and **Notes** (optional). `captures.template.csv` has an example row for each
-common situation. The same examples, ready to paste into Notepad (keep the first line
+common situation. Examples like these, ready to paste into Notepad (keep the first line
 only once, at the top of your file):
 
 ```
@@ -764,9 +775,8 @@ Page reached through a menu,https://portal.example.com/,clicktext:Administration
 ```
 
 If Excel saves your CSV with semicolons instead of commas (Windows set to use commas for
-decimals), Vouch says the *Url column is missing*: open the file in Notepad, check the
-columns are separated by commas, and save it there — or import it into the Designer and
-work with the configuration file instead.
+decimals), Vouch stops with *"The CSV '…' is missing the required 'Name' column"*. Open
+the file in Notepad, check that the columns are separated by commas, and save it there.
 
 ---
 
@@ -809,9 +819,9 @@ stopped — it was closed, or the computer slept. Changes you did not save are l
 the Designer window and start `Vouch-Designer.cmd` again; your saved file is safe.
 
 If you close the **console window** with its **X**, the Designer stops at once, but its
-window stays open, showing that message: close it too. An audit browser window that stays
-open after that can be closed as well. (Click **Close** in the Designer next time; that
-stops everything cleanly.)
+window stays open, showing that message: close it too. **Close the audit browser
+window as well**: it is left running with its remote-control connection open. (Click
+**Close** in the Designer next time; that stops everything cleanly.)
 
 ### Problems in a run
 

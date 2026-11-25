@@ -23,9 +23,9 @@
       - keeps a console transcript of every run (the window is not visible): in the
         configuration's own log folder when it names one, otherwise in a "logs" folder
         inside the output folder
-      - CSV: passes -FailOnWarning, so an expired login shows up as Last Run Result 0x3
-        (-AllowWarnings turns that off). Configuration file: the file decides
-        ("Count warnings as failure" in the Designer), unless -AllowWarnings is given.
+      - passes -FailOnWarning, so an expired login shows up as Last Run Result 0x3
+        instead of a success - for a configuration file too, whatever its "Count
+        warnings as failure" setting says. -AllowWarnings turns that off.
       - starts a missed run as soon as possible and never runs twice at once
 
     With -ConfigPath, the file is checked first with the same checks vouch.ps1 makes;
@@ -33,10 +33,10 @@
     run (open the report when done, asking when a page is not ready, pause actions) are
     pointed out, with what the scheduled run does instead.
 
-    -OutputDir, -EdgeProfileDir, -ImageFormat, -SaveImages, -AllowWarnings,
-    -UseVirtualDesktop and -DebugPort: with -ConfigPath they are passed on only when you
-    type them, and then beat the same setting in the file; without them the file
-    decides. With a CSV file they work as before.
+    -OutputDir, -EdgeProfileDir, -ImageFormat, -SaveImages, -UseVirtualDesktop and
+    -DebugPort: with -ConfigPath they are passed on only when you type them, and then
+    beat the same setting in the file; without them the file decides. With a CSV file
+    they work as before.
 
     Re-running the install replaces the existing task with the new settings.
 
@@ -56,7 +56,8 @@
     Time of day for Weekdays/Daily/Weekly, e.g. 07:30.
 
 .PARAMETER AllowWarnings
-    Do not count warnings as failure: runs with warnings then report success (0).
+    Do not count warnings as failure: runs with warnings then report success (0). Without
+    it every scheduled run - CSV or configuration file - counts warnings as failure (3).
 
 .PARAMETER Status
     Show the task, its next and last run, the file it runs, where its reports go, and
@@ -187,10 +188,13 @@ function Get-VouchTaskArguments {
         The argument string the task stores. -NoPrompt is always there: a scheduled run
         must never show a dialog or wait for an answer (pwsh's -NonInteractive already
         keeps the Vouch dialog away; -NoPrompt says so to the engine directly).
-        CSV schedules: the installer's own settings, as always (-FailOnWarning unless
-        warnings are allowed). Configuration schedules: only -ConfigPath, plus the
-        settings in -Override, which hold exactly the installer parameters that were
-        typed: a setting not typed is left to the file. A typed switch is passed with its
+        CSV schedules: the installer's own settings, as always. Configuration schedules:
+        only -ConfigPath, plus the settings in -Override, which hold exactly the installer
+        parameters that were typed: a setting not typed is left to the file. Both count
+        warnings as failure (-FailOnWarning) unless warnings are allowed: an expired
+        sign-in in an unattended evidence run must never show as a success in Task
+        Scheduler, so this scheduler rule beats the file's output.failOnWarning (allowed:
+        -FailOnWarning:$false, which beats an "on" in the file the other way round). A typed switch is passed with its
         value (-SaveImages:$false), so "off" beats an "on" in the file too.
         -JsonSummary always; -LogDir only when given (a configuration that names its
         own log folder keeps it).
@@ -221,8 +225,9 @@ function Get-VouchTaskArguments {
         if ($Override.Contains('OutputDir')) { $arguments.Add('-OutputDir'); $arguments.Add((ConvertTo-TaskArgument -Value ([string]$Override['OutputDir']))) }
         if ($Override.Contains('ImageFormat')) { $arguments.Add('-ImageFormat'); $arguments.Add([string]$Override['ImageFormat']) }
         if ($Override.Contains('SaveImages')) { $arguments.Add((& $switchValue 'SaveImages' ([bool]$Override['SaveImages']))) }
-        # -AllowWarnings is the opposite of the engine's -FailOnWarning.
-        if ($Override.Contains('AllowWarnings')) { $arguments.Add((& $switchValue 'FailOnWarning' (-not [bool]$Override['AllowWarnings']))) }
+        # -AllowWarnings is the opposite of the engine's -FailOnWarning; without it, always on.
+        $allow = $Override.Contains('AllowWarnings') -and [bool]$Override['AllowWarnings']
+        $arguments.Add((& $switchValue 'FailOnWarning' (-not $allow)))
         if ($Override.Contains('EdgeProfileDir')) { $arguments.Add('-EdgeProfileDir'); $arguments.Add((ConvertTo-TaskArgument -Value ([string]$Override['EdgeProfileDir']))) }
         if ($Override.Contains('DebugPort') -and [int]$Override['DebugPort'] -gt 0) { $arguments.Add('-DebugPort'); $arguments.Add([string][int]$Override['DebugPort']) }
         if ($Override.Contains('UseVirtualDesktop')) { $arguments.Add((& $switchValue 'UseVirtualDesktop' ([bool]$Override['UseVirtualDesktop']))) }
@@ -387,9 +392,12 @@ function Get-VouchScheduleSetup {
         $profilePath = if ($override.Contains('EdgeProfileDir')) { $override['EdgeProfileDir'] } elseif ($loaded['browser']['profileDir']) { [string]$loaded['browser']['profileDir'] } else { $defaultProfileDir }
 
         foreach ($concern in (Get-VouchScheduleConcern -Config $loaded)) { $concerns.Add($concern) }
-        $failOnWarning = if ($override.Contains('AllowWarnings')) { -not $override['AllowWarnings'] } else { [bool]$loaded['output']['failOnWarning'] }
-        if (-not $failOnWarning) {
-            $notes.Add('Warnings count as success: a run whose pages only have warnings (often an expired sign-in) shows as a success in Task Scheduler. To see them as result 3, switch on "Count warnings as failure" in the Designer''s Output tab and save.')
+        # Scheduler policy: warnings count as failure unless -AllowWarnings (whatever the file says).
+        if ($override.Contains('AllowWarnings') -and $override['AllowWarnings']) {
+            $notes.Add('Warnings count as success (-AllowWarnings): a run whose pages only have warnings (often an expired sign-in) shows as a success in Task Scheduler.')
+        }
+        elseif (-not [bool]$loaded['output']['failOnWarning']) {
+            $notes.Add('Scheduled runs count warnings as failure (Last Run Result 0x3), although "Count warnings as failure" is off in the file, so an expired sign-in never shows as a success. Add -AllowWarnings to allow warnings.')
         }
         $arguments = Get-VouchTaskArguments -ScriptPath $vouchScript -LogDir $passLog -ConfigPath $configFile -Override $override
         $kind = 'config'

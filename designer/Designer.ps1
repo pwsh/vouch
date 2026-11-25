@@ -1518,7 +1518,7 @@ function Get-VouchCommandLine {
     # Only a command to copy: the Designer never sets up a scheduled task itself.
     $schedule = "$head $(& $ps $installer) -ConfigPath $(& $ps $configFull) -Schedule AtLogOn"
     $scheduleCmd = if ($cmdSafe) { "$head $(& $cmd $installer) -ConfigPath $(& $cmd $configFull) -Schedule AtLogOn" } else { '' }
-    $scheduleNote = 'Paste into a PowerShell window to set up a Windows scheduled task that runs the saved file 3 minutes after you sign in, without asking anything. It checks the file first and sets up nothing if the file has problems. For a set time instead, replace -Schedule AtLogOn with -At 07:30 (every weekday at 07:30). The Designer itself does not set up the task.'
+    $scheduleNote = 'Paste into a PowerShell window to set up a Windows scheduled task that runs the saved file 3 minutes after you sign in, without asking anything. It checks the file first and sets up nothing if the file has problems. Scheduled runs count warnings as failure, whatever the file says, so an expired sign-in never shows as a success; add -AllowWarnings to allow warnings. For a set time instead, replace -Schedule AtLogOn with -At 07:30 (every weekday at 07:30). The Designer itself does not set up the task.'
 
     return [pscustomobject]@{
         Run            = $run
@@ -1739,6 +1739,41 @@ function Start-DesignerPanel {
     return $process
 }
 
+function Test-DesignerProcessExited {
+    <#
+        Whether a process has ended. Process.HasExited is read as a METHOD (get_HasExited):
+        PowerShell hides an exception thrown by a property read, so .HasExited on a handle
+        that cannot be read just gives $null - which must not count as an answer. Then
+        the process id is looked up: no process, or one that started at another time
+        (-StartTime, a reused id), means ended. When nothing can tell, -Unknown is the
+        answer: each caller decides which way is safe for it.
+    #>
+    param(
+        [AllowNull()][object]$Process,
+        [int]$ProcessId = 0,
+        [datetime]$StartTime = [datetime]::MinValue,
+        [bool]$Unknown = $false
+    )
+    if ($null -eq $Process -and $ProcessId -le 0) { return $true }
+    if ($null -ne $Process) {
+        try {
+            $value = $Process.get_HasExited()
+            if ($value -is [bool]) { return $value }
+        }
+        catch { Write-Verbose "Whether the process has ended could not be read directly: $($_.Exception.Message)" }
+        if ($ProcessId -le 0) { try { $ProcessId = [int]$Process.get_Id() } catch { $ProcessId = 0 } }
+    }
+    if ($ProcessId -le 0) { return $Unknown }
+    try {
+        $found = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if ($null -eq $found) { return $true }
+        if ($StartTime -ne [datetime]::MinValue -and $found.StartTime -ne $StartTime) { return $true }
+        return $false
+    }
+    catch { Write-Verbose "Whether the process has ended could not be told: $($_.Exception.Message)" }
+    return $Unknown
+}
+
 function Stop-DesignerPanel {
     <#
         Closes the panel window the way a person would (WM_CLOSE), so Edge does not offer
@@ -1747,7 +1782,7 @@ function Stop-DesignerPanel {
     param([AllowNull()][System.Diagnostics.Process]$Process)
     if ($null -eq $Process) { return }
     try {
-        if ($Process.HasExited) { return }
+        if (Test-DesignerProcessExited -Process $Process) { return }
         [void]$Process.CloseMainWindow()
         if (-not $Process.WaitForExit(3000)) { $Process.Kill($true) }
     }
@@ -3579,8 +3614,8 @@ function Invoke-DesignerTick {
     param([Parameter(Mandatory)][object]$State)
     $panel = $State.PanelProcess
     if ($null -ne $panel) {
-        $gone = $true
-        try { $gone = $panel.HasExited } catch { $gone = $true }
+        # Cannot tell counts as closed, as before: the server must not outlive its window.
+        $gone = Test-DesignerProcessExited -Process $panel -Unknown $true
         if ($gone) {
             # A launcher that handed over to another Edge exits at once; look for the browser.
             $replacement = $null

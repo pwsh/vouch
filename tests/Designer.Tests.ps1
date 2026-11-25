@@ -1482,6 +1482,32 @@ return out;
 }
 
 Describe 'Designer mode in vouch.ps1 and the panel window' {
+    It 'tells whether a process has ended without trusting a hidden property error, and stops with a panel it cannot read' {
+        # A Process object tied to no process: reading .HasExited gives $null in PowerShell.
+        Test-DesignerProcessExited -Process ([System.Diagnostics.Process]::new()) | Should -BeFalse
+        Test-DesignerProcessExited -Process ([System.Diagnostics.Process]::new()) -Unknown $true | Should -BeTrue
+        $self = Get-Process -Id $PID
+        Test-DesignerProcessExited -Process $self | Should -BeFalse
+        Test-DesignerProcessExited -Process ([System.Diagnostics.Process]::new()) -ProcessId $PID -Unknown $true | Should -BeFalse
+        Test-DesignerProcessExited -Process ([System.Diagnostics.Process]::new()) -ProcessId $PID -StartTime $self.StartTime.AddMinutes(-5) | Should -BeTrue
+        $ended = Start-Process -FilePath $self.Path -ArgumentList '-NoProfile', '-Command', 'exit' -WindowStyle Hidden -PassThru
+        $ended.WaitForExit()
+        Test-DesignerProcessExited -Process $ended | Should -BeTrue
+        # The tick: a panel whose state cannot be read counts as closed, so the server stops with it.
+        $state = New-TestState
+        $state.PanelProcess = [System.Diagnostics.Process]::new()
+        $state.PanelStartedAt = (Get-Date).AddMinutes(-1)
+        $state.Running = $true
+        Invoke-DesignerTick -State $state
+        $state.Running | Should -BeFalse
+        $state.StopReason | Should -Be 'The Designer window was closed.'
+        # A living panel keeps it running.
+        $state.Running = $true
+        $state.PanelProcess = $self
+        Invoke-DesignerTick -State $state
+        $state.Running | Should -BeTrue
+    }
+
     It 'says plainly that the designer folder is missing, and writes no events or logs' {
         $alone = Join-Path $TestDrive 'alone'
         [void](New-Item -ItemType Directory -Path $alone -Force)
@@ -3850,10 +3876,8 @@ Describe 'Runs with a stand-in child process (the run state machine)' -Tag 'Inte
         Test-DesignerRunActive -State $state | Should -BeFalse
         $data.state | Should -Be 'done'
         ($data.notes -join ' ') | Should -Match 'could not finish reading'
-        # The outcome says plainly that the page was captured but there is nothing to see here.
-        $data.message | Should -Match '^Test finished: the page was captured, but its preview cannot be shown here \(The preview could not be registered\.\)\.$'
-        $data.message | Should -Not -Match 'without problems'
-        $data.nextStep | Should -Match 'Open the preview report'
+        # A test with warnings keeps its own outcome, with the preview sentence added.
+        $data.message | Should -Match '^Test finished: this page was captured, with warnings\..* Its preview cannot be shown here \(The preview could not be registered\.\)\.$'
         $data.open['preview-report'] | Should -BeTrue
         Should -Invoke Connect-DesignerBrowser -Times 1 -Exactly
         $state.Browser.Connected | Should -BeTrue
@@ -3866,6 +3890,33 @@ Describe 'Runs with a stand-in child process (the run state machine)' -Tag 'Inte
         $data.state | Should -Be 'failed'
         $data.message | Should -Match 'could not read its result'
         Should -Invoke Connect-DesignerBrowser -Times 2 -Exactly
+    }
+
+    It 'says plainly that a clean page test was captured but its preview cannot be shown' {
+        $state = New-RunTestState 'preview-fails-clean'
+        Mock Register-DesignerPreview { throw 'The preview could not be registered.' }
+        $run = Start-TestRun $state 'clean' -Kind page -PageId 'p001'
+        $script:Started.Add($run)
+        $data = Wait-TestRun $state
+        $data.state | Should -Be 'done'
+        $data.exitCode | Should -Be 0
+        $data.message | Should -Be 'Test finished: the page was captured, but its preview cannot be shown here (The preview could not be registered.).'
+        $data.message | Should -Not -Match 'without problems'
+        $data.nextStep | Should -Match 'Open the preview report'
+    }
+
+    It 'keeps a failed page test''s own outcome when its preview cannot be shown, and adds that' {
+        $state = New-RunTestState 'preview-fails-failpage'
+        Mock Register-DesignerPreview { throw 'The preview could not be registered.' }
+        $run = Start-TestRun $state 'failpage' -Kind page -PageId 'p001'
+        $script:Started.Add($run)
+        $data = Wait-TestRun $state
+        $data.state | Should -Be 'done'
+        $data.exitCode | Should -Be 2
+        $data.message | Should -Match '^Test finished, but the page failed'
+        $data.message | Should -Match 'Its preview cannot be shown here \(The preview could not be registered\.\)\.$'
+        $data.message | Should -Not -Match 'the page was captured, but'
+        $data.nextStep | Should -Match '^Fix the page'
     }
 
     It 'skips a turn whose reading of the progress fails, and reads it all at the next turns' {

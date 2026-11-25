@@ -123,7 +123,7 @@ switch ($scenario) {
                 $status = 'FAILED'; $details = @('The page could not be loaded: net::ERR_NAME_NOT_RESOLVED')
                 Write-FakeEvent 'detail' ([ordered]@{ pageId = $id; pageIndex = $i; status = 'FAILED'; text = $details[0] })
             }
-            elseif ($i -eq 2) {
+            elseif ($i -eq 2 -and $scenario -ne 'clean') {
                 $status = 'WARNING'; $details = @('Page truncated at 3 segments (raise -MaxScrollSegments to capture more).')
                 Write-FakeEvent 'detail' ([ordered]@{ pageId = $id; pageIndex = $i; status = 'WARNING'; text = $details[0] })
             }

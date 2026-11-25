@@ -507,21 +507,9 @@ function Test-DesignerChildExited {
     #>
     param([Parameter(Mandatory)][object]$Run)
     if ($null -eq $Run.Process) { return $true }
-    # The getter is called as a method: PowerShell hides an exception thrown by a property
-    # read (.HasExited would just give $null, which must not count as an answer either).
-    try {
-        $value = $Run.Process.get_HasExited()
-        if ($value -is [bool]) { return $value }
-    }
-    catch { Write-Verbose "Whether the run has ended could not be read directly: $($_.Exception.Message)" }
-    if ($Run.ProcessId -le 0) { return $false }
-    try {
-        $process = Get-Process -Id $Run.ProcessId -ErrorAction SilentlyContinue
-        if ($null -eq $process) { return $true }
-        if ($Run.ProcessStartTime -ne [datetime]::MinValue -and $process.StartTime -ne $Run.ProcessStartTime) { return $true }
-    }
-    catch { Write-Verbose "Whether the run has ended could not be told: $($_.Exception.Message)" }
-    return $false
+    # Test-DesignerProcessExited (Designer.ps1) reads HasExited as a method: PowerShell hides
+    # an exception from a property read (.HasExited would just give $null).
+    return Test-DesignerProcessExited -Process $Run.Process -ProcessId $Run.ProcessId -StartTime $Run.ProcessStartTime -Unknown $false
 }
 
 function Stop-DesignerBrowserForRun {
@@ -943,7 +931,7 @@ function Get-DesignerRunNextStep {
         }
         3 {
             if ($test) { return 'Look at the warnings below. If they are acceptable, "Count warnings as failure" (Output tab) can be switched off.' }
-            return 'Open the report and look at the warnings. If they are acceptable, switch off "Count warnings as failure" (Output tab), or keep it on so scheduled runs report them.'
+            return 'Open the report and look at the warnings. If they are acceptable, switch off "Count warnings as failure" (Output tab).'
         }
     }
     return ''
@@ -1045,8 +1033,14 @@ function Complete-DesignerRun {
                 $problem = [string]$_.Exception.Message
                 $run.Notes.Add("The Designer could not finish reading this run's result ($problem).")
                 if ($run.State -eq 'done') {
-                    $run.Message = "Test finished: the page was captured, but its preview cannot be shown here ($problem)."
-                    $run.NextStep = if ($State.OpenTargets.Contains('preview-report')) { 'Press "Open the preview report" to see the images in your browser, or test the page again.' } else { 'Test the page again. If the preview still does not appear, use Run all pages and look at this page in the report.' }
+                    # A clean test says so in one sentence; a test with warnings or a failed page
+                    # keeps its own outcome (and next step), with the preview sentence added.
+                    $clean = $run.ExitCode -eq 0 -and -not ($null -ne $run.Counts -and $run.Counts['warning'] -gt 0)
+                    if ($clean) { $run.Message = "Test finished: the page was captured, but its preview cannot be shown here ($problem)." }
+                    else { $run.Message = "$($run.Message) Its preview cannot be shown here ($problem)." }
+                    if ($clean -or -not $run.NextStep) {
+                        $run.NextStep = if ($State.OpenTargets.Contains('preview-report')) { 'Press "Open the preview report" to see the images in your browser, or test the page again.' } else { 'Test the page again. If the preview still does not appear, use Run all pages and look at this page in the report.' }
+                    }
                 }
             }
         }

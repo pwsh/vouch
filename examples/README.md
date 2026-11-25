@@ -37,8 +37,9 @@ Check that nothing has changed since the run:
 ```
 
 It should report `VERIFIED: 71 check(s) passed` (23 image hashes, 23 metadata checks,
-23 saved files, the manifest and SHA256SUMS). Edit anything — an image, a hash, a capture
-time — and it fails.
+23 saved files, the manifest and SHA256SUMS). Change, swap or remove a picture and it
+fails. Words in the report are not covered: see
+[what -Verify proves](../README.md#-verify-what-it-checks-and-what-it-proves).
 
 The run recorded the computer name and Windows user of the machine that made it, as
 every Vouch report does.

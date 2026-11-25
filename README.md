@@ -333,7 +333,7 @@ configuration file are named in brackets.
 | `-OutputDir <folder>` | see below | Output folder. |
 | `-ImageFormat jpeg\|png` | see below | Image format. |
 | `-SaveImages` | see below | Save image files. |
-| `-AllowWarnings` | see below | Warnings count as success. |
+| `-AllowWarnings` | off | Warnings count as success. Without it every scheduled run passes `-FailOnWarning` (exit 3 on warnings), CSV or configuration file alike, whatever `output.failOnWarning` says. |
 | `-UseVirtualDesktop` | see below | Separate virtual desktop. |
 | `-EdgeProfileDir <folder>` | see below | Audit profile (for a second schedule with other accounts). |
 | `-DebugPort <port>` | see below | Debugging port (for a second schedule on the same machine). |
@@ -343,12 +343,14 @@ configuration file are named in brackets.
 | `-RunNow` | | Start the task now. |
 | `-Uninstall` | | Remove the task (reports, logs and the audit profile are kept). |
 
-**With `-ConfigPath`** the seven settings marked "see below" are **overrides**: passed to
+**With `-ConfigPath`** the six settings marked "see below" are **overrides**: passed to
 `vouch.ps1` only when you type them (with their value, so `-SaveImages:$false` beats
-`true` in the file), and then they beat the file. Not typed, the file decides —
-including `output.failOnWarning`. **With a CSV** they work as in 1.x: `-OutputDir`
-defaults to `reports` next to the script, `-FailOnWarning` is passed unless
-`-AllowWarnings`.
+`true` in the file), and then they beat the file. Not typed, the file decides. **With a
+CSV** they work as in 1.x (`-OutputDir` defaults to `reports` next to the script).
+**Warnings** are scheduler policy for both: the task passes `-FailOnWarning` unless
+`-AllowWarnings` is given (then `-FailOnWarning:$false` for a configuration file), so an
+expired sign-in in an unattended run never shows as a success, whatever the file's
+`output.failOnWarning` says.
 
 ## Exit codes
 
@@ -461,7 +463,7 @@ PowerShell 7 (no browser). It prints one line per check (`OK` / `FAIL`), then
 `VERIFIED: <n> check(s) passed.` (exit 0) or `NOT VERIFIED: <x> of <n> check(s) failed.`
 (exit 4).
 
-**What is checked.** The report must be exactly what Vouch writes: plain UTF-8 without a
+**What is checked.** The report's structure must be exactly what Vouch writes: plain UTF-8 without a
 byte order mark; only the elements, attributes, values and character references Vouch
 writes, each where Vouch puts it; one of the style sheets released Vouch versions
 produce, and the document built as the kind of report that style sheet belongs to (with
@@ -481,17 +483,21 @@ the images folder is present, every file in `SHA256SUMS` is unchanged (`SHA256SU
 unaltered: headings, status badges, details, URLs and names shown as text, notes, run
 details and even the printed hashes can be edited consistently; the classification can
 be switched to another level by a careful edit; a page that has no screenshot can be
-removed altogether. The logo (stored inside the report) is not hash-checked; it can only
+removed altogether. The logo (stored inside the report) is not hash-checked: **a logo of
+up to 220 × 64 pixels can be added or exchanged without `-Verify` noticing**. It can only
 stand in the company header at the top and is shown at most 220 × 64 pixels (a report
 without report options has no header and no logo). A report rebuilt from scratch with
 new images and new hashes verifies; **only a manifest hash recorded elsewhere at capture
 time shows that a report is the original.** `-Verify` says nothing about the capture
 log, the JSON summary or the zip.
 
-**Hand-edited reports.** Because the check is strict, a report edited by hand — a
-paragraph added, a file re-saved by an editor that reformats it or adds a byte order
-mark — no longer verifies, even when the edit was honest. Reports made by Vouch 1.2,
-1.3 and 2.0 verify (the committed example was made by 1.2).
+**Hand-edited reports.** A *structural* edit stops a report verifying, even when it was
+honest: an element or attribute Vouch does not write (a paragraph or comment added), a
+re-save that changes the layout or the text encoding (a byte order mark, another
+encoding), altered styling, or any change to a picture. A *consistent text* edit does
+**not**: changed words, a status badge changed from OK to FAILED, an edited URL or note
+still verify (see above). Reports made by Vouch 1.2, 1.3 and 2.0 verify (the committed
+example was made by 1.2).
 
 ## Capture areas and zoom
 
@@ -600,6 +606,8 @@ robust*, *Robust*, *Less robust*, *Fragile*. Limits:
   (the pick is refused).
 - Keys: Esc cancels; scroll keys scroll; browser shortcuts still work (F5 reloads). An
   IME composition or the page changing a field by itself ends the pick with a message.
+- Vouch ends the pick rather than go on unprotected when the page keeps removing its
+  layer, or keeps the keyboard focus inside a frame Vouch cannot listen in.
 - Menus in closed shadow roots, sub-menus opened only by script before the pick, and
   unrelated tooltips may close when you click.
 - A page that reloads during a pick is shielded until the layer is back (not inside
@@ -628,7 +636,10 @@ needed. The Designer's **Schedule it** box shows the command for the saved file.
 What the task does: it runs PowerShell 7 hidden (`-NoProfile -NonInteractive
 -ExecutionPolicy Bypass`) in **your** signed-in session ("Run only when user is logged
 on"), starts in the script folder with absolute paths, and always passes **`-NoPrompt`**
-and **`-JsonSummary`** (so `-Status` can show the last counts). It keeps a console
+and **`-JsonSummary`** (so `-Status` can show the last counts), and **`-FailOnWarning`**
+unless you give `-AllowWarnings` — for a configuration file too, whatever its
+`output.failOnWarning` says, so an expired sign-in shows as *Last Run Result 0x3*, never
+as a success. It keeps a console
 transcript: in the configuration's `output.logDir` when it names one, otherwise
 `-LogDir <output folder>\logs`. A run missed while the PC was off starts as soon as
 possible; two runs never overlap.
@@ -637,9 +648,12 @@ possible; two runs never overlap.
 and prints the same messages; a file with problems, no pages, or no page switched on is
 **not scheduled**. It points out settings that make no sense unattended — `openReport`,
 `onNotReady: prompt`, `pause` actions — with what the scheduled run does instead, and
-notes when warnings would count as success. `-Status` reads the output folder from the
+notes when the file's own "Count warnings as failure" is off (the schedule counts them
+anyway). `-Status` reads the output folder from the
 file when it was not typed, and says when the file is missing or broken now. The task
-runs the file as it is at run time, so later edits apply without reinstalling.
+runs the file as it is at run time, so later edits apply without reinstalling — except
+the transcript folder, which is fixed when the task is set up: after changing
+`output.dir`, run the installer again.
 
 Paths are quoted for Task Scheduler (spaces, `&`, `'`, `;`, non-ASCII letters all pass
 unchanged; a drive root stays a root). A path containing a `%NAME%` of a defined Windows
@@ -807,16 +821,18 @@ For people upgrading from 1.3:
   switched off, the report numbers and image file names (`001_…`) count only the pages
   run.
 - **A command-line value beats a per-page override** in the configuration file.
-- **`-Verify` is stricter**: it accepts only reports exactly as Vouch writes them, so a
-  hand-edited report fails even when the edit was honest; reports must be UTF-8 without
-  a byte order mark. Reports made by 1.2, 1.3 and 2.0 verify. **Linked-image reports cannot be
+- **`-Verify` is stricter about structure**: an element or attribute Vouch does not write,
+  a re-save that changes layout or encoding (reports must be UTF-8 without a byte order
+  mark), altered styling or any picture change now fails, even when the edit was honest.
+  Consistent edits of the report's *text* still pass — `-Verify` never proved the text. Reports made by 1.2, 1.3 and 2.0 verify. **Linked-image reports cannot be
   verified by Vouch 1.3.**
 - **JSON summary** gains `ReportDetails`, `Zip`, `LogPath`, `LogComplete`, and per item
   `Account`, `CaptureArea`, `ZoomPercent` and capture numbers/labels (all additive).
-- **Scheduler**: `-ConfigPath`; `-NoPrompt` always passed; the configuration is checked
+- **Scheduler**: `-ConfigPath`; `-NoPrompt` always passed; `-FailOnWarning` for every
+  schedule unless `-AllowWarnings`; the configuration is checked
   before a task is created; `-Status` names the file and output folder.
 - **Exit codes** are unchanged; exit 1 now also covers configuration problems, `-Only`
   naming no page and a report name Windows cannot keep, and `-Verify` exits 4 for
-  hand-edited or re-encoded reports that 1.3 accepted.
+  structurally edited or re-encoded reports that 1.3 accepted.
 - **Audit browser**: still launched without `--disable-sync` (as in 1.3), so on
   work-joined PCs a sign-in bubble can appear in full-screen captures of a fresh profile.

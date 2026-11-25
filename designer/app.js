@@ -1285,7 +1285,7 @@
       section('Logs and results', null, [
         checkField({ path: 'output.captureLog', label: 'Write a capture log', help: 'A readable, time-stamped account written next to the report while the run happens: each page, action, question and answer, and every image with its fingerprint. It also goes into the zip. On by default.' }),
         checkField({ path: 'output.jsonSummary', label: 'Write a JSON summary', help: 'The results as a .json file next to the report, for monitoring tools.' }),
-        checkField({ path: 'output.failOnWarning', label: 'Count warnings as failure', help: 'The run ends with exit code 3 when a page has a warning, so a scheduled task shows it as failed. Without it, warnings count as success.' }),
+        checkField({ path: 'output.failOnWarning', label: 'Count warnings as failure', help: 'The run ends with exit code 3 when a page has a warning. Without it, warnings count as success. Scheduled runs always count warnings as failure, unless they were set up with -AllowWarnings.' }),
         textField({ path: 'output.logDir', label: 'Console transcript folder (optional)', mono: true, extra: browseButton('output.logDir', 'folder', 'Choose the transcript folder'), help: 'Keeps a raw copy of everything the Vouch window shows, for troubleshooting scheduled runs. This is not the capture log.' }),
       ]),
       section('Zip', null, [

@@ -95,13 +95,13 @@ Describe 'Schedules of a configuration file (-ConfigPath)' {
         }
     }
 
-    It 'runs the file with -NoPrompt and the JSON summary, and passes no installer default over the file' {
+    It 'runs the file with -NoPrompt, the JSON summary and -FailOnWarning, and passes no other installer default over the file' {
         $config = New-TestConfig (Join-Path $TestDrive 'plain')
         $setup = Get-VouchScheduleSetup -ScriptRoot $script:Root -Parameters @{ ConfigPath = $config }
         $setup.Kind | Should -Be 'config'
         $setup.Definition | Should -Be $config
-        $setup.Arguments | Should -BeLike "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$($script:VouchPath)`" -ConfigPath `"$config`" -NoPrompt -JsonSummary -LogDir *"
-        $setup.Arguments | Should -Not -Match 'CsvPath|OutputDir|ImageFormat|SaveImages|FailOnWarning|EdgeProfileDir|DebugPort|UseVirtualDesktop'
+        $setup.Arguments | Should -BeLike "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$($script:VouchPath)`" -ConfigPath `"$config`" -FailOnWarning -NoPrompt -JsonSummary -LogDir *"
+        $setup.Arguments | Should -Not -Match 'CsvPath|OutputDir|ImageFormat|SaveImages|EdgeProfileDir|DebugPort|UseVirtualDesktop'
         # The file's output folder ("reports", read from the file's own folder), its logs inside.
         $setup.OutputDir | Should -Be (Join-Path (Split-Path $config) 'reports')
         $setup.LogDir | Should -Be (Join-Path (Split-Path $config) 'reports\logs')
@@ -128,6 +128,18 @@ Describe 'Schedules of a configuration file (-ConfigPath)' {
         foreach ($token in (Get-ReceivedArgument $setup.Arguments)) {
             if ($token -match '^-([A-Za-z]+)(:.*)?$') { $script:EngineParams | Should -Contain $Matches[1] }
         }
+    }
+
+    It 'counts warnings as failure whatever the file says, unless -AllowWarnings is given' {
+        $off = New-TestConfig (Join-Path $TestDrive 'warn-off') { param($c) $c['output']['failOnWarning'] = $false }
+        $on = New-TestConfig (Join-Path $TestDrive 'warn-on') { param($c) $c['output']['failOnWarning'] = $true }
+        foreach ($config in $off, $on) {
+            (Get-VouchScheduleSetup -ScriptRoot $script:Root -Parameters @{ ConfigPath = $config }).Arguments | Should -Match ' -FailOnWarning -NoPrompt '
+            $allowed = Get-VouchScheduleSetup -ScriptRoot $script:Root -Parameters @{ ConfigPath = $config; AllowWarnings = [switch]$true }
+            $allowed.Arguments | Should -Match ([regex]::Escape(' -FailOnWarning:$false -NoPrompt '))
+            ($allowed.Notes -join ' ') | Should -Match 'Warnings count as success \(-AllowWarnings\)'
+        }
+        (Get-VouchScheduleSetup -ScriptRoot $script:Root -Parameters @{ ConfigPath = $on }).Notes.Count | Should -Be 0
     }
 
     It 'always passes -NoPrompt for CSV schedules too' {
@@ -167,7 +179,9 @@ Describe 'Schedules of a configuration file (-ConfigPath)' {
         $text | Should -Match 'Open the report when the run is finished" is on, but a scheduled run never opens the report'
         $text | Should -Match 'Asks you when a page is not ready \(Payroll - security settings\): in a scheduled run nobody is asked; such a page is captured as it is, with a warning\.'
         $text | Should -Match 'Pauses for you \(Payroll - security settings\): in a scheduled run the pause is skipped'
-        ($setup.Notes -join ' ') | Should -Match 'Warnings count as success'
+        # Scheduler policy: warnings count as failure although the file says otherwise.
+        $setup.Arguments | Should -Match ' -FailOnWarning -NoPrompt '
+        ($setup.Notes -join ' ') | Should -Match 'Scheduled runs count warnings as failure .*although "Count warnings as failure" is off in the file'
         # Switched-off pages do not run, so they are not mentioned; nothing to say for a plain file.
         $quiet = New-TestConfig (Join-Path $TestDrive 'quiet') { param($c) $c['pages'][2]['enabled'] = $false; $c['output']['failOnWarning'] = $true }
         $calm = Get-VouchScheduleSetup -ScriptRoot $script:Root -Parameters @{ ConfigPath = $quiet }
@@ -225,7 +239,7 @@ Describe 'Schedules of a configuration file (-ConfigPath)' {
         Mock Write-Host { }
         Install-VouchTask -ScriptRoot $script:Root -Parameters @{ ConfigPath = $config; Schedule = 'AtLogOn'; TaskName = 'Vouch test (never registered)' }
         Should -Invoke Register-ScheduledTask -Times 1 -Exactly -ParameterFilter {
-            $TaskName -eq 'Vouch test (never registered)' -and $Action.Arguments -like "*-ConfigPath `"$config`" -NoPrompt -JsonSummary -LogDir *" -and $Action.WorkingDirectory -eq $script:Root
+            $TaskName -eq 'Vouch test (never registered)' -and $Action.Arguments -like "*-ConfigPath `"$config`" -FailOnWarning -NoPrompt -JsonSummary -LogDir *" -and $Action.WorkingDirectory -eq $script:Root
         }
         Should -Invoke Write-Host -ParameterFilter { "$Object" -eq "  Configuration: $config" }
         Should -Invoke Write-Host -ParameterFilter { "$Object" -like '  - Pauses for you (Payroll - security settings)*' }
