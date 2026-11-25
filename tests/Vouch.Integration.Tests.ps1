@@ -745,6 +745,25 @@ Describe 'Browser lifecycle' -Tag 'Integration' {
         $pages[0].id | Should -Be $keep.id
     }
 
+    It 'never attaches to an edge:// tab listed first, and closes it' {
+        # A fresh profile on a work-joined PC lists edge://sync-confirmation-dialog/ first.
+        $port = Get-FreeTcpPort
+        [void](Start-HeadlessEdge -Port $port -ProfileDir $lifecycleProfile)
+        [void](Get-CdpPageTarget -Port $port -WaitSeconds 10)
+        [void](Invoke-RestMethod -Method Put -Uri "http://127.0.0.1:$port/json/new?$Web/ok" -NoProxy)
+        [void](Invoke-RestMethod -Method Put -Uri "http://127.0.0.1:$port/json/new?edge://version" -NoProxy)
+        @(Get-DevToolsTargetList -Port $port | Where-Object type -eq 'page')[0].url | Should -BeLike 'edge://*'
+
+        $target = Get-CdpPageTarget -Port $port -WaitSeconds 10
+        $target.url | Should -Be "$Web/ok"
+
+        Close-OtherPageTargets -Port $port -KeepId $target.id
+        Start-Sleep -Milliseconds 500
+        $pages = @(Get-DevToolsTargetList -Port $port | Where-Object type -eq 'page')
+        $pages.Count | Should -Be 1
+        $pages[0].id | Should -Be $target.id
+    }
+
     It 'Start-EdgeDebug refuses a profile an ordinary Edge window already holds' {
         # No DevTools port: the situation after -LoginSetup's window was left open.
         [void](Start-Process -FilePath (Get-EdgePathForTest) -ArgumentList @(

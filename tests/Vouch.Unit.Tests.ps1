@@ -1005,6 +1005,43 @@ Describe 'Configuration file' {
     }
 }
 
+Describe 'Browser-internal tabs' {
+    It 'recognises <Url> as internal: <Internal>' -ForEach @(
+        @{ Url = 'edge://sync-confirmation-dialog/'; Internal = $true }
+        @{ Url = 'chrome://newtab/'; Internal = $true }
+        @{ Url = 'devtools://devtools/bundled/inspector.html'; Internal = $true }
+        @{ Url = 'edge-extension://abc/popup.html'; Internal = $true }
+        @{ Url = 'chrome-extension://abc/options.html'; Internal = $true }
+        @{ Url = 'about:blank'; Internal = $false }
+        @{ Url = 'https://intranet.example/edge://x'; Internal = $false }
+    ) {
+        Test-InternalPageTarget -Target ([pscustomobject]@{ url = $Url }) | Should -Be $Internal
+    }
+
+    It 'Get-CdpPageTarget skips the sync dialog Edge lists first' {
+        Mock Get-DevToolsTargetList {
+            [pscustomobject]@{ id = 'sync'; type = 'page'; url = 'edge://sync-confirmation-dialog/'; webSocketDebuggerUrl = 'ws://x/sync' }
+            [pscustomobject]@{ id = 'worker'; type = 'service_worker'; url = 'https://a/sw.js'; webSocketDebuggerUrl = 'ws://x/sw' }
+            [pscustomobject]@{ id = 'tab'; type = 'page'; url = 'about:blank'; webSocketDebuggerUrl = 'ws://x/tab' }
+        }
+        (Get-CdpPageTarget -Port 9 -WaitSeconds 0).id | Should -Be 'tab'
+    }
+
+    It 'Close-OtherPageTargets closes Edge''s own tabs but leaves DevTools and extensions alone' {
+        Mock Get-DevToolsTargetList {
+            [pscustomobject]@{ id = 'sync'; type = 'page'; url = 'edge://sync-confirmation-dialog/' }
+            [pscustomobject]@{ id = 'tab'; type = 'page'; url = 'https://a/' }
+            [pscustomobject]@{ id = 'other'; type = 'page'; url = 'about:blank' }
+            [pscustomobject]@{ id = 'tools'; type = 'page'; url = 'devtools://devtools/inspector.html' }
+            [pscustomobject]@{ id = 'ext'; type = 'page'; url = 'edge-extension://abc/page.html' }
+        }
+        $script:Closed = [System.Collections.Generic.List[string]]::new()
+        Mock Invoke-RestMethod { $script:Closed.Add(($Uri -split '/')[-1]) }
+        Close-OtherPageTargets -Port 9 -KeepId 'tab'
+        @($script:Closed) | Should -Be @('sync', 'other')
+    }
+}
+
 Describe 'Get-ScreenCapture' -Tag 'Desktop' {
     # Reads the pixels of the primary display into memory only; nothing is saved.
     BeforeAll {

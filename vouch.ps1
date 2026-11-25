@@ -1544,12 +1544,27 @@ function Get-DevToolsTargetList {
     $response | ForEach-Object { $_ }
 }
 
+function Test-InternalPageTarget {
+    <#
+        Browser-internal tabs (edge://, chrome://, devtools:// and extension pages) are
+        listed as "page" targets like any web page. A fresh Edge profile - especially on a
+        work-joined PC - opens edge://sync-confirmation-dialog/ and lists it FIRST, so a
+        run that took the first page attached to that dialog instead of its own tab.
+    #>
+    param([AllowNull()][object]$Target)
+    $url = if ($null -ne $Target -and $Target.PSObject.Properties['url']) { [string]$Target.url } else { '' }
+    return $url -match '^(?i)(edge|chrome|devtools|chrome-extension|edge-extension)://'
+}
+
+
 function Get-CdpPageTarget {
     <#
         Returns an existing tab, or opens one. Right after the DevTools port opens, a
         freshly launched Edge briefly lists no tabs at all even though its about:blank
         tab is on its way, so wait up to -WaitSeconds for it rather than opening a
         second tab that would then show up in every screenshot.
+        Internal tabs (Test-InternalPageTarget) are never used: the run would navigate
+        Edge's own dialog, and the real tab would stay behind it.
     #>
     param(
         [Parameter(Mandatory)][int]$Port,
@@ -1569,9 +1584,9 @@ function Get-CdpPageTarget {
         foreach ($target in $targets) {
             if ($target.PSObject.Properties['type'] -and $target.type -eq 'page' -and
                 $target.PSObject.Properties['webSocketDebuggerUrl'] -and
-                -not [string]::IsNullOrWhiteSpace($target.webSocketDebuggerUrl)) {
-                $targetUrl = if ($target.PSObject.Properties['url']) { [string]$target.url } else { '' }
-                if ($targetUrl -notlike 'devtools://*') { return $target }
+                -not [string]::IsNullOrWhiteSpace($target.webSocketDebuggerUrl) -and
+                -not (Test-InternalPageTarget -Target $target)) {
+                return $target
             }
         }
         if ((Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
@@ -1594,6 +1609,12 @@ function Close-OtherPageTargets {
         A fresh profile opens with more than one tab (the about:blank from the command line
         plus Edge's own start page). Every screenshot shows the tab strip, so close the
         tabs the run does not use. Only called for an Edge this run launched.
+        Edge's own edge:// and chrome:// tabs are closed too: they would sit in the tab
+        strip of every screenshot. (The sync sign-in dialog of a fresh profile is listed
+        like a tab but answers "Target is closing" and stays: it is a dialog, and only
+        --disable-sync at launch keeps it away.) DevTools windows and extension pages are
+        left alone - they are not tabs of the run and closing them could break whatever
+        opened them.
     #>
     param(
         [Parameter(Mandatory)][int]$Port,
@@ -1609,6 +1630,8 @@ function Close-OtherPageTargets {
     foreach ($target in $targets) {
         if (-not $target.PSObject.Properties['type'] -or $target.type -ne 'page') { continue }
         if ([string]$target.id -eq $KeepId) { continue }
+        $url = if ($target.PSObject.Properties['url']) { [string]$target.url } else { '' }
+        if ($url -match '^(?i)(devtools|chrome-extension|edge-extension)://') { continue }
         try { [void](Invoke-RestMethod -Uri "http://$($script:CdpHost):$Port/json/close/$($target.id)" -TimeoutSec 10 -NoProxy) }
         catch { Write-Verbose "Could not close tab $($target.id): $($_.Exception.Message)" }
     }

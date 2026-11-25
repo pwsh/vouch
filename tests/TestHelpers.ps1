@@ -79,7 +79,8 @@ function Start-TestServer {
 function Start-HeadlessEdge {
     <#
         A headless Edge with a throwaway profile: never shows a window, never touches the
-        user's own Edge profile or the Vouch audit profile.
+        user's own Edge profile or the Vouch audit profile. --disable-sync: a fresh profile
+        on a work-joined PC otherwise opens edge://sync-confirmation-dialog/ as an extra tab.
     #>
     param(
         [Parameter(Mandatory)][int]$Port,
@@ -89,7 +90,7 @@ function Start-HeadlessEdge {
     if (-not $edge) { throw 'Microsoft Edge is not installed.' }
     $process = Start-Process -FilePath $edge -PassThru -ArgumentList @(
         '--headless=new', "--remote-debugging-port=$Port", "--user-data-dir=`"$ProfileDir`"",
-        '--no-first-run', '--no-default-browser-check', '--window-size=1280,800', 'about:blank')
+        '--no-first-run', '--no-default-browser-check', '--disable-sync', '--window-size=1280,800', 'about:blank')
     $deadline = (Get-Date).AddSeconds(20)
     while ((Get-Date) -lt $deadline) {
         try {
