@@ -1401,7 +1401,8 @@
     const c = r.counts;
     if (c) bits.push(plural(c.run, 'page', 'pages') + ' run: ' + c.ok + ' OK, ' + c.warning + ' with warnings, ' + c.failed + ' failed' + (c.notRun ? ', ' + c.notRun + ' not run' : '') + ', ' + plural(c.captures, 'image', 'images'));
     else if (r.pages && r.pages.length) {
-      const done = r.pages.filter(p => p.status !== 'RUNNING').length;
+      // Only pages that really finished count; a run that died leaves NOTFINISHED pages.
+      const done = r.pages.filter(p => p.status === 'OK' || p.status === 'WARNING' || p.status === 'FAILED').length;
       const total = r.pages[0].total > 0 ? r.pages[0].total : r.pages.length;
       bits.push(done + ' of ' + plural(total, 'page', 'pages') + ' done');
     }
@@ -1458,7 +1459,7 @@
       })));
     }
     else if (r.state === 'done' || r.state === 'failed') parts.push(h('p', { class: 'help', text: 'This test made no screenshots.' }));
-    if (pv && pv.report) parts.push(h('div', { class: 'button-row' }, btn('Open the preview report', () => openTarget('preview-report'), { small: true, fkey: 'open-preview' })));
+    if ((pv && pv.report) || (r.open && r.open['preview-report'])) parts.push(h('div', { class: 'button-row' }, btn('Open the preview report', () => openTarget('preview-report'), { small: true, fkey: 'open-preview' })));
     parts.push(h('p', { class: 'help', text: 'The preview is temporary: it is replaced by the next test of this page and removed when the Designer closes.' }));
     return h('div', { class: 'preview-block' }, parts);
   }

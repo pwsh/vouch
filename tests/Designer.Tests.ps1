@@ -3821,6 +3821,11 @@ Describe 'Runs with a stand-in child process (the run state machine)' -Tag 'Inte
         Test-DesignerRunActive -State $state | Should -BeFalse
         $data.state | Should -Be 'done'
         ($data.notes -join ' ') | Should -Match 'could not finish reading'
+        # The outcome says plainly that the page was captured but there is nothing to see here.
+        $data.message | Should -Match '^Test finished: the page was captured, but its preview cannot be shown here \(The preview could not be registered\.\)\.$'
+        $data.message | Should -Not -Match 'without problems'
+        $data.nextStep | Should -Match 'Open the preview report'
+        $data.open['preview-report'] | Should -BeTrue
         Should -Invoke Connect-DesignerBrowser -Times 1 -Exactly
         $state.Browser.Connected | Should -BeTrue
         $run.ConfigTempPath | Should -Not -Exist
@@ -3832,6 +3837,102 @@ Describe 'Runs with a stand-in child process (the run state machine)' -Tag 'Inte
         $data.state | Should -Be 'failed'
         $data.message | Should -Match 'could not read its result'
         Should -Invoke Connect-DesignerBrowser -Times 2 -Exactly
+    }
+
+    It 'skips a turn whose reading of the progress fails, and reads it all at the next turns' {
+        $state = New-RunTestState 'read-hiccup'
+        $script:ReadCalls = 0
+        Mock Read-DesignerRunEvent { throw 'The file is in use by another process.' } -ParameterFilter { $script:ReadCalls++; $script:ReadCalls -le 3 }
+        $run = Start-TestRun $state 'normal'
+        $script:Started.Add($run)
+        $data = Wait-TestRun $state
+        $data.state | Should -Be 'done'
+        Get-EventType $data | Should -Be @('runStart', 'pageStart', 'capture', 'pageEnd', 'pageStart', 'detail', 'capture', 'pageEnd', 'runEnd')
+        $run.ReadFailures | Should -Be 0
+    }
+
+    It 'still ends a run whose progress can never be read, when its process ends' {
+        $state = New-RunTestState 'read-broken'
+        Mock Read-DesignerRunEvent { throw 'The disk is not ready.' }
+        $run = Start-TestRun $state 'normal'
+        $script:Started.Add($run)
+        $data = Wait-TestRun $state
+        Test-DesignerRunActive -State $state | Should -BeFalse
+        $data.state | Should -Be 'failed'
+        ($data.notes -join ' ') | Should -Match 'The last part of this run''s progress could not be read \(The disk is not ready\.\)'
+        $run.ConfigTempPath | Should -Not -Exist
+    }
+
+    It 'treats a run it cannot check as still running, and never hands the browser back early' {
+        $state = New-RunTestState 'cannot-tell'
+        $self = Get-Process -Id $PID
+        # A Process object tied to no process: reading HasExited throws.
+        $broken = [System.Diagnostics.Process]::new()
+        $run = New-DesignerRunState
+        $run.Process = $broken
+        # This process is alive and is the one that was started: not ended.
+        $run.ProcessId = $PID
+        $run.ProcessStartTime = $self.StartTime
+        Test-DesignerChildExited -Run $run | Should -BeFalse
+        # The start time cannot be compared: still not ended.
+        $run.ProcessStartTime = [datetime]::MinValue
+        Test-DesignerChildExited -Run $run | Should -BeFalse
+        # Another process now has the id (another start time): ended.
+        $run.ProcessStartTime = $self.StartTime.AddMinutes(-5)
+        Test-DesignerChildExited -Run $run | Should -BeTrue
+        # No process has the id any more: ended.
+        $ended = Start-Process -FilePath $self.Path -ArgumentList '-NoProfile', '-Command', 'exit' -WindowStyle Hidden -PassThru
+        $ended.WaitForExit()
+        $run.ProcessId = $ended.Id
+        Test-DesignerChildExited -Run $run | Should -BeTrue
+        # In the loop: a run that cannot be checked stays running, the browser is not touched.
+        Mock Complete-DesignerRun { }
+        Mock Connect-DesignerBrowser { }
+        $run.ProcessId = $PID
+        $run.ProcessStartTime = $self.StartTime
+        $run.State = 'running'
+        $run.EventPath = Join-Path $TestDrive 'cannot-tell.ndjson'
+        [System.IO.File]::WriteAllText($run.EventPath, '')
+        $state.Run = $run
+        Update-DesignerRun -State $state
+        Should -Invoke Complete-DesignerRun -Times 0 -Exactly
+        Should -Invoke Connect-DesignerBrowser -Times 0 -Exactly
+        Test-DesignerRunActive -State $state | Should -BeTrue
+        $state.Run = New-DesignerRunState
+    }
+
+    It 'keeps the browser away from a run whose force stop did not end it, until it has ended' {
+        $state = New-RunTestState 'kill-fails'
+        $state.Browser.Connected = $true
+        $state.Browser.TabId = 'TAB-1'
+        Mock Connect-DesignerBrowser { $State.Browser.Connected = $true; $State.Browser.TabId = 'TAB-1' }
+        Mock Set-DesignerLayout { [pscustomobject]@{ Ok = $true; Message = '' } }
+        Mock Clear-PageZoom { }
+        Mock Stop-DesignerChildProcess { }
+        $run = Start-TestRun $state 'ignorestop'
+        $script:Started.Add($run)
+        [void](Wait-TestRun $state -Until { (Get-DesignerRunData -State $state).state -eq 'running' })
+        $refusal = Stop-DesignerRun -State $state -Force -Immediately
+        $refusal.Status | Should -Be 500
+        $body = $refusal.Body | ConvertFrom-Json
+        $body.code | Should -Be 'kill-failed'
+        $body.detail | Should -Match "process number $($run.ProcessId)"
+        $run.KillFailed | Should -BeTrue
+        $run.State | Should -Be 'stopping'
+        Test-DesignerRunActive -State $state | Should -BeTrue
+        ((Get-DesignerRunData -State $state).notes -join ' ') | Should -Match 'Windows did not end the run''s process'
+        Should -Invoke Connect-DesignerBrowser -Times 0 -Exactly
+        (Get-DesignerRunRefusal -State $state -Route 'POST /api/browser/navigate').Status | Should -Be 409
+        # A later turn still does not hand the browser back while the process lives.
+        Update-DesignerRun -State $state
+        Should -Invoke Connect-DesignerBrowser -Times 0 -Exactly
+        # Once the process is really gone, the run ends and the browser comes back.
+        $run.Process.Kill($true)
+        [void]$run.Process.WaitForExit(10000)
+        $data = Wait-TestRun $state
+        $data.state | Should -Be 'failed'
+        $data.message | Should -Match 'force-stopped'
+        Should -Invoke Connect-DesignerBrowser -Times 1 -Exactly
     }
 
     It 'keeps the older preview of a page when the new test cannot start' {
@@ -3928,6 +4029,62 @@ Describe 'Runs with a stand-in child process (the run state machine)' -Tag 'Inte
         # Its own folder is never touched (the living one's owner has ended by now, so it goes).
         (Clear-DesignerStaleSession -TempFolder $temp) | Should -Not -Contain $folder
         $folder | Should -Exist
+    }
+
+    It 'never lets one odd folder stop the sweep, never deletes an owner it cannot determine, and retries a partly removed folder' {
+        $temp = Join-Path $TestDrive 'temp-sweep-2'
+        [void](New-Item -ItemType Directory -Path $temp -Force)
+        $marker = Get-DesignerSessionMarkerName
+        $new = {
+            param($Name, [string]$MarkerJson)
+            $folder = Join-Path $temp $Name
+            [void](New-Item -ItemType Directory -Path $folder -Force)
+            [System.IO.File]::WriteAllText((Join-Path $folder 'run-001-aaaaaaaa.json'), '{}')
+            if ($MarkerJson) { [System.IO.File]::WriteAllText((Join-Path $folder $marker), $MarkerJson) }
+            return $folder
+        }
+        $ended = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile', '-Command', 'exit' -WindowStyle Hidden -PassThru
+        $ended.WaitForExit()
+        $alive = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile', '-Command', 'Start-Sleep 60' -WindowStyle Hidden -PassThru
+        try {
+            # Sorted first by name, so a throw there would have stopped the sweep before the rest.
+            $tooBig = & $new 'VouchDesigner-0000000000-aaaaaaaa' '{"pid":0,"started":1}'
+            $notInt = & $new 'VouchDesigner-9999999999-aaaaaaaa' '{"pid":9999999999,"started":12345}'
+            $gone = & $new "VouchDesigner-$($ended.Id)-0a1b2c3d" ('{"pid":' + $ended.Id + ',"started":12345}')
+            # The marker cannot be read completely: never deleted, even for a living unrelated process.
+            $noStarted = & $new "VouchDesigner-$($alive.Id)-aaaa0001" ('{"pid":' + $alive.Id + '}')
+            $textStarted = & $new "VouchDesigner-$($alive.Id)-aaaa0002" ('{"pid":' + $alive.Id + ',"started":"soon"}')
+            $nullStarted = & $new "VouchDesigner-$($ended.Id)-aaaa0003" ('{"pid":' + $ended.Id + ',"started":null}')
+            $textPid = & $new "VouchDesigner-$($ended.Id)-aaaa0004" ('{"pid":"' + $ended.Id + '","started":12345}')
+            $notObject = & $new "VouchDesigner-$($ended.Id)-aaaa0005" '[1,2]'
+            $removed = Clear-DesignerStaleSession -TempFolder $temp
+            @($removed) | Should -Be @($gone)
+            $gone | Should -Not -Exist
+            foreach ($kept in $tooBig, $notInt, $noStarted, $textStarted, $nullStarted, $textPid, $notObject) { $kept | Should -Exist }
+            # A file still in use: the folder is not removed, its marker stays, the next start retries.
+            $busy = & $new "VouchDesigner-$($ended.Id)-bbbb0001" ('{"pid":' + $ended.Id + ',"started":12345}')
+            $lock = [System.IO.File]::Open((Join-Path $busy 'run-002-locked.events.ndjson'), 'Create', 'ReadWrite', 'None')
+            try {
+                $first = Clear-DesignerStaleSession -TempFolder $temp
+                ($first -contains $busy) | Should -BeFalse
+                Join-Path $busy $marker | Should -Exist
+                Join-Path $busy 'run-001-aaaaaaaa.json' | Should -Not -Exist
+            }
+            finally { $lock.Dispose() }
+            $second = Clear-DesignerStaleSession -TempFolder $temp
+            ($second -contains $busy) | Should -BeTrue
+            $busy | Should -Not -Exist
+            # Left empty by an earlier attempt (marker gone): removed once its owner is gone, kept while alive.
+            $emptyGone = Join-Path $temp "VouchDesigner-$($ended.Id)-cccc0001"
+            $emptyAlive = Join-Path $temp "VouchDesigner-$($alive.Id)-cccc0002"
+            [void](New-Item -ItemType Directory -Path $emptyGone, $emptyAlive -Force)
+            $removed = Clear-DesignerStaleSession -TempFolder $temp
+            ($removed -contains $emptyGone) | Should -BeTrue
+            ($removed -contains $emptyAlive) | Should -BeFalse
+            $emptyGone | Should -Not -Exist
+            $emptyAlive | Should -Exist
+        }
+        finally { Stop-Process -Id $alive.Id -Force -ErrorAction SilentlyContinue }
     }
 
     It 'skips garbage, waits for a line written in two parts, and drops an unfinished last line' {
@@ -4231,12 +4388,18 @@ Describe 'A real run from the Designer (vouch.ps1 as a child, headless Edge, pag
         $script:S.Browser.Connected | Should -BeTrue
     }
 
-    It 'tests pages whose id looks like a switch or has spaces and a colon (<_>)' -ForEach @('-Zip', '-OutputDir', '-home', 'p 1: x') {
+    It 'tests pages whose id looks like a switch, a true/false value, or has spaces and a colon (<_>)' -ForEach @('-Zip', '-OutputDir', '-home', 'p 1: x', '$true', '$FALSE') {
         $config = Copy-VouchConfig -Config $script:Shown.Config
         $config['pages'].Add([ordered]@{ id = $_; name = "Odd id $_"; url = "$($script:RealBase)/ok"; enabled = $false })
         $r = Invoke-TestRoute POST '/api/run' ([ordered]@{ config = $config; path = $script:RealKnown; kind = 'page'; pageId = $_ }) -State $script:S
         $r.Status | Should -Be 200
-        $script:S.Run.Arguments | Should -Contain "-Only:$_"
+        if ($_ -in '$true', '$false') {
+            # Joined, pwsh -File would hand the engine the word True or False.
+            $at = [array]::IndexOf([string[]]$script:S.Run.Arguments, '-Only')
+            $at | Should -BeGreaterThan -1
+            $script:S.Run.Arguments[$at + 1] | Should -BeExactly $_
+        }
+        else { $script:S.Run.Arguments | Should -Contain "-Only:$_" }
         $data = Wait-RealRun
         $data.state | Should -Be 'done' -Because "$($data.message) $($data.errorText)"
         $data.pages[0].pageId | Should -Be $_
@@ -4491,14 +4654,17 @@ btnByKey('run-all').click();
 await until(() => S.run.state === 'failed', 30000);
 const callout = document.querySelector('#panel-run .callout-error');
 const rows = Array.from(document.querySelectorAll('.run-page')).map(li => li.querySelector('.chip').textContent);
+const failedStatus = document.querySelector('.run-state').textContent;
 D.setTab('pages');
 const pageChip = document.querySelectorAll('.page-row .chip')[0].textContent;
 D.setTab('run');
-return { live: !!firstDone, liveStatus, state: S.run.state, failed: callout ? callout.textContent : '', rows, pageChip, errs: window.__errs };
+return { live: !!firstDone, liveStatus, failedStatus, state: S.run.state, failed: callout ? callout.textContent : '', rows, pageChip, errs: window.__errs };
 '@
         $r.live | Should -BeTrue
         $r.liveStatus | Should -Match 'Running…'
         $r.liveStatus | Should -Match 'of 6 pages done'
+        # The page the run died on is not counted as done.
+        $r.failedStatus | Should -Match '0 of 1 page done'
         $r.state | Should -Be 'failed'
         $r.failed | Should -Match 'ended unexpectedly \(exit code 7\)'
         $r.failed | Should -Match 'Something broke badly inside the run'

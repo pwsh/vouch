@@ -31,6 +31,14 @@ function New-DesignerRunState {
         PageName         = ''
         Process          = $null
         ProcessId        = 0
+        # The child's start time: a process found later under the same id with another
+        # start time is not the run (Test-DesignerChildExited).
+        ProcessStartTime = [datetime]::MinValue
+        # A force stop whose kill could not be confirmed: the run stays "stopping" and the
+        # browser stays the run's until the process is seen gone.
+        KillFailed       = $false
+        # Event-file reads that failed in a row (Update-DesignerRun).
+        ReadFailures     = 0
         OutputTask       = $null
         ErrorTask        = $null
         EventPath        = ''
@@ -131,37 +139,68 @@ function Clear-DesignerStaleSession {
         cleaning up (killed, or their console closed). Only folders named
         VouchDesigner-<pid>-<8 hex> that hold the marker file with that same pid, and only
         when that process is gone - or the process now using the pid started at another
-        time (a reused id). A folder whose owner is alive, or cannot be checked, or that
-        looks any different, is never touched. Returns the folders removed.
+        time (a reused id). A folder whose owner is alive, or cannot be checked, or whose
+        marker cannot be read completely, or that looks any different, is never touched.
+        One odd folder never stops the sweep of the others (each is checked on its own).
+        The marker is deleted LAST: a folder only partly removed (a file still in use) keeps
+        its marker and is tried again at the next start. A folder left EMPTY by such an
+        attempt (marker gone, folder itself refused) is removed once its owner id is free.
+        Returns the folders removed.
     #>
     param([string]$TempFolder = [System.IO.Path]::GetTempPath())
     $removed = [System.Collections.Generic.List[string]]::new()
     $folders = @()
     try { $folders = @([System.IO.Directory]::GetDirectories($TempFolder, 'VouchDesigner-*')) } catch { return , $removed }
+    $markerName = Get-DesignerSessionMarkerName
     foreach ($folder in $folders) {
-        $name = [System.IO.Path]::GetFileName($folder)
-        $match = [regex]::Match($name, '^VouchDesigner-(\d{1,10})-[0-9a-f]{8}$')
-        if (-not $match.Success) { continue }
-        $owner = [long]$match.Groups[1].Value
-        if ($owner -eq $PID) { continue }
-        $markerPath = Join-Path -Path $folder -ChildPath (Get-DesignerSessionMarkerName)
-        if (-not [System.IO.File]::Exists($markerPath)) { continue }
         try {
+            $name = [System.IO.Path]::GetFileName($folder)
+            $match = [regex]::Match($name, '^VouchDesigner-(\d{1,10})-[0-9a-f]{8}$')
+            if (-not $match.Success) { continue }
+            # A process id is an Int32 above 0; anything else cannot name a process (and
+            # Get-Process -Id would refuse it), so such a folder is not ours to judge.
+            $owner = 0
+            if (-not [int]::TryParse($match.Groups[1].Value, [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$owner) -or $owner -le 0) { continue }
+            if ($owner -eq $PID) { continue }
+            $markerPath = Join-Path -Path $folder -ChildPath $markerName
+            if (-not [System.IO.File]::Exists($markerPath)) {
+                # Left over from an earlier sweep that removed everything but the folder.
+                if (@([System.IO.Directory]::EnumerateFileSystemEntries($folder)).Count -eq 0 -and
+                    $null -eq (Get-Process -Id $owner -ErrorAction SilentlyContinue)) {
+                    [System.IO.Directory]::Delete($folder, $false)
+                    $removed.Add($folder)
+                }
+                continue
+            }
+            # The marker must name the same pid and a start time, both as whole numbers;
+            # anything missing or of another kind means the owner cannot be determined.
             $marker = [System.IO.File]::ReadAllText($markerPath) | ConvertFrom-Json -ErrorAction Stop
-            if ([long]$marker.pid -ne $owner) { continue }
-            $started = [long]$marker.started
+            if ($marker -isnot [System.Management.Automation.PSCustomObject]) { continue }
+            $names = @($marker.PSObject.Properties.Name)
+            if ($names -notcontains 'pid' -or $names -notcontains 'started') { continue }
+            $markerPid = $marker.pid
+            $started = $marker.started
+            if (($markerPid -isnot [int] -and $markerPid -isnot [long]) -or ($started -isnot [int] -and $started -isnot [long])) { continue }
+            if ([long]$markerPid -ne $owner -or [long]$started -le 0) { continue }
+            $gone = $false
+            $process = Get-Process -Id $owner -ErrorAction SilentlyContinue
+            if ($null -eq $process) { $gone = $true }
+            else {
+                try { $gone = $process.StartTime.ToUniversalTime().Ticks -ne [long]$started }
+                catch { continue }
+            }
+            if (-not $gone) { continue }
+            # Everything but the marker first; the marker, then the folder, last.
+            foreach ($entry in @([System.IO.Directory]::EnumerateFileSystemEntries($folder))) {
+                if ([System.IO.Path]::GetFileName($entry) -eq $markerName) { continue }
+                if ([System.IO.Directory]::Exists($entry)) { [System.IO.Directory]::Delete($entry, $true) }
+                else { [System.IO.File]::Delete($entry) }
+            }
+            [System.IO.File]::Delete($markerPath)
+            [System.IO.Directory]::Delete($folder, $false)
+            $removed.Add($folder)
         }
-        catch { continue }
-        $gone = $false
-        $process = Get-Process -Id $owner -ErrorAction SilentlyContinue
-        if ($null -eq $process) { $gone = $true }
-        else {
-            try { $gone = $process.StartTime.ToUniversalTime().Ticks -ne $started }
-            catch { continue }
-        }
-        if (-not $gone) { continue }
-        try { [System.IO.Directory]::Delete($folder, $true); $removed.Add($folder) }
-        catch { Write-Verbose "An old Designer folder could not be removed: $folder" }
+        catch { Write-Verbose "An old Designer folder was left as it is: $folder ($($_.Exception.Message))" }
     }
     return , $removed
 }
@@ -374,7 +413,11 @@ function Get-DesignerRunSessionFlag {
     }
     if ($browser.TypedKeepOpen) { & $add @('-KeepBrowserOpen') 'Keep the browser open (-KeepBrowserOpen, typed when the Designer was started).' }
     if ($Plan.Kind -eq 'page') {
-        & $add @("-Only:$($Plan.PageId)") "Only this page (-Only:$($Plan.PageId))."
+        # pwsh -File turns the joined values "$true" and "$false" (any case) into the words
+        # True and False; as a separate argument they arrive verbatim (and cannot start with
+        # a dash, so they cannot be read as a switch either).
+        if ($Plan.PageId -in '$true', '$false') { & $add @('-Only', $Plan.PageId) "Only this page (-Only $($Plan.PageId))." }
+        else { & $add @("-Only:$($Plan.PageId)") "Only this page (-Only:$($Plan.PageId))." }
         & $add @("-OutputDir:$PreviewFolder") 'A temporary preview folder instead of the output folder (-OutputDir).'
         & $add @('-SaveImages') 'Image files for the preview (-SaveImages).'
         & $add @('-Zip:$false') 'No zip (-Zip:$false).'
@@ -440,14 +483,45 @@ function Get-DesignerConsoleEncoding {
 }
 
 function Stop-DesignerChildProcess {
-    # Force stop: the run's process and everything it started (only the tree the Designer started).
+    <#
+        Force stop: the run's process and everything it started (only the tree the Designer
+        started). Never throws: whether the process really ended is decided afterwards by
+        Test-DesignerChildExited, never by this call having returned.
+    #>
     param([AllowNull()][object]$Process)
     if ($null -eq $Process) { return }
-    try {
-        if (-not $Process.HasExited) { $Process.Kill($true) }
-        [void]$Process.WaitForExit(10000)
-    }
+    try { $Process.Kill($true) }
     catch { Write-Verbose "The run could not be ended: $($_.Exception.Message)" }
+    try { [void]$Process.WaitForExit(10000) }
+    catch { Write-Verbose "The end of the run could not be awaited: $($_.Exception.Message)" }
+}
+
+function Test-DesignerChildExited {
+    <#
+        Whether the run's process has ended: $true only when that is CERTAIN. Process.HasExited
+        can throw (handle problems, access); then the process id is looked up - gone, or now
+        a process that started at another time, means ended. When even that cannot tell, the
+        answer is $false: a child that may still be driving the audit Edge must never get
+        the Designer's hands on the browser at the same time. That wait is bounded by the
+        usual Stop / Force stop (and by closing the Designer).
+    #>
+    param([Parameter(Mandatory)][object]$Run)
+    if ($null -eq $Run.Process) { return $true }
+    # The getter is called as a method: PowerShell hides an exception thrown by a property
+    # read (.HasExited would just give $null, which must not count as an answer either).
+    try {
+        $value = $Run.Process.get_HasExited()
+        if ($value -is [bool]) { return $value }
+    }
+    catch { Write-Verbose "Whether the run has ended could not be read directly: $($_.Exception.Message)" }
+    if ($Run.ProcessId -le 0) { return $false }
+    try {
+        $process = Get-Process -Id $Run.ProcessId -ErrorAction SilentlyContinue
+        if ($null -eq $process) { return $true }
+        if ($Run.ProcessStartTime -ne [datetime]::MinValue -and $process.StartTime -ne $Run.ProcessStartTime) { return $true }
+    }
+    catch { Write-Verbose "Whether the run has ended could not be told: $($_.Exception.Message)" }
+    return $false
 }
 
 function Stop-DesignerBrowserForRun {
@@ -559,6 +633,7 @@ function Start-DesignerRun {
         if (-not $pwsh -or [System.IO.Path]::GetFileNameWithoutExtension($pwsh) -notmatch '^pwsh') { $pwsh = (Get-Process -Id $PID).Path }
         $run.Process = Start-DesignerChildProcess -FilePath $pwsh -ArgumentList $run.Arguments -WorkingDirectory $folder
         $run.ProcessId = $run.Process.Id
+        try { $run.ProcessStartTime = $run.Process.StartTime } catch { Write-Verbose 'The start time of the run''s process could not be read.' }
         $run.OutputTask = $run.Process.StandardOutput.ReadToEndAsync()
         $run.ErrorTask = $run.Process.StandardError.ReadToEndAsync()
     }
@@ -892,14 +967,27 @@ function Update-DesignerRun {
         The run's share of each loop turn (about every 200 ms): read what the run wrote,
         notice when it has ended, and - when the Designer is closing - force it to stop
         once the grace time after the stop request has passed. Never waits on the run.
+        A failed read of the event file (a file briefly locked, a disk hiccup) skips this
+        turn's reading only; the next turn tries again from the same place. After several
+        failures in a row the turn goes on anyway, so a run whose events cannot be read
+        still ends when its process ends (Complete-DesignerRun reads once more and says
+        what it could not read). Whether the process ended counts only when certain
+        (Test-DesignerChildExited).
     #>
     param([Parameter(Mandatory)][object]$State)
     if (-not (Test-DesignerRunActive -State $State)) { return }
     $run = $State.Run
-    [void](Read-DesignerRunEvent -State $State -Run $run)
-    $exited = $true
-    try { $exited = ($null -eq $run.Process) -or $run.Process.HasExited } catch { $exited = $true }
-    if ($exited) { Complete-DesignerRun -State $State; return }
+    try {
+        [void](Read-DesignerRunEvent -State $State -Run $run)
+        $run.ReadFailures = 0
+    }
+    catch {
+        $run.ReadFailures++
+        Write-Verbose "The run's progress could not be read this time: $($_.Exception.Message)"
+        if ($run.ReadFailures -eq 10) { $run.Notes.Add("The Designer cannot read this run's progress at the moment ($($_.Exception.Message)); the run itself goes on.") }
+        if ($run.ReadFailures -lt 5) { return }
+    }
+    if (Test-DesignerChildExited -Run $run) { Complete-DesignerRun -State $State; return }
     if ($State.ShutdownAfterRun -and (Test-DesignerRunForceAvailable -Run $run)) {
         [void](Stop-DesignerRun -State $State -Force)
     }
@@ -925,7 +1013,11 @@ function Complete-DesignerRun {
     $run = $State.Run
     $exitCode = -1
     try {
-        try { [void](Read-DesignerRunEvent -State $State -Run $run -Final) } catch { Write-Verbose "The last events could not be read: $($_.Exception.Message)" }
+        try { [void](Read-DesignerRunEvent -State $State -Run $run -Final) }
+        catch {
+            Write-Verbose "The last events could not be read: $($_.Exception.Message)"
+            $run.Notes.Add("The last part of this run's progress could not be read ($($_.Exception.Message)).")
+        }
         try { if ($null -ne $run.Process) { [void]$run.Process.WaitForExit(5000); $exitCode = $run.Process.ExitCode } } catch { $exitCode = -1 }
         $run.Output = Get-DesignerRunOutput -Run $run
         $run.EndedAt = Get-Date
@@ -946,7 +1038,18 @@ function Complete-DesignerRun {
                 if ($run.ZipPath) { $State.OpenTargets['zip'] = Split-Path -Path $run.ZipPath -Parent }
             }
         }
-        if ($run.Kind -eq 'page') { Register-DesignerPreview -State $State -Run $run }
+        if ($run.Kind -eq 'page') {
+            try { Register-DesignerPreview -State $State -Run $run }
+            catch {
+                # The page was captured (the run's own result stands); only showing it here failed.
+                $problem = [string]$_.Exception.Message
+                $run.Notes.Add("The Designer could not finish reading this run's result ($problem).")
+                if ($run.State -eq 'done') {
+                    $run.Message = "Test finished: the page was captured, but its preview cannot be shown here ($problem)."
+                    $run.NextStep = if ($State.OpenTargets.Contains('preview-report')) { 'Press "Open the preview report" to see the images in your browser, or test the page again.' } else { 'Test the page again. If the preview still does not appear, use Run all pages and look at this page in the report.' }
+                }
+            }
+        }
     }
     catch {
         $problem = [string]$_.Exception.Message
@@ -1023,6 +1126,17 @@ function Stop-DesignerRun {
         }
         $run.Forced = $true
         Stop-DesignerChildProcess -Process $run.Process
+        if (-not (Test-DesignerChildExited -Run $run)) {
+            # The kill did not take (or cannot be confirmed): the run may still be driving the
+            # audit Edge, so it stays "stopping", the browser stays the run's, and the next
+            # turns keep checking; it ends as soon as its process is seen gone.
+            $text = "Windows did not end the run's process (pwsh, process number $($run.ProcessId)). The Designer keeps away from the browser until it has ended. Try Force stop again, end that process in Task Manager, or close the Designer."
+            if (-not $run.KillFailed) { $run.Notes.Add($text) }
+            $run.KillFailed = $true
+            $run.State = 'stopping'
+            if ($run.StopRequestedAt -eq [datetime]::MinValue) { $run.StopRequestedAt = Get-Date }
+            return New-DesignerError -Status 500 -Code 'kill-failed' -Message 'The run could not be ended.' -Detail $text
+        }
         Complete-DesignerRun -State $State
         return $null
     }
@@ -1054,7 +1168,10 @@ function Stop-DesignerRunForExit {
     }
     if (Test-DesignerRunActive -State $State) {
         [void](Stop-DesignerRun -State $State -Force -Immediately)
-        Write-Host 'The run did not stop in time and was ended; its report may be missing.' -ForegroundColor Yellow
+        if (Test-DesignerRunActive -State $State) {
+            Write-Host "The run did not stop in time and Windows did not end it (pwsh, process number $($run.ProcessId)). End it in Task Manager before you start Vouch again." -ForegroundColor Yellow
+        }
+        else { Write-Host 'The run did not stop in time and was ended; its report may be missing.' -ForegroundColor Yellow }
     }
     else { Write-Host 'The run stopped.' }
 }
