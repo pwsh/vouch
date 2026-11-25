@@ -906,8 +906,8 @@ function Get-DesignerRunOutcome {
             return "Finished, but $failed page(s) failed. The report shows what went wrong on each."
         }
         3 {
-            if ($test) { return 'Test finished with warnings, and "Fail on warnings" is on, so a run would count as not passed (exit code 3).' }
-            return 'Finished with warnings, and "Fail on warnings" is on, so the run counts as not passed (exit code 3). The report shows the warnings.'
+            if ($test) { return 'Test finished with warnings, and "Count warnings as failure" is on, so a run would count as not passed (exit code 3).' }
+            return 'Finished with warnings, and "Count warnings as failure" is on, so the run counts as not passed (exit code 3). The report shows the warnings.'
         }
         1 {
             $why = Get-DesignerRunErrorText -Run $Run
@@ -942,8 +942,8 @@ function Get-DesignerRunNextStep {
             return 'Open the report to see what went wrong on each failed page; fix those pages and test them with "Test this page", then run all pages again.'
         }
         3 {
-            if ($test) { return 'Look at the warnings below. If they are acceptable, "Fail on warnings" (Output tab) can be switched off.' }
-            return 'Open the report and look at the warnings. If they are acceptable, switch off "Fail on warnings" (Output tab), or keep it on so scheduled runs report them.'
+            if ($test) { return 'Look at the warnings below. If they are acceptable, "Count warnings as failure" (Output tab) can be switched off.' }
+            return 'Open the report and look at the warnings. If they are acceptable, switch off "Count warnings as failure" (Output tab), or keep it on so scheduled runs report them.'
         }
     }
     return ''

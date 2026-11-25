@@ -221,7 +221,7 @@
     'output.embedImages': 'Images in the report',
     'output.jsonSummary': 'JSON summary',
     'output.logDir': 'Console transcript folder',
-    'output.failOnWarning': 'Fail on warnings',
+    'output.failOnWarning': 'Count warnings as failure',
     'output.openReport': 'Open the report when done',
     'output.captureLog': 'Write a capture log',
     'output.zip.enabled': 'Make a zip',
@@ -1276,7 +1276,7 @@
       ]),
       section('What each screenshot shows', null, [
         radioField({ path: 'defaults.captureArea', label: 'Capture area (run default)', options: [
-          { value: 'screen', label: AREA_TEXT.screen, help: 'The whole screen, as today: the Windows clock and date are in every picture. What auditors usually expect.' },
+          { value: 'screen', label: AREA_TEXT.screen, help: 'The whole screen: the Windows clock and date are in every picture. What auditors usually expect.' },
           { value: 'window', label: AREA_TEXT.window, help: 'The Edge window with its title bar, tabs and address bar; no taskbar.' },
           { value: 'page', label: AREA_TEXT.page, help: 'Taken by the browser itself; Edge need not be in front. No address bar or clock in the picture - the time and address are in the report and inside each image file.' }] }),
         settingNumber('defaults.zoomPercent', 'Zoom', 'Shows the pages zoomed, like Ctrl+plus or minus, without changing anything in Edge.', '%'),

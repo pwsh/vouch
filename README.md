@@ -2,22 +2,44 @@
 
 *Audit evidence screen captures, with the clock in the shot.*
 
-`vouch.ps1` walks a list of web application pages and takes **real screen
-captures** of each one, then assembles them into a single self-contained HTML report.
-The screenshots are genuine captures of the primary display — not browser-rendered
-full-page images — so the Windows taskbar and its clock are visible in every image,
-which is what auditors ask for when they want to see *when* the evidence was taken.
-Pages taller than one screen are captured as a series of viewport segments as the
-script scrolls down. The report embeds every image as base64, so the one `.html` file
-can be attached to an audit workpaper and opened anywhere with no loose image files.
+Vouch opens a list of web application pages in Microsoft Edge, does the clicks and waits
+each page needs, and takes **real screen captures** of each one, then assembles them into
+one HTML report. By default the screenshots are genuine captures of the primary display
+— not browser-rendered images — so the Windows taskbar and its clock are visible in every
+image, which is what auditors ask for when they want to see *when* the evidence was
+taken. Every image carries its own capture record and SHA-256 hash, and `-Verify` checks
+a report later.
+
+Vouch 2.0 has two parts:
+
+- the **Vouch Designer** — a window beside the browser where you add pages, point at what
+  to click and capture, set the report and output options, test a page, run everything,
+  and save it all as one **configuration file** (JSON);
+- the **capture engine** `vouch.ps1`, which runs a configuration file (or a CSV capture
+  list) from the Designer, a command line or a scheduled task.
 
 > **New to Vouch, or not technical? Start with the
 > [step-by-step guide](docs/getting-started.md).** It covers installing, signing in,
-> writing the capture list, reading and sharing the report, scheduling, and what to do
-> when something goes wrong — in plain language, with a one-page quick reference.
-> For example rows to copy into your capture list, see
-> [`captures.template.csv`](captures.template.csv). This README is the technical
-> reference.
+> setting up pages in the Designer, reading and sharing the report, scheduling, and what
+> to do when something goes wrong — in plain language, with a one-page quick reference.
+> This README is the technical reference.
+
+**Contents:** [Requirements](#requirements) ·
+[Quick start: the Designer](#quick-start-the-designer) ·
+[Quick start: the command line](#quick-start-the-command-line) ·
+[The configuration file](#the-configuration-file) ·
+[vouch.ps1 parameters](#vouchps1-parameters) ·
+[Install-VouchSchedule.ps1 parameters](#install-vouchscheduleps1-parameters) ·
+[Exit codes](#exit-codes) · [Outputs](#outputs) ·
+[Image metadata](#image-metadata) · [-Verify](#-verify-what-it-checks-and-what-it-proves) ·
+[Capture areas and zoom](#capture-areas-and-zoom) ·
+[Prompts and unattended runs](#prompts-and-unattended-runs) ·
+[The Designer](#the-designer-how-it-works-and-security) ·
+[Picker limits](#what-the-picker-cannot-do) · [Scheduling](#running-on-a-schedule) ·
+[Virtual desktop](#keeping-other-applications-out-of-the-evidence) ·
+[CSV reference](#csv-reference) · [How failures appear](#how-failures-appear) ·
+[Tips](#tips) · [Troubleshooting](#troubleshooting) · [Tests](#tests) ·
+[What changed in 2.0](#what-changed-in-20)
 
 ## Requirements
 
@@ -25,86 +47,386 @@ can be attached to an audit workpaper and opened anywhere with no loose image fi
 - PowerShell 7 or later: `winget install Microsoft.PowerShell`
 - Microsoft Edge (the version that ships with Windows is fine).
 
-No modules, no DLLs, nothing to install beyond the two above. The script drives Edge
-through the Chrome DevTools Protocol and captures the screen with the built-in
-`System.Drawing` APIs.
+No modules, no DLLs, nothing to install beyond the two above, no administrator rights.
+Vouch drives Edge through the Chrome DevTools Protocol (Edge's remote debugging
+connection, on `127.0.0.1` only) and captures the screen with the built-in
+`System.Drawing` APIs. An organisation policy that switches remote debugging off (the
+Edge policy `RemoteDebuggingAllowed` = 0) blocks Vouch entirely.
 
-## First-time setup
+Keep the folder together: `vouch.ps1` alone still does every capture, `-Verify` and
+schedule job, but the Designer needs the `designer` folder next to it.
 
-Most configuration pages are behind a login, so first give the script its own browser
-profile and sign in:
+## Quick start: the Designer
+
+Double-click `Vouch-Designer.cmd` (or run `pwsh -File .\vouch.ps1 -Designer`). Drop a
+configuration file onto `Vouch-Designer.cmd` to open it at the start.
+
+Three windows open: a console (the Designer's server; leave it open), the **audit Edge**
+on the left, and the **Designer** panel on the right. Sign in to your applications in
+the audit Edge once; the sessions are kept in its profile. Then, in the panel:
+
+1. **Pages** tab: open a page in the audit Edge and click **Add page from current tab**.
+   Add steps — **Pick something to click**, **Pick a scroll area**, **Add capture**,
+   **Add wait**, **Add wait-for**, **Add pause** — and **Test this page**.
+2. **Report** tab: title, classification, logo, company, description, origin, account,
+   generated by, period.
+3. **Output** tab: folder, report name, image format, embedded or linked images, capture
+   area, zoom, virtual desktop, capture log, JSON summary, zip.
+4. **Save**, then **Run** tab → **Run all pages**.
+
+The Run tab's **Command line** box shows the same run as a command, and the
+`Install-VouchSchedule.ps1` command that schedules it.
+
+## Quick start: the command line
 
 ```powershell
-.\vouch.ps1 -LoginSetup
-```
+# A configuration file made in the Designer
+.\vouch.ps1 -ConfigPath .\q3-itgc.json
 
-Edge opens with a dedicated profile at `%LOCALAPPDATA%\Vouch\EdgeProfile`.
-Sign in to every application you plan to capture, complete any MFA prompts, tick
-"stay signed in" where offered, then return to the console and press Enter.
+# Only some of its pages (by id or name); a switched-off page runs when named
+.\vouch.ps1 -ConfigPath .\q3-itgc.json -Only p002,p005
 
-Why a separate profile? Chromium 136 and later refuse to enable
-`--remote-debugging-port` when the default user profile is in use — a security change
-that blocks cookie theft through the debugging port. Automation therefore has to run
-against a `--user-data-dir` of its own. The upside is that your everyday browsing is
-untouched, and the audit logins persist in that folder, so `-LoginSetup` is normally a
-one-time step. Repeat it whenever a session expires or you add a new application.
+# A typed switch beats the file for this one run
+.\vouch.ps1 -ConfigPath .\q3-itgc.json -OutputDir C:\Audit\2026-Q3 -CaptureArea page
 
-## Usage
+# A CSV capture list (the 1.x way; still supported)
+.\vouch.ps1 -CsvPath .\captures.csv -OutputDir .\reports -SaveImages
 
-1. Copy `captures.sample.csv` to `captures.csv` and edit it — one row per screenshot.
-   `captures.template.csv` has an example row for each common pattern (full page, tab
-   click, several steps, waits, selectors, quoted notes) to copy from.
-2. Run the script.
-3. Open the report it prints at the end.
-
-```powershell
-# Default: reads captures.csv next to the script and writes
-# reports\VouchReport_<date>_<time>.html next to the script, whatever the current folder
+# Without -ConfigPath or -CsvPath: captures.csv next to the script
 .\vouch.ps1
 
-# Another definition file and output folder
-.\vouch.ps1 -CsvPath .\q3-itgc.csv -OutputDir C:\Audit\2026-Q3
+# Sign in to your applications in the audit profile (without the Designer)
+.\vouch.ps1 -LoginSetup
 
-# Also keep the individual images, with a SHA256SUMS file (reports\images\<report name>\)
-.\vouch.ps1 -SaveImages
-
-# Check a report (and its saved images) has not changed since it was made
+# Check a report has not changed since it was made
 .\vouch.ps1 -Verify .\reports\VouchReport_2026-09-24_061204.html
-
-# Leave the browser open afterwards, e.g. to debug a selector
-.\vouch.ps1 -KeepBrowserOpen
-
-# Lossless screenshots (much larger report)
-.\vouch.ps1 -ImageFormat png
 ```
 
-Useful switches: `-SettleSeconds` (pause after load and after each click, default 2),
-`-ScrollSettleSeconds` (pause after each scroll so lazy content can load, default 1),
-`-MaxScrollSegments` (cap per page, default 30), `-NavigationTimeoutSec` (default 30),
-`-JpegQuality` (default 85), `-DebugPort` (default 9222), `-FailOnWarning`,
-`-LogDir` (write a log of the run to that folder), `-Verify` (check a report), `-JsonSummary` (also write the
-results as `.json` next to the report, for monitoring or scripts).
-Run `Get-Help .\vouch.ps1 -Detailed` for the full list.
+`-LoginSetup` opens Edge with the audit profile (`%LOCALAPPDATA%\Vouch\EdgeProfile`)
+without the debugging connection; sign in, then press Enter in the console. Why a
+separate profile: Chromium 136 and later refuse `--remote-debugging-port` on the default
+user profile, so automation needs a `--user-data-dir` of its own. Your everyday browsing
+is untouched, and the audit logins persist in that folder.
 
-Relative paths passed to `-CsvPath` and `-OutputDir` resolve against the current
-folder; the defaults resolve against the script's folder, so a scheduled task finds its
-files without a "Start in" setting.
+Relative paths typed on the command line resolve against the current folder. Defaults
+(`captures.csv`, `reports`) resolve against the script's folder, so a scheduled task
+finds its files without a "Start in" setting. Relative paths **inside a configuration
+file** resolve against the file's own folder.
+
+## The configuration file
+
+One JSON file (`schemaVersion` 1) holds the pages and every setting.
+[`captures.sample.json`](captures.sample.json) is a complete example. Hand-editing
+rules:
+
+- Comments (`//`, `/* */`) and trailing commas are allowed. (The Designer's Save writes
+  the file without comments and says so first.)
+- Keys are matched without regard to capitals; the same key written twice is an error.
+- A missing key, `null`, or (for settings whose default is not blank) blank text means
+  "use the default".
+- An unknown key is a warning ("is not a setting Vouch knows, so it is ignored"), not an
+  error. A missing `schemaVersion` is a warning (read as 1); a `schemaVersion` above 1 is
+  an error (made by a newer Vouch).
+- Every problem is listed at once, with its place in the file (such as
+  `pages[2].actions[0].selector`, counting from 0); nothing runs until they are fixed.
+- Folders and files in the file (`browser.profileDir`, `output.dir`, `output.logDir`,
+  `report.logoPath`) are read relative to the file's folder.
+
+### Settings
+
+| Key | Type | Default | Allowed | Meaning |
+| --- | --- | --- | --- | --- |
+| `schemaVersion` | number | `1` | `1` | File format version. |
+| `name` | text | `""` | | A name for this configuration, for you only (not in the report). |
+| `browser.profileDir` | text | `""` | | Edge profile folder with the sign-ins. Empty: `%LOCALAPPDATA%\Vouch\EdgeProfile`. |
+| `browser.debugPort` | whole number | `9222` | 1024–65535 | Port of Edge's debugging connection. An Edge already listening there is reused and left open. |
+| `browser.useVirtualDesktop` | true/false | `false` | | Capture on a separate, empty virtual desktop. |
+| `browser.keepBrowserOpen` | true/false | `false` | | Leave the Edge this run started open. |
+| `defaults.account` | text | `""` | | Account used to sign in, shown in the report and stored in each image. |
+| `defaults.captureArea` | text | `"screen"` | `screen`, `window`, `page` | What each screenshot shows (see [Capture areas](#capture-areas-and-zoom)). |
+| `defaults.zoomPercent` | whole number | `100` | 25–500 | Page zoom, without changing the Edge profile. |
+| `defaults.navigationTimeoutSec` | whole number | `30` | 5–600 | How long to wait for a page to load. |
+| `defaults.settleSeconds` | number | `2` | 0–120 | Extra wait after loading and after each click. |
+| `defaults.scrollSettleSeconds` | number | `1` | 0–120 | Wait after each scroll. |
+| `defaults.maxScrollSegments` | whole number | `30` | 1–500 | Most screenshots for one scrolled capture; longer is a warning. |
+| `defaults.waitFor` | text | `""` | | A CSS selector every page must show before anything is captured. |
+| `defaults.onNotReady` | text | `"warn"` | `warn`, `prompt` | A page not ready or asking for a sign-in: capture with a warning, or ask in the Vouch dialog (interactive runs only). |
+| `defaults.promptTimeoutSec` | whole number | `300` | 1–3600 | How long the Vouch dialog waits before it continues by itself. |
+| `output.dir` | text | `"reports"` | | Output folder. |
+| `output.reportName` | text | `""` | | Report file name; empty: `VouchReport_<date>_<time>.html`. Tokens `{report}` `{title}` `{date}` `{time}` `{period}` `{classification}`. A name, not a path. |
+| `output.imageFormat` | text | `"jpeg"` | `jpeg`, `png` | Image format. |
+| `output.jpegQuality` | whole number | `85` | 1–100 | JPEG quality. |
+| `output.saveImages` | true/false | `false` | | Also save every image as a file, with `SHA256SUMS`. |
+| `output.embedImages` | true/false | `true` | | `true`: images inside the report; `false`: linked image files next to it. |
+| `output.jsonSummary` | true/false | `false` | | Also write the results as JSON next to the report. |
+| `output.logDir` | text | `""` | | Folder for a raw console transcript (`vouch_<date>_<time>.log`); empty: none. |
+| `output.failOnWarning` | true/false | `false` | | Exit code 3 when nothing failed but something has a warning. |
+| `output.openReport` | true/false | `false` | | Open the report when finished (only when a person started the run). |
+| `output.captureLog` | true/false | `true` | | Write the capture log `<report>.log` next to the report. |
+| `output.zip.enabled` | true/false | `false` | | Put report, summary, capture log and images into one zip. |
+| `output.zip.name` | text | `"{report}.zip"` | | Zip name; same tokens as the report name. |
+| `report.title` | text | `"Audit Evidence Report"` | | Report title and main heading. |
+| `report.logoPath` | text | `""` | | PNG, JPEG, GIF or SVG logo, at most 1 MB, copied into the report. A problem with it is a warning. |
+| `report.showIndex` | true/false | `true` | | Contents list near the top. |
+| `report.company.name` | text | `""` | | Company name at the top. |
+| `report.company.details` | text | `""` | | More lines about the company; line breaks kept. |
+| `report.description` | text | `""` | | What the evidence is for. |
+| `report.origin` | text | `""` | | Where the capture was made. |
+| `report.generatedBy` | text | `""` | | Who produced the report; empty: the Windows user. |
+| `report.period.from` | text | `""` | | Start of the period under audit, shown as typed. |
+| `report.period.to` | text | `""` | | End of the period, shown as typed. |
+| `report.period.label` | text | `""` | | Name of the period, e.g. `Q3 2026`. |
+| `report.classification` | text | `""` | `""`, `Public`, `Internal`, `Private`, `Confidential` | Coloured banner at the top and bottom, repeated on every printed page. |
+| `pages` | list | `[]` | | The pages, captured in this order (below). |
+
+Values in enums (`"PNG"`, `"Confidential"`) and action types are accepted in any
+capitals.
+
+### Pages
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `id` | text | `p001`, `p002`, … by position | Used by `-Only`. Unique (capitals ignored). |
+| `name` | text | *required* | Heading in the report; used in image file names. |
+| `url` | text | *required* | Must start with `http://` or `https://`. |
+| `notes` | text | `""` | Shown in the report. |
+| `enabled` | true/false | `true` | `false`: kept in the file but not captured in full runs (`-Only` still runs it). |
+| `overrides` | object | `{}` | Any `defaults.*` key, for this page only. |
+| `actions` | list | `[]` | Steps after the page has loaded, in order. A page without a `capture` gets one appended (`scroll.mode` `none`). |
+
+### Actions
+
+| `type` | Fields | Meaning |
+| --- | --- | --- |
+| `click` | `selector` (required) | Clicks the first element matching the CSS selector — on the page, or else inside one of its same-site frames. |
+| `clickText` | `text` (required) | Clicks the link, button or tab whose visible text matches (capitals ignored; exact match first, else the shortest partial match; a partial match never picks a log-out / sign-out control). |
+| `wait` | `seconds` (required, 0–300) | Waits. |
+| `waitFor` | `selector` (required), `timeoutSec` (1–600; default: the page's `navigationTimeoutSec`) | Waits until the element is present and visible. Not in time: a failed step, the page is a WARNING. |
+| `pause` | `message` | Interactive runs: the Vouch dialog with the message (Continue / Wait / Skip). Unattended: skipped, with a WARNING. |
+| `capture` | `label`, `scroll` | Takes the screenshots. `label` is shown under them. |
+
+`capture.scroll`:
+
+| Key | Default | Allowed | Meaning |
+| --- | --- | --- | --- |
+| `mode` | `"none"` | `none` | One screenshot of what is visible. |
+| | | `auto` | Finds what scrolls — the page, the largest inner panel, or a frame — and captures all of it (CSV `ScrollFullPage` `Y`). |
+| | | `page` | Scrolls the page itself. When the window does not scroll, one screen. |
+| | | `area` | Scrolls the element named by `selector` (required). |
+| `selector` | `""` | | The area for `mode` `area`. |
+| `as` | `"segments"` | `segments`, `single` | `single`: one tall image — only with capture area `page`, only when the window itself scrolls and the image stays within 16,384 pixels; otherwise segments with a detail saying why. |
+
+When a click opens another page, Vouch waits for it to load (up to the page's
+`navigationTimeoutSec`) before the next step. A step that fails is recorded and the page
+goes on (it becomes a WARNING); a capture that cannot be taken at all ends the page as
+FAILED. Image files are named `NNN_<name>_segNN.jpg`; the second and later captures of a
+page add `_c02`, `_c03`.
+
+### Precedence
+
+**Command-line switch > configuration file > default.** For the per-page settings this
+means: a switch typed on the command line beats the file's run default **and every
+page's `overrides`** (for example `-CaptureArea page` captures every page as page
+content, including pages that override it). A switch bound to `$false`
+(`-SaveImages:$false`) beats `true` in the file. `-Account` beats a page's
+`overrides.account` too. The Designer's "Run it with every setting spelled out" command
+leaves out a switch for a setting some page overrides, and says so.
+
+## vouch.ps1 parameters
+
+`Get-Help .\vouch.ps1 -Detailed` shows the same list. Settings that also exist in the
+configuration file are named in brackets.
+
+**What to capture**
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `-ConfigPath <file>` | | A configuration file (JSON). Not together with `-CsvPath`. |
+| `-CsvPath <file>` | `captures.csv` next to the script | A CSV capture list. Not together with `-ConfigPath`. |
+| `-Only <id or name>[,…]` | all enabled pages | Run only these pages (ids or names, capitals ignored; CSV rows have ids `p001`, `p002`, …). Runs a switched-off page when it names it. An unknown name stops with the list of pages. |
+
+**Where the results go and what is written**
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `-OutputDir <folder>` | `reports` next to the script (`output.dir`) | Output folder. |
+| `-ReportName <name>` | `VouchReport_<date>_<time>.html` (`output.reportName`) | Report file name, `.html` added when missing; tokens as above. A **name, not a path**: `\ / : * ? " < > \|` and control characters become `_`, spaces and dots at either end are dropped (a NOTE says so). A report of the same name is replaced. |
+| `-ImageFormat jpeg\|png` | `jpeg` (`output.imageFormat`) | Image format. |
+| `-JpegQuality <1-100>` | `85` (`output.jpegQuality`) | JPEG quality. |
+| `-SaveImages` | off (`output.saveImages`) | Also save the images in `images\<report name>\` with `SHA256SUMS`. |
+| `-LinkImages` | off (`output.embedImages` `false`) | The report links to the image files instead of containing them (images always saved). |
+| `-Zip` | off (`output.zip.enabled`) | Make a zip of the report, JSON summary, capture log and images. |
+| `-ZipName <name>` | `{report}.zip` (`output.zip.name`) | Zip name; an existing zip is never replaced (`_2`, `_3` is added). |
+| `-JsonSummary` | off (`output.jsonSummary`) | Write `<report>.json`. |
+| `-NoCaptureLog` | log written (`output.captureLog` `false`) | Do not write the capture log. |
+| `-LogDir <folder>` | none (`output.logDir`) | Write a raw console transcript `vouch_<date>_<time>.log` there. |
+| `-OpenReport` | off (`output.openReport`) | Open the report when finished — only in an interactive run. |
+
+**What the report says**
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `-ReportTitle <text>` | `Audit Evidence Report` (`report.title`) | Title and heading. |
+| `-Classification <level>` | none (`report.classification`) | `Public`, `Internal`, `Private` or `Confidential`. |
+| `-LogoPath <file>` | none (`report.logoPath`) | Logo (PNG, JPEG, GIF, SVG; ≤ 1 MB). |
+| `-CompanyName <text>` | (`report.company.name`) | Company name. |
+| `-CompanyDetails <text>` | (`report.company.details`) | Company details (line breaks: easier in the file). |
+| `-Description <text>` | (`report.description`) | What the evidence is for. |
+| `-Origin <text>` | (`report.origin`) | Where it was captured. |
+| `-GeneratedBy <text>` | the Windows user (`report.generatedBy`) | Who produced the report. |
+| `-PeriodFrom <text>`, `-PeriodTo <text>`, `-PeriodLabel <text>` | (`report.period.*`) | Period under audit, shown as typed. |
+| `-Account <text>` | (`defaults.account`) | Sign-in account; beats page overrides. |
+| `-NoIndex` | index shown (`report.showIndex` `false`) | Leave out the contents list. |
+
+**How pages are captured**
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `-CaptureArea screen\|window\|page` | `screen` (`defaults.captureArea`) | What each image shows. |
+| `-ZoomPercent <25-500>` | `100` (`defaults.zoomPercent`) | Page zoom. |
+| `-NavigationTimeoutSec <5-600>` | `30` (`defaults.navigationTimeoutSec`) | Page load limit. |
+| `-SettleSeconds <0-120>` | `2` (`defaults.settleSeconds`) | Wait after load and after each click. |
+| `-ScrollSettleSeconds <0-120>` | `1` (`defaults.scrollSettleSeconds`) | Wait after each scroll. |
+| `-MaxScrollSegments <1-500>` | `30` (`defaults.maxScrollSegments`) | Most screenshots per scrolled capture. |
+| `-UseVirtualDesktop` | off (`browser.useVirtualDesktop`) | Capture on a separate virtual desktop. |
+
+**Browser**
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `-EdgeProfileDir <folder>` | `%LOCALAPPDATA%\Vouch\EdgeProfile` (`browser.profileDir`) | The audit profile. |
+| `-DebugPort <1024-65535>` | `9222` (`browser.debugPort`) | Debugging port. An Edge already listening there is reused and left open. |
+| `-KeepBrowserOpen` | off (`browser.keepBrowserOpen`) | Leave the Edge this run started open. |
+
+**Run behaviour**
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `-FailOnWarning` | off (`output.failOnWarning`) | Exit 3 when nothing failed but something has a warning. |
+| `-NoPrompt` | off | Never ask anything (see [Prompts](#prompts-and-unattended-runs)). |
+
+**Other modes**
+
+| Parameter | Meaning |
+| --- | --- |
+| `-Verify <report.html>` | Check a report instead of capturing (exit 0 or 4). Needs no browser. |
+| `-LoginSetup` | Open Edge with the audit profile, without debugging, to sign in. |
+| `-Designer` | Open the Vouch Designer. Only `-ConfigPath`, `-DesignerPort`, `-EdgeProfileDir`, `-DebugPort` and `-KeepBrowserOpen` are used with it; others are ignored with a note. |
+| `-DesignerPort <0-65535>` | The Designer's local port; `0` (default) picks a free one. |
+
+**For programs that follow a run**
+
+| Parameter | Meaning |
+| --- | --- |
+| `-EventLogPath <file>` | Write progress events, one JSON object per line ([Event file](#event-file-and-stop-file)). |
+| `-TabId <id>` | Use this tab (DevTools target id) of an already running Edge instead of the first one; it is never closed. |
+
+## Install-VouchSchedule.ps1 parameters
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `-ConfigPath <file>` | | The configuration file to run. Not together with `-CsvPath`. |
+| `-CsvPath <file>` | `captures.csv` next to the script | The CSV capture list to run. |
+| `-Schedule Weekdays\|Daily\|Weekly\|AtLogOn` | `Weekdays` | When it runs. `AtLogOn` runs 3 minutes after you sign in. |
+| `-At <HH:mm>` | `08:00` | Time of day for Weekdays, Daily and Weekly. |
+| `-DaysOfWeek <day>[,…]` | `Monday` | Days for Weekly. |
+| `-OutputDir <folder>` | see below | Output folder. |
+| `-ImageFormat jpeg\|png` | see below | Image format. |
+| `-SaveImages` | see below | Save image files. |
+| `-AllowWarnings` | see below | Warnings count as success. |
+| `-UseVirtualDesktop` | see below | Separate virtual desktop. |
+| `-EdgeProfileDir <folder>` | see below | Audit profile (for a second schedule with other accounts). |
+| `-DebugPort <port>` | see below | Debugging port (for a second schedule on the same machine). |
+| `-MaxRunHours <1-24>` | `2` | Task Scheduler stops a run that takes longer. |
+| `-TaskName <name>` | `Vouch evidence capture` | Task name (for several schedules). |
+| `-Status` | | Show the task, next and last run, the result in words, the counts of the last report, the file it runs, where its reports go, and the newest report and console transcript. |
+| `-RunNow` | | Start the task now. |
+| `-Uninstall` | | Remove the task (reports, logs and the audit profile are kept). |
+
+**With `-ConfigPath`** the seven settings marked "see below" are **overrides**: passed to
+`vouch.ps1` only when you type them (with their value, so `-SaveImages:$false` beats
+`true` in the file), and then they beat the file. Not typed, the file decides —
+including `output.failOnWarning`. **With a CSV** they work as in 1.x: `-OutputDir`
+defaults to `reports` next to the script, `-FailOnWarning` is passed unless
+`-AllowWarnings`.
+
+## Exit codes
 
 | Exit code | Meaning |
 | --- | --- |
-| `0` | Nothing failed (warnings are allowed unless `-FailOnWarning` is set). |
-| `1` | The run could not start: bad CSV, Edge not found, DevTools port unavailable. |
-| `2` | At least one item failed. |
-| `3` | Only with `-FailOnWarning`: nothing failed, but at least one item has a warning — for example an expired session redirecting to a sign-in page. Use this for scheduled jobs so an expired login does not look like a successful run. |
-| `4` | Only with `-Verify`: at least one integrity check failed. |
+| `0` | Nothing failed (warnings are allowed unless `-FailOnWarning`). Also a run stopped by the user with nothing failed. |
+| `1` | The run could not start: a CSV or configuration file with problems, no page to run, `-Only` naming no page, Edge not found, debugging port unavailable, the report cannot be saved under that name; also `-Verify` on a path that does not exist, and `-Designer` that could not start. |
+| `2` | At least one page FAILED. |
+| `3` | Only with `-FailOnWarning`: nothing failed, but at least one page has a warning — for example an expired session redirecting to a sign-in page. |
+| `4` | Only with `-Verify`: the report did not verify. |
 
-## Image metadata, hashes and verification
+## Outputs
 
-A complete example report — ten public websites, with its images and hashes — is in
-[`examples/live-test-2026-09-24`](examples/README.md).
+All next to each other in the output folder; `<report>` is the report's name without
+`.html`.
 
-Every screenshot carries its own description **inside the image file**, so it still says
-what it is when it is separated from the report:
+| File | When | What |
+| --- | --- | --- |
+| `<report>.html` | always | The report. |
+| `images\<report>\NNN_…_segNN.jpg\|png` and `SHA256SUMS` | `-SaveImages`, `-LinkImages` | The images, and their SHA-256 in `sha256sum` format. |
+| `<report>.log` | unless `-NoCaptureLog` | The capture log. |
+| `<report>.json` | `-JsonSummary` | The JSON summary. |
+| `<report>.zip` (or `ZipName`) | `-Zip` | Report, summary, capture log and the run's images + `SHA256SUMS`. |
+| `<LogDir>\vouch_<date>_<time>.log` | `-LogDir` | Raw console transcript. |
+
+**Report forms.** *Self-contained* (default): every image inside the HTML as base64 —
+one file, larger. *Linked* (`-LinkImages`, `output.embedImages: false`): the HTML shows
+`images/<report>/<file>`; the folder must travel with the report (or send the zip).
+Vouch 1.3's `-Verify` cannot read linked reports.
+
+**Report contents.** Classification banner; company header and logo; title; run details
+(classification, description, origin, period, capture window, account, generated by,
+capture log; run start/end, time zone, computer, Windows user, OS, Edge version, browser
+instance, desktop, tool version, definition file, image format, screen resolution, run
+ID, manifest SHA-256 — empty rows are left out); contents list; summary; integrity
+section (manifest and every image's hash); one section per page (requested and final URL,
+HTTP status, scroll capture, capture area, account, notes, steps with their outcome, the
+images with their capture time, URL and SHA-256). Each page's evidence starts on a new
+printed page.
+
+**Capture log** (`<report>.log`, UTF-8, CRLF): a readable account written line by line
+while the run happens — header (computer, user, account, definition file, output folder,
+report, capture defaults, classification, interactive or unattended, pages), then per
+page: opened URL and HTTP status, each action with its result, each image with capture
+number, segment, area, zoom, size and SHA-256, questions and answers, notes, warnings
+and problems; finally the counts, manifest hash, report, summary, zip and exit code. It
+is not part of the report's hashes and not checked by `-Verify`. The copy inside the zip
+ends at the line that says the zip is being made. Not the same as `-LogDir`, which is the
+raw console text.
+
+**JSON summary** (`-JsonSummary`): `Report`, `ExitCode`, `Run` (start/end, time zone,
+computer, user, OS, Edge version, browser instance, desktop, tool version, definition
+file, image format, screen resolution, counts, run ID, manifest SHA-256), `ReportDetails`
+(title, classification, company, logo path, description, origin, generated by, period,
+capture window, account, index shown, image form and folder), `Zip` (`Path`, `Sha256`;
+`null` in the copy inside the zip), `LogPath` and `LogComplete`, and `Items` (per page:
+index, name, URLs, status, HTTP status, scroll and capture area, zoom, account, details,
+steps, and per image the time, SHA-256, file name, URL, segment, bytes, capture number,
+label, area and zoom). No image data.
+
+### Event file and stop file
+
+For programs that follow a run (the Designer does): `-EventLogPath <file>` appends one
+JSON object per line (UTF-8, LF), opened and closed per event with shared access. Every
+line starts with `ts` (local time with offset), `type` and `runId`. Types, in order:
+`runStart`, then per page `pageStart`, `navigation`, any `prompt`/`promptResult` pairs,
+`detail`, `capture` and `action`, then `pageEnd`; `archive` before the zip; `runEnd`
+last. A run that fails to start writes `error` and `runEnd`. `runEnd` carries the exit
+code, report path, counts, stopped flag, zip path and hash, manifest hash, elapsed time
+and capture log path.
+
+Creating `<event file>.stop` stops the run cleanly between steps: the current page ends
+with a "stopped by the user" warning, the pages not started are not reported, and the
+report is still written. A leftover stop file is removed when a run starts.
+
+## Image metadata
+
+Every image carries its own description **inside the file**:
 
 | Where | JPEG (default) | PNG |
 | --- | --- | --- |
@@ -114,100 +436,235 @@ what it is when it is separated from the report:
 | Tool and version | EXIF *Program name* | `Software` |
 | Everything, as JSON | EXIF *Comments* | `Vouch` |
 
-The JSON holds the run ID, item name and number, requested URL, the page URL at the
-moment of capture, the capture time to the millisecond with its UTC offset and in UTC,
-the segment ("3 of 15"), computer, user and screen size. Windows Explorer shows these
-under *Properties → Details*; any EXIF viewer (e.g. `exiftool`) shows them too.
+The JSON holds `Tool`, `RunId`, `ItemIndex`, `ItemName`, `RequestedUrl`, `PageUrl`,
+`CapturedAt` (milliseconds, with offset), `CapturedAtUtc`, `Segment` ("3 of 15"),
+`Computer`, `User`, `Screen`, `CaptureArea`, `ZoomPercent` and `Account`. Windows
+Explorer shows these under *Properties → Details*.
 
 After the metadata is written, the file is hashed with **SHA-256**. The hash is printed
-under each screenshot in the report, listed in the report's *Integrity* section and the
-JSON summary, and — with `-SaveImages` — written to `SHA256SUMS` next to the images,
-in the standard format:
+under each image, listed in the report's *Integrity* section, the JSON summary and the
+capture log, and — with saved images — in `SHA256SUMS`:
 
 ```powershell
 Get-FileHash .\reports\images\VouchReport_...\001_Example_Domain_seg01.jpg   # one image
 sha256sum -c SHA256SUMS                                                       # all of them (Git Bash, WSL, Linux)
 ```
 
-The **manifest SHA-256** at the top of the report is the hash of that list — one value
-that covers every image of the run. Copy it into the workpaper (or the e-mail that sends
-the report) when the evidence is taken.
+The **manifest SHA-256** is the hash of that list — one value covering every image of
+the run, in order. Record it in the workpaper when the evidence is taken. A complete
+example report is in [`examples/live-test-2026-09-24`](examples/README.md).
 
-`.\vouch.ps1 -Verify <report.html>` re-checks a report later, on any Windows machine with
-PowerShell 7 (no browser needed): it re-hashes every embedded screenshot, confirms the
-metadata inside each image matches the report's capture time and URL, recomputes the
-manifest hash, and checks the saved images against `SHA256SUMS`. It exits 0 when
-everything matches and 4 when anything does not.
+## -Verify: what it checks and what it proves
 
-What this does and does not prove: `-Verify` shows the report, the images and the manifest
-are consistent with each other. Someone who rebuilt every image *and* every hash could
-make a consistent forgery — the defence is the manifest hash you recorded somewhere else
-at capture time. If it matches, nothing has changed since.
+`.\vouch.ps1 -Verify <report.html>` checks a report on any Windows machine with
+PowerShell 7 (no browser). It prints one line per check (`OK` / `FAIL`), then
+`VERIFIED: <n> check(s) passed.` (exit 0) or `NOT VERIFIED: <x> of <n> check(s) failed.`
+(exit 4).
 
-## Keeping other applications out of the evidence
+**What is checked.** The report must be exactly what Vouch writes: plain UTF-8 without a
+byte order mark; only the elements, attributes, values and character references Vouch
+writes, each where Vouch puts it; one of the style sheets released Vouch versions
+produce, and the document built as the kind of report that style sheet belongs to (with
+or without report options; with the banner of exactly its classification). Because of
+that strict rule, every picture the report can show is either a screenshot or the single
+company logo: no base address, link, script or other way to load something else can be
+present. Then, for every screenshot: its bytes match the printed SHA-256 (`Image`); the
+capture time and URL stored inside the image match the report (`Metadata`); it is shown
+in the section of the page its file name numbers. Linked images are read only from the
+one `images` folder inside the report's own folder, by exactly the address a browser
+uses. The manifest hash matches all screenshot hashes and file names in their order
+(`Manifest`), so a screenshot removed, added, duplicated or reordered is detected. When
+the images folder is present, every file in `SHA256SUMS` is unchanged (`SHA256SUMS`,
+`File`).
 
-Edge covers the whole screen while capturing, but the taskbar at the bottom (which has
-to be there for the clock) also shows every other application you have open. Add
-`-UseVirtualDesktop` to run the capture on a fresh virtual desktop (Task View):
+**What it does not prove.** It does not prove that the *text* of the report is
+unaltered: headings, status badges, details, URLs and names shown as text, notes, run
+details and even the printed hashes can be edited consistently; the classification can
+be switched to another level by a careful edit; a page that has no screenshot can be
+removed altogether. The logo (stored inside the report) is not hash-checked; it can only
+stand in the company header at the top and is shown at most 220 × 64 pixels (a report
+without report options has no header and no logo). A report rebuilt from scratch with
+new images and new hashes verifies; **only a manifest hash recorded elsewhere at capture
+time shows that a report is the original.** `-Verify` says nothing about the capture
+log, the JSON summary or the zip.
 
-```powershell
-.\vouch.ps1 -UseVirtualDesktop
-.\Install-VouchSchedule.ps1 -At 07:30 -UseVirtualDesktop
-```
+**Hand-edited reports.** Because the check is strict, a report edited by hand — a
+paragraph added, a file re-saved by an editor that reformats it or adds a byte order
+mark — no longer verifies, even when the edit was honest. Reports made by Vouch 1.2,
+1.3 and 2.0 verify (the committed example was made by 1.2).
 
-The script opens a new desktop (as if you pressed Win+Ctrl+D), captures there, and
-closes it again at the end (Win+Ctrl+F4), which returns you to your own desktop. The
-taskbar then shows only the capture Edge — as long as Windows is set to show only the
-current desktop's windows on the taskbar (Settings → System → Multitasking → Desktops,
-the default). **Pinned taskbar icons still appear**, just without the "running" mark; for
-a completely bare taskbar, run captures from a dedicated Windows account with nothing
-pinned.
+## Capture areas and zoom
 
-Windows has no supported way for a script to create desktops, so the keyboard shortcut is
-used, and the documented desktop API then confirms that your other windows really stayed
-behind. The report's **Desktop** line says whether the separate desktop was confirmed;
-if it was not, the capture still runs, on your normal desktop. When an editor running as
-administrator is in front, Windows ignores the shortcut from a non-elevated scheduled run,
-so the script first moves focus to the taskbar and tries again.
+| `captureArea` | Image | Notes |
+| --- | --- | --- |
+| `screen` (default) | The whole primary display, taskbar and clock included (GDI screen copy). | Edge is maximised and brought to the front. A locked screen gives black images. |
+| `window` | The Edge window only: title bar, tabs, address bar; no taskbar. | Cropped from the screen; if the window cannot be measured, that capture falls back to the full screen with a warning. |
+| `page` | The page content, rendered by Edge itself (`Page.captureScreenshot`). | Edge need not be in front and the window is not touched. No address bar or clock in the image; time and URL are in the report and the image metadata. |
+
+**Zoom** (`zoomPercent`, 25–500) is applied through the browser's device-metrics
+emulation, so nothing is stored in the Edge profile; the page reflows to the zoomed
+width. It is cleared at the end of every run. A zoom that could not be applied (or
+re-applied after a reconnect) is recorded as 100 in the images, with a detail.
+
+**One tall image** (`scroll.as: single`): only with `page`, only when the window itself
+scrolls, and only up to **16,384 pixels** of output height (CSS height × pixel ratio ×
+zoom; beyond that Edge silently repeats the top of the page). Otherwise the capture is
+taken as screen-sized segments and a detail says why. Content that grows while the tall
+image is taken is reported.
+
+Hands-on checks not yet done on a real screen: the `window` crop at 125–150 % display
+scaling, zoom in a window that was not maximised at the start, `page` capture with Edge
+behind another window, and tall images of pages with fixed headers. Prefer `screen` or
+`page` where it matters until these are confirmed.
+
+## Prompts and unattended runs
+
+A run is **interactive** when a person started it: not with `-NoPrompt`, not in a
+process without a desktop, and not under `pwsh -NonInteractive` (which is how the
+scheduled task starts it). Then Vouch can ask in its own small topmost window (titled *Vouch -* and the kind
+below, bottom right of the primary screen); it closes, and Edge is brought back to the front,
+before the next screenshot:
+
+| Kind | When | Buttons |
+| --- | --- | --- |
+| *Vouch is paused* | a `pause` action | **Continue** / **Wait N s more** / **Skip this page** |
+| *The page is not ready* | the page did not load, or `waitFor` did not appear, in time — with `onNotReady: prompt` | Wait re-checks for N s |
+| *Sign-in needed* | the page redirected to a sign-in page or another site — with `onNotReady: prompt` | Continue opens the page once more and judges it again |
+
+The countdown (`promptTimeoutSec`, default 300 s) continues by itself, with a warning
+that nobody answered; closing the window is Continue. Wait accepts 5–3600 s (default
+30). Skip ends the page with a warning; images already taken are kept. A stop request
+closes the dialog with Skip.
+
+**Unattended** (scheduled, `-NoPrompt`, `-NonInteractive`): nothing is asked. A pause is
+skipped with a WARNING ("…skipped because nobody was there to answer it…"); a page that
+is not ready or asks for a sign-in is captured as it is, with a warning; `-OpenReport`
+does nothing. The capture log's header says which mode the run had.
+
+Hands-on checks not yet done on a real screen: the dialog's placement, focus and absence
+from screenshots, including when a run is started from the Designer.
+
+## The Designer: how it works and security
+
+- `vouch.ps1 -Designer` (what `Vouch-Designer.cmd` runs) starts a small web server on
+  **`http://localhost:<free port>/`** in the console process. Only this computer can
+  reach it. Each session has a random 256-bit token; the panel receives it in its start
+  address and sends it with every request. Requests without the token, with another
+  `Host` or a foreign `Origin` are refused. The panel is served with a strict
+  Content-Security-Policy and loads nothing from the internet.
+- The **panel** is a separate Edge process with its own profile,
+  `%LOCALAPPDATA%\Vouch\DesignerPanel`, opened as an app window. It is never the audit
+  profile.
+- The **audit Edge** uses `%LOCALAPPDATA%\Vouch\EdgeProfile` (or the configured profile)
+  with the debugging port (default 9222). The Designer opens it if needed, and closes it
+  when the Designer stops only if the Designer opened it. While it is open, the
+  debugging port is reachable from programs running on this computer — like every Vouch
+  run, keep it open only while you work.
+- **Runs and page tests** are child processes running the command shown in the Run tab
+  on a temporary copy of the configuration as shown (unsaved edits included), plus
+  session-only switches listed in the Run tab (`-EventLogPath`, `-TabId`, `-DebugPort`,
+  `-EdgeProfileDir`; for a page test `-Only`, a preview folder, `-SaveImages`, no zip, no
+  opening). The Designer hands the browser to the run and connects again afterwards.
+  A never-saved configuration reads relative folders from `Documents\Vouch`.
+- The **session folder** `%TEMP%\VouchDesigner-<pid>-<random>` holds the run copies,
+  event files and page-test previews. It is removed when the Designer stops; folders of
+  Designers that were killed are removed at the next start.
+- **Files.** The Designer reads and writes only files you choose in its Open, Save,
+  Import and Browse dialogs (plus its own profile and session folder). Save writes
+  atomically and keeps the previous version as `<file>.bak`.
+- **Configuration files from other people**: treat them like any document. Opening one in
+  the Designer runs nothing and reads no other file. **Running it visits its addresses in
+  your signed-in audit browser** and clicks what it says, and reads the logo file it
+  names — look at the pages and steps first.
+
+Full runs from the Designer with the `screen` area show the Designer's taskbar button in
+the evidence; the virtual-desktop option avoids that (the Designer closes the Edge it
+opened, the run opens its own on the new desktop, and the Designer reconnects
+afterwards). A page test ignores the virtual-desktop option. Not yet checked hands-on: the
+real virtual-desktop path from the Designer, and the panel/browser tiling and the panel
+returning to the front after a pick or a run.
+
+## What the picker cannot do
+
+The Pick buttons put a transparent layer over the page in the audit Edge; the page's own
+buttons, links and fields do not act on your click, and only candidates that the engine
+itself finds again exactly (the same matching a run uses) are offered, ranked *Most
+robust*, *Robust*, *Less robust*, *Fragile*. Limits:
+
+- Cannot be picked: elements inside a frame from another site, inside shadow DOM (open or
+  closed), inside a frame shown scaled, mirrored or turned, inside a full-screen element;
+  menu items that only appear on hover (a run cannot hover either); pages that change
+  what is under the pointer at every click. Type the words or a selector instead.
+- A page that listens for every click or key anywhere may still react; the click also
+  counts as user activation for the page. Alt + letter access keys cannot be switched off
+  (the pick is refused).
+- Keys: Esc cancels; scroll keys scroll; browser shortcuts still work (F5 reloads). An
+  IME composition or the page changing a field by itself ends the pick with a message.
+- Menus in closed shadow roots, sub-menus opened only by script before the pick, and
+  unrelated tooltips may close when you click.
+- A page that reloads during a pick is shielded until the layer is back (not inside
+  frames from other sites); the picker removes itself if the Designer stops answering
+  (5 s; 20 s while a click is checked).
+
+Hands-on check not yet done: real IME, emoji panel and voice input during a pick (tested
+through DevTools input only).
 
 ## Running on a schedule
 
-`Install-VouchSchedule.ps1` sets up a Windows scheduled task that runs the capture for
-you — no Task Scheduler clicking needed:
+`Install-VouchSchedule.ps1` sets up a Windows scheduled task — no Task Scheduler clicking
+needed. The Designer's **Schedule it** box shows the command for the saved file.
 
 ```powershell
-.\Install-VouchSchedule.ps1 -At 07:30                    # every weekday at 07:30
+.\Install-VouchSchedule.ps1 -ConfigPath .\q3-itgc.json -Schedule AtLogOn   # 3 minutes after you sign in
+.\Install-VouchSchedule.ps1 -ConfigPath .\q3-itgc.json -At 07:30           # every weekday at 07:30
 .\Install-VouchSchedule.ps1 -Schedule Weekly -DaysOfWeek Monday -At 06:00 `
-    -CsvPath .\q3-itgc.csv -OutputDir C:\Audit\2026-Q3   # weekly, own CSV and folder
-.\Install-VouchSchedule.ps1 -Schedule AtLogOn            # 3 minutes after you sign in
+    -CsvPath .\q3-itgc.csv -OutputDir C:\Audit\2026-Q3                     # weekly, a CSV list
 
 .\Install-VouchSchedule.ps1 -RunNow      # try it straight away
-.\Install-VouchSchedule.ps1 -Status      # next/last run, result in plain words, newest report and log
+.\Install-VouchSchedule.ps1 -Status      # next/last run, result, file, output folder, newest report and log
 .\Install-VouchSchedule.ps1 -Uninstall   # remove the task (reports, logs and logins are kept)
 ```
 
-Running the installer again replaces the task with the new settings. It uses
-`-Daily`, `-Weekdays` (default), `-Weekly` or `-AtLogOn`, plus `-SaveImages`,
-`-ImageFormat`, `-UseVirtualDesktop`, `-MaxRunHours` (default 2) and `-TaskName` if you want several schedules.
+What the task does: it runs PowerShell 7 hidden (`-NoProfile -NonInteractive
+-ExecutionPolicy Bypass`) in **your** signed-in session ("Run only when user is logged
+on"), starts in the script folder with absolute paths, and always passes **`-NoPrompt`**
+and **`-JsonSummary`** (so `-Status` can show the last counts). It keeps a console
+transcript: in the configuration's `output.logDir` when it names one, otherwise
+`-LogDir <output folder>\logs`. A run missed while the PC was off starts as soon as
+possible; two runs never overlap.
 
-What the task does for you: it runs PowerShell 7 hidden in **your** signed-in session,
-starts in the script folder, writes a log of every run to `<reports>\logs\`, and passes
-`-FailOnWarning` so an expired login shows up as *Last Run Result 0x3* instead of a green
-tick (`-AllowWarnings` turns that off). A run missed while the PC was off starts as soon
-as possible, and two runs never overlap.
+**With `-ConfigPath`** the installer first checks the file with `vouch.ps1`'s own checks
+and prints the same messages; a file with problems, no pages, or no page switched on is
+**not scheduled**. It points out settings that make no sense unattended — `openReport`,
+`onNotReady: prompt`, `pause` actions — with what the scheduled run does instead, and
+notes when warnings would count as success. `-Status` reads the output folder from the
+file when it was not typed, and says when the file is missing or broken now. The task
+runs the file as it is at run time, so later edits apply without reinstalling.
+
+Paths are quoted for Task Scheduler (spaces, `&`, `'`, `;`, non-ASCII letters all pass
+unchanged; a drive root stays a root). A path containing a `%NAME%` of a defined Windows
+variable is refused, because Task Scheduler may replace it and offers no way to escape
+it.
 
 **The one thing it cannot do for you:** screen captures need an unlocked desktop. At the
 scheduled time you must be signed in, with the screen unlocked and the screen saver not
-running — otherwise the images come out blank. If your screen locks after inactivity,
-`-Schedule AtLogOn` (run shortly after you sign in) is the most dependable choice. Over
-Remote Desktop, keep the session connected and not minimised. A task set to "run whether
-user is logged on or not" can never work, because that session has no desktop; the
-installer never sets it up that way.
+running — otherwise the images come out blank. `-Schedule AtLogOn` is the most dependable
+choice when your screen locks after inactivity. Over Remote Desktop, keep the session
+connected and not minimised. A task set to "run whether user is logged on or not" can
+never work (that session has no desktop); the installer never sets it up that way.
 
-Sign in once with `.\vouch.ps1 -LoginSetup` before the first scheduled run, and again
-whenever `-Status` reports warnings about expired logins.
+## Keeping other applications out of the evidence
 
-For your own unattended setups, `vouch.ps1 -LogDir <folder>` writes the same run log.
+Edge covers the whole screen while capturing, but the taskbar (which has to be there for
+the clock) also shows every other application you have open. `-UseVirtualDesktop`
+(`browser.useVirtualDesktop`) runs the capture on a fresh virtual desktop (Task View):
+the script opens one (Win+Ctrl+D), captures there, and closes it at the end
+(Win+Ctrl+F4). The taskbar then shows only the capture Edge — as long as Windows shows
+only the current desktop's windows on the taskbar (Settings → System → Multitasking →
+Desktops, the default). **Pinned taskbar icons still appear.** The documented desktop API
+confirms that your other windows stayed behind; the report's **Desktop** line says
+whether the separate desktop was confirmed. An Edge that was already running is reused on
+its own desktop, so no separate desktop is used then.
 
 ## CSV reference
 
@@ -217,161 +674,149 @@ Header: `Name,Url,Steps,ScrollFullPage,Notes`
 | --- | --- | --- |
 | `Name` | yes | Short label for the evidence item. Shown in the report and used in image file names. |
 | `Url` | yes | Page to capture. Must start with `http://` or `https://`. |
-| `Steps` | no | Semicolon-separated actions performed after the page loads, before the screenshot. |
-| `ScrollFullPage` | no | `Y` to scroll the whole page and capture every screenful. Works when the content scrolls inside a panel or a frame rather than the page itself (see *Inner scrolling areas and frames*). Blank or `N` captures one screen. Also accepts `Yes`/`No`, `True`/`False`, `1`/`0`. |
-| `Notes` | no | Free text reproduced in the report — the control reference, what the reviewer should look at, and so on. |
+| `Steps` | no | Semicolon-separated actions after the page loads: `click:<css selector>`, `clicktext:<visible text>`, `wait:<seconds>` (`2.5` and `2,5` both work). |
+| `ScrollFullPage` | no | `Y`: capture everything that scrolls (`auto`); blank or `N`: one screen. Also `Yes`/`No`, `True`/`False`, `1`/`0`. |
+| `Notes` | no | Free text reproduced in the report. |
 
-Fields containing a comma must be quoted, as in any CSV. Excel does this for you.
-Completely blank rows (such as the `,,,,` rows Excel leaves behind) are ignored.
+Fields containing a comma must be quoted. Completely blank rows are ignored.
+[`captures.template.csv`](captures.template.csv) has an example row for each common
+pattern; [`captures.sample.csv`](captures.sample.csv) is a short sample. The Designer's
+**Import CSV…** turns a CSV into pages. CSV rows get the ids `p001`, `p002`, … for
+`-Only`.
 
-### Step grammar
-
-| Step | Effect |
-| --- | --- |
-| `click:<css selector>` | Clicks the first element matching the CSS selector - on the page, or else inside one of its frames. |
-| `clicktext:<visible text>` | Clicks the link, button or tab whose visible text matches. Case-insensitive. Only elements actually shown on the page count. An exact match wins; otherwise the closest partial match (the one with the shortest text). A partial match never picks a log-out / sign-out control, so `clicktext:Log` cannot end the session — write `clicktext:Log out` if you really mean it. |
-| `wait:<seconds>` | Pauses, for pages that load data after rendering. `2.5` and `2,5` both work. |
-
-When a `click:` or `clicktext:` step opens another page, the script waits for that page
-to finish loading (up to `-NavigationTimeoutSec`) before the next step or screenshot.
-
-Combine steps with `;`, for example:
-
-```
-click:#settings-tab ; clicktext:Audit Log ; wait:3
-```
-
-### Inner scrolling areas and frames
-
-Many web applications do not scroll the page itself: a header and menu stay still and
-only a panel inside the page scrolls, or the content sits in a frame. For `ScrollFullPage`
-rows, Vouch looks at what actually scrolls — the page, any large panel inside it, or a
-frame (and panels inside frames) — and steps through the largest one it can see, one
-screenshot per screenful of that area. The report's *Scroll capture* line names what was
-scrolled (for example `div#main`, or `the frame /app/content`). Scrolling areas smaller
-than a quarter of the screen, such as a sidebar or a code box, are left alone.
-
-When a page has a **second** large scrolling area, or a large **frame from another site**
-(the browser does not let a page look into those), the content hidden in it cannot be
-captured; the item is marked WARNING and the reason says which area it was.
-
-`click:` and `clicktext:` steps search the page first, then its frames. Frames from
-another site cannot be searched; when a step fails on such a page the message says so.
-A click that loads a new page inside a frame waits for that frame to finish loading.
-
-Prefer `clicktext:` — it survives redesigns better than a selector. Use `click:` when
-the target has no distinctive text or the same text appears several times.
-
-**Finding a CSS selector:** open the page in Edge, press `F12`, click the arrow icon at
-the top left of DevTools (or press `Ctrl+Shift+C`), and click the element on the page.
-In the Elements panel, right-click the highlighted line and choose
-**Copy → Copy selector**. Paste it after `click:`. Shorten it if you can — `#tab-users`
-is far more durable than a long `body > div:nth-child(3) > ...` chain. A quick way to
-verify: in the DevTools Console, run `document.querySelector('#tab-users')` and confirm
-it returns the element rather than `null`.
+`clicktext:` and `click:` search the page first, then its same-site frames. When a page
+scrolls inside a panel or a frame rather than the window, `ScrollFullPage` `Y` scrolls
+the largest such area it can see (areas smaller than a quarter of the screen are left
+alone); the report's *Scroll capture* line names it. A second large scrolling area, or a
+large frame from another site, cannot be captured and gives a WARNING naming it.
 
 ## How failures appear
 
-Every row gets a status badge in the summary table and in its own section. One row's
-problem never stops the run — the script always continues to the next row.
+One page's problem never stops the run.
 
 | Badge | Meaning |
 | --- | --- |
 | **OK** (green) | Page loaded, all steps ran, screenshots taken. |
-| **WARNING** (amber) | Evidence was captured but needs a look. Typically the final URL is on a different origin than requested ("redirected to … — possible login required"), the page landed on a sign-in page of the same site ("redirected to a sign-in page — the session has probably expired"), a step failed (bad selector, text not found, a page it opened did not load in time), the page did not finish loading in time, the Edge window could not be brought to the front, the page was truncated at the segment cap, or a full-page capture found a second large scrolling area or a frame from another site whose hidden content it could not scroll. |
-| **FAILED** (red) | Either the page could not be reached at all (`net::ERR_NAME_NOT_RESOLVED`, connection refused, or the page did not respond within `-NavigationTimeoutSec` — no screenshot is possible in these cases), or the server returned HTTP 400 or higher. HTTP errors are still captured: the error page is itself evidence. When the server sends an error with an empty body, Edge's own error page is captured instead. |
+| **WARNING** (amber) | Evidence was captured but needs a look: redirected to another site ("possible login required") or to a sign-in page ("the session has probably expired"), a step failed, the page or a wait-for did not finish in time, a pause was skipped or nobody answered, the Edge window could not be brought to the front, the page was truncated at the segment cap, a second scrolling area or a frame from another site could not be scrolled, a tall image fell back to segments, or the user skipped or stopped the page. |
+| **FAILED** (red) | The page could not be reached at all, a capture could not be taken, or the server returned HTTP 400 or higher (the error page is still captured as evidence). |
 
-Each section records the requested URL, the URL actually reached, the HTTP status, the
-outcome of every step and the exact local timestamp of each screenshot, so a reviewer
-can tell "the page redirected to a login screen" apart from "the setting really is off".
-A redirect warning almost always means the session for that application expired.
+Each section records the requested URL, the URL reached, the HTTP status, every step's
+outcome and the exact time of each image, so a reviewer can tell "the page redirected to
+a login screen" apart from "the setting really is off".
 
 ## Tips
 
-- **Do not lock the workstation or start a screensaver while a run is in progress.**
-  Screen captures need a visible desktop; a locked session produces black or blank
-  images. Same for RDP — minimising or disconnecting a remote session stops the desktop
-  from rendering. Start the run and leave the machine alone.
-- Do not use the mouse or keyboard during the run either; a window brought to the front
-  or a popup notification ends up in the evidence.
-- **Multi-monitor:** only the primary display is captured. Keep Edge on the primary
-  monitor; the script maximises it there before each shot.
-- **Report size:** JPEG at quality 85 costs roughly 200–400 KB per screenshot, so a
-  40-screenshot report lands around 10–15 MB, which is fine to attach to a workpaper.
-  `-ImageFormat png` is lossless and typically 4–8x larger; use it only when fine text
-  must be pixel-perfect. Add `-SaveImages` if you also need the images as separate files.
-- Long tables get one screenshot per screenful. Filter or page down the list first if
-  you only need part of it, or raise `-MaxScrollSegments` if 30 screens is not enough.
-- Do a dry run of a new CSV against one or two rows before capturing a full set — it is
-  quicker to fix a selector than to redo a 60-page run.
+- **Do not lock the workstation or start a screensaver while a run is in progress** (black
+  images). Same for RDP: minimising or disconnecting stops the desktop from rendering.
+- Do not use the mouse or keyboard during a `screen` or `window` run; a window brought to
+  the front or a notification ends up in the evidence.
+- **Multi-monitor:** only the primary display is captured; keep Edge on it.
+- **Report size:** JPEG at quality 85 costs roughly 200–400 KB per screenshot. PNG is
+  typically 4–8 times larger. Linked images keep the HTML small.
+- Test a new page (Designer: **Test this page**; command line: `-Only p003`) before a
+  full run.
 
 ## Troubleshooting
 
-**"Edge is already running with the audit profile … but without the DevTools port"** —
-an ordinary Edge window still uses the audit profile, usually the one opened by
-`-LoginSetup`. Close every window of it and rerun. (`-LoginSetup` closes its windows
-itself when you press Enter and warns you if any are left.)
+**"Edge is already running with the audit profile … but without the DevTools port"** /
+Designer: *"Edge is already open with the audit profile, but without the connection Vouch
+needs"* — an ordinary Edge window still uses the audit profile (often from
+`-LoginSetup`, or left by a Designer whose console was closed). Close every window of it
+and retry.
 
-**"Edge did not open its DevTools endpoint on port 9222"** — something else holds the
-port. Pick another port with `-DebugPort 9333`. If a debugging-enabled Edge is already
-listening on the port, the script attaches to it instead of launching a new one and
-notes this in the report. The Edge the script launches is closed at the end of every run
-(unless `-KeepBrowserOpen`), so the debugging port does not stay open.
+**"Edge did not open its DevTools endpoint on port 9222"** / *"Another program is using
+port 9222"* — pick another port (`-DebugPort 9333`, or `browser.debugPort`). If the
+Designer names the Edge policy `RemoteDebuggingAllowed`, remote debugging is switched off
+by your organisation.
 
-**"Microsoft Edge (msedge.exe) was not found"** — Edge is not installed or not
-registered. Install it, or check
+**"Microsoft Edge (msedge.exe) was not found"** — check
 `HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe`.
 
-**Blank, black or wrongly-cropped screenshots** — the session was locked, disconnected
-or the screensaver started during the run. Rerun with the desktop visible. If images
-look scaled or cut off on a high-DPI display, confirm you are running PowerShell 7
-directly on the console rather than inside a tool that hosts it in a DPI-unaware process.
+**Blank, black or wrongly cropped screenshots** — the session was locked, disconnected
+or the screensaver started. If images look scaled or cut off on a high-DPI display, run
+PowerShell 7 directly rather than inside a host that is not DPI-aware, and prefer
+`screen` or `page`.
 
-**Everything redirects to a login page** — the stored session expired. Run
-`.\vouch.ps1 -LoginSetup`, sign in again, and rerun the capture.
+**A sign-in or sync bubble in `screen` captures** (work-joined PCs, fresh profile) — the
+audit Edge is started without `--disable-sync`, so Edge may show it. Close it once in the
+audit Edge, or use `page`.
 
-**A step reports "no element matched"** — the selector or the visible text changed, or
-the element had not rendered yet. Add `wait:3` before the step, or rerun with
-`-KeepBrowserOpen` and try the selector in the DevTools Console.
+**Everything redirects to a login page** — sign in again (Designer: in the audit Edge;
+otherwise `.\vouch.ps1 -LoginSetup`).
 
-**PowerShell refuses to run the script** — it is unsigned, so either unblock it once
-with `Unblock-File .\vouch.ps1` or start it with
+**The Designer panel says it is not answering** — its console was closed or the server
+stopped. Close the panel window too, and start the Designer again. Closing the console
+with X does not close the panel.
+
+**PowerShell refuses to run the script** — unblock the files once
+(`Get-ChildItem -Recurse | Unblock-File`) or start it with
 `pwsh -ExecutionPolicy Bypass -File .\vouch.ps1`.
 
 ## Tests
 
-The `tests` folder holds a Pester suite: unit tests for the CSV parsing, report
-generation and helpers, and integration tests that drive a **headless** Edge (throwaway
-profile, no window, your own profiles untouched) against a local test server, including
-an end-to-end run of the capture loop with only window focus and screen capture mocked.
+The `tests` folder holds a Pester 5 suite: unit tests for parsing, configuration,
+report generation, `-Verify` and the scheduler; integration tests that drive a
+**headless** Edge (throwaway profile and port, no window, your profiles untouched)
+against a local test server (`tests\TestServer.ps1`), including end-to-end runs, the
+Designer's server, panel, picker and runs from the panel.
 
 ```powershell
 Install-Module Pester -Scope CurrentUser -MinimumVersion 5.0   # once
-pwsh .\tests\Invoke-Tests.ps1              # everything (about 1 minute)
-pwsh .\tests\Invoke-Tests.ps1 -UnitOnly    # no browser needed
+pwsh .\tests\Invoke-Tests.ps1                       # everything (a few minutes)
+pwsh .\tests\Invoke-Tests.ps1 -UnitOnly             # no browser needed
+pwsh .\tests\Invoke-Tests.ps1 -IncludeInteractive   # also shows the real Vouch dialog once (opt-in)
 ```
 
-Tests tagged `KnownIssue` document bugs that are not fixed yet and are expected to fail;
-`-ExcludeKnownIssues` leaves them out. `-ResultPath results.xml` writes NUnit XML for CI.
+Tests tagged `KnownIssue` document bugs that are expected to fail; `-ExcludeKnownIssues`
+leaves them out. `-ResultPath results.xml` writes NUnit XML. `-ScriptPath` tests another
+copy of `vouch.ps1`.
 
-### Live test against public websites
+**Live test.** `tests\live\Invoke-LiveTest.ps1` runs the real thing: Edge opens maximised
+on this desktop and captures ten public pages listed in `tests\live\public-sites.csv`,
+then checks status, image count, final URL, image size, the taskbar strip, the exit code
+and that Edge is gone. It takes over the screen and needs internet access; it uses its
+own throwaway profile and port 9333. `-ViaScheduler` runs it through a temporary
+scheduled task; `-UseVirtualDesktop` also checks the desktop was confirmed and closed.
+Results land in `tests\live\output\<date>` (git-ignored).
 
-`tests\live\Invoke-LiveTest.ps1` runs the real thing: Edge opens maximised on this
-desktop and captures ten public pages listed in `tests\live\public-sites.csv` — a plain
-page, a long Wikipedia article in scroll segments, click steps that open other pages, a
-404 with and without a body, an http-to-https upgrade, a failing step and an unreachable
-host. Each row carries its expected status, screenshot count and final URL, and the
-runner checks them, plus: every screenshot exists at full screen size and is not blank,
-the taskbar strip is present, the exit code is right, and Edge is gone afterwards.
+## What changed in 2.0
 
-```powershell
-pwsh .\tests\live\Invoke-LiveTest.ps1                 # about 1 minute; hands off the keyboard and mouse
-pwsh .\tests\live\Invoke-LiveTest.ps1 -ViaScheduler   # same, through a temporary scheduled task
-pwsh .\tests\live\Invoke-LiveTest.ps1 -UseVirtualDesktop   # also checks the desktop was confirmed and closed
-```
+For people upgrading from 1.3:
 
-It takes over the screen, needs internet access, and uses its own throwaway Edge profile
-and port (9333), so the audit profile is never touched. Results, the report and the
-images land in `tests\live\output\<date>` (git-ignored). Public sites change, so an
-unexpected result can mean the site moved rather than that Vouch broke — look at the
-screenshot before concluding either way.
+- **The Vouch Designer** (`Vouch-Designer.cmd`, `vouch.ps1 -Designer`) and **JSON
+  configuration files** (`-ConfigPath`, [above](#the-configuration-file)): action lists
+  (click, click by text, wait, wait-for, pause, several captures per page), explicit
+  scroll areas, per-page overrides, `-Only`. CSV files keep working unchanged.
+- **Capture areas and zoom**: `-CaptureArea screen|window|page`, `-ZoomPercent`.
+- **Prompts**: the Vouch dialog (Continue / Wait / Skip) for pauses and, with
+  `onNotReady: prompt`, pages that are not ready or need a sign-in; `-NoPrompt`.
+- **New report fields**: title, classification banner, logo, company, description,
+  origin, account (per run and per page, also in the image metadata), generated by,
+  period, capture window; contents list; linked-image reports (`-LinkImages`); zip;
+  open when done.
+- **CSV runs change too.** A plain CSV run now gets the contents list (`-NoIndex` removes
+  it), extra run-detail rows (*Capture window*, *Report generated by*, *Capture log*), a
+  *Capture area* line per page, the self-contained-report note, and an `Account` key in
+  each image's metadata.
+- **Capture log on by default**: every capture run writes `<report>.log` next to the
+  report, and it goes into the zip. `-NoCaptureLog` (or `output.captureLog: false`) turns
+  it off.
+- **`-ReportName` is now a file name, not a path**: a value like `sub\x` becomes
+  `sub_x.html` in the output folder (with a NOTE). Use `-OutputDir` for the folder.
+- **Page numbering restarts over the pages actually run**: with `-Only`, or with pages
+  switched off, the report numbers and image file names (`001_…`) count only the pages
+  run.
+- **A command-line value beats a per-page override** in the configuration file.
+- **`-Verify` is stricter**: it accepts only reports exactly as Vouch writes them, so a
+  hand-edited report fails even when the edit was honest; reports must be UTF-8 without
+  a byte order mark. Reports made by 1.2, 1.3 and 2.0 verify. **Linked-image reports cannot be
+  verified by Vouch 1.3.**
+- **JSON summary** gains `ReportDetails`, `Zip`, `LogPath`, `LogComplete`, and per item
+  `Account`, `CaptureArea`, `ZoomPercent` and capture numbers/labels (all additive).
+- **Scheduler**: `-ConfigPath`; `-NoPrompt` always passed; the configuration is checked
+  before a task is created; `-Status` names the file and output folder.
+- **Exit codes** are unchanged; exit 1 now also covers configuration problems, `-Only`
+  naming no page and a report name Windows cannot keep, and `-Verify` exits 4 for
+  hand-edited or re-encoded reports that 1.3 accepted.
+- **Audit browser**: still launched without `--disable-sync` (as in 1.3), so on
+  work-joined PCs a sign-in bubble can appear in full-screen captures of a fresh profile.

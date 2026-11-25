@@ -3628,7 +3628,7 @@ Describe 'Runs from the panel: routes, plan and rules (no browser, no child)' {
     It 'puts the exit code into words: <Code>' -ForEach @(
         @{ Code = 0; RunEnd = $true; Words = 'Finished: every page was captured' }
         @{ Code = 2; RunEnd = $true; Words = 'page\(s\) failed' }
-        @{ Code = 3; RunEnd = $true; Words = 'Fail on warnings' }
+        @{ Code = 3; RunEnd = $true; Words = 'Count warnings as failure' }
         @{ Code = 1; RunEnd = $true; Words = 'could not start: Edge has no tab' }
         @{ Code = 9; RunEnd = $false; Words = 'ended unexpectedly \(exit code 9\)' }
     ) {
@@ -4009,7 +4009,7 @@ Describe 'Runs with a stand-in child process (the run state machine)' -Tag 'Inte
         Get-DesignerRunNextStep -Run (& $make 'full' 7 $false $false $true) | Should -Match '^Try again\. If it happens again'
         Get-DesignerRunNextStep -Run (& $make 'full' -1 $false $true $true) | Should -Match '^Run it again'
         Get-DesignerRunNextStep -Run (& $make 'full' 2 $true $false $true) | Should -Match 'Open the report to see what went wrong'
-        Get-DesignerRunNextStep -Run (& $make 'full' 3 $true $false $true) | Should -Match 'Fail on warnings'
+        Get-DesignerRunNextStep -Run (& $make 'full' 3 $true $false $true) | Should -Match 'Count warnings as failure'
         Get-DesignerRunNextStep -Run (& $make 'full' 0 $true $false $true) | Should -Be ''
         Get-DesignerRunOutcome -Run (& $make 'page' 0 $true $false $true) -ProcessExitCode 0 | Should -Be 'Test finished: this page was captured without problems.'
         Get-DesignerRunOutcome -Run (& $make 'page' 2 $true $false $true) -ProcessExitCode 2 | Should -Match '^Test finished, but the page failed'

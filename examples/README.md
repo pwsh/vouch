@@ -5,6 +5,12 @@
 A real run of `tests\live\Invoke-LiveTest.ps1 -UseVirtualDesktop` against ten public
 websites, on a 1280×800 Windows 11 desktop, 24 September 2026.
 
+It was made by **Vouch 1.2** (the report says `vouch.ps1 v1.2.0`; a CSV run with a
+self-contained report) and still verifies with Vouch 2.0, which also checks reports of
+earlier versions. Reports made by 2.0 have more in them (report details, a contents
+list, a capture log next to the report); see
+[What changed in 2.0](../README.md#what-changed-in-20).
+
 | File | What it is |
 | --- | --- |
 | `live-test.html` | The report, exactly as produced: open it in any browser. |
