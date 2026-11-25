@@ -253,7 +253,7 @@ Describe 'The committed example report' {
 
 Describe 'Get-ReportImageList' {
     It 'finds every image with data-sha256, decodes the values, and skips images without it' {
-        $html = '<p><img class="logo" alt="Company logo" src="data:image/svg+xml;base64,PHN2Zz4="></p>' +
+        $html = '<p><img class="logo" data-vouch-logo alt="Company logo" src="data:image/svg+xml;base64,PHN2Zz4="></p>' +
             '<img data-sha256="' + ('a' * 64) + '" alt="x" data-file="a&amp;b.jpg" src="images/r/a%26b.jpg">' +
             "<img src='images/r/2.jpg' data-file='2.jpg' data-sha256='$('b' * 64)' data-extra>"
         $list = Get-ReportImageList -Html $html
@@ -507,5 +507,110 @@ Describe 'Window capture (screen grab mocked)' {
         }
         finally { $image.Dispose() }
         (Get-ImageMetadata -Bytes $bytes).ItemName | Should -Be 'Admin – users'
+    }
+}
+
+Describe 'What -Verify accepts as shown images (fix round 1)' {
+    BeforeEach {
+        $folder = Join-Path $TestDrive ([guid]::NewGuid())
+        [void](New-Item -ItemType Directory -Path $folder)
+    }
+    BeforeAll {
+        function Edit-Report([string]$Path, [scriptblock]$Change) {
+            [System.IO.File]::WriteAllText($Path, (& $Change ([System.IO.File]::ReadAllText($Path))))
+        }
+        function Get-FailedCheck([string]$Path) { @(Test-ReportIntegrity -Path $Path | Where-Object { -not $_.Ok }) }
+    }
+
+    It 'fails a <Form> report that contains a base element' -ForEach @(@{ Form = 'embedded'; Linked = $false }, @{ Form = 'linked'; Linked = $true }) {
+        $report = New-TestReport -Folder $folder -Linked:$Linked
+        Edit-Report $report { param($h) $h.Replace('<head>', '<head><BASE href="http://evil.example/">') }
+        $failed = Get-FailedCheck $report
+        ($failed | Where-Object Check -eq 'Report').Detail | Should -BeLike '*contains a <base> element*'
+    }
+
+    It 'does not count a base element inside a comment' {
+        $report = New-TestReport -Folder $folder -Linked
+        Edit-Report $report { param($h) $h.Replace('<head>', '<head><!-- <base href="http://x/"> -->') }
+        Get-FailedCheck $report | Should -BeNullOrEmpty
+    }
+
+    It 'fails, naming it, an image shown without a hash' {
+        $report = New-TestReport -Folder $folder
+        Edit-Report $report { param($h) $h.Replace('<h2>Evidence</h2>', '<h2>Evidence</h2><img alt="x" src="data:image/png;base64,AAAA">') }
+        $failed = Get-FailedCheck $report
+        $failed.Check | Should -Be @('Unverified image 1')
+        $failed[0].Detail | Should -BeLike '*(data:image/png;base64,AAAA) that has no SHA-256*'
+    }
+
+    It 'sees an image written as img/src (a slash instead of a space)' {
+        $report = New-TestReport -Folder $folder
+        Edit-Report $report { param($h) $h.Replace('<h2>Evidence</h2>', '<h2>Evidence</h2><img/src="fake.png"/alt="x">') }
+        (Get-FailedCheck $report).Check | Should -Be @('Unverified image 1')
+    }
+
+    It 'reads a tag with ">" inside a quoted value to its real end' {
+        $report = New-TestReport -Folder $folder
+        # Unhashed: the old pattern stopped at the ">" in alt and never saw the image.
+        Edit-Report $report { param($h) $h.Replace('<h2>Evidence</h2>', '<h2>Evidence</h2><img alt="a > b" src="fake.png">') }
+        (Get-FailedCheck $report).Check | Should -Be @('Unverified image 1')
+        # Hashed: still checked in full.
+        $report2 = New-TestReport -Folder (Join-Path $folder 'second') -Linked
+        Edit-Report $report2 { param($h) $h.Replace('<img alt="', '<img title="1 > 0" alt="') }
+        Get-FailedCheck $report2 | Should -BeNullOrEmpty
+        @(Test-ReportIntegrity -Path $report2 | Where-Object Check -like 'Metadata *').Count | Should -Be 2
+    }
+
+    It 'ignores images inside comments, hashed or not' {
+        $report = New-TestReport -Folder $folder
+        Edit-Report $report {
+            param($h)
+            $first = [regex]::Match($h, '<img alt="[^"]*" data-file[^>]*>').Value
+            $h.Replace('<h2>Evidence</h2>', "<h2>Evidence</h2><!-- <img src=""fake.png""> $first -->")
+        }
+        Get-FailedCheck $report | Should -BeNullOrEmpty
+        @(Test-ReportIntegrity -Path $report | Where-Object Check -like 'Image *').Count | Should -Be 2
+    }
+
+    It 'allows the company logo, and only when it is marked as the logo' {
+        $report = New-TestReport -Folder $folder -Linked
+        Edit-Report $report { param($h) $h.Replace('<body>', '<body><img class="logo" data-vouch-logo alt="Company logo" src="data:image/png;base64,iVBORw0KGgo=">') }
+        Get-FailedCheck $report | Should -BeNullOrEmpty
+        Edit-Report $report { param($h) $h.Replace(' data-vouch-logo', '') }
+        (Get-FailedCheck $report).Check | Should -Be @('Unverified image 1')
+    }
+
+    It 'fails a screenshot that also has a srcset' {
+        $report = New-TestReport -Folder $folder
+        Edit-Report $report { param($h) ([regex]'<img alt=').Replace($h, '<img srcset="fake.png 1x" alt=', 1) }
+        (Get-FailedCheck $report).Check | Should -Contain 'Image 003_Admin_users_seg01.jpg'
+    }
+
+    It 'fails a <Form> report with one screenshot tag duplicated' -ForEach @(@{ Form = 'embedded'; Linked = $false }, @{ Form = 'linked'; Linked = $true }) {
+        $report = New-TestReport -Folder $folder -Linked:$Linked
+        Edit-Report $report { param($h) $tag = [regex]::Match($h, '<img alt="[^"]*" data-file[^>]*>').Value; $h.Replace($tag, "$tag`n$tag") }
+        (Get-FailedCheck $report).Check | Should -Contain 'Manifest'
+    }
+
+    It 'fails a <Form> report with two screenshot tags swapped' -ForEach @(@{ Form = 'embedded'; Linked = $false }, @{ Form = 'linked'; Linked = $true }) {
+        $report = New-TestReport -Folder $folder -Linked:$Linked
+        Edit-Report $report {
+            param($h)
+            $tags = [regex]::Matches($h, '<img alt="[^"]*" data-file[^>]*>')
+            $a = $tags[0].Value; $b = $tags[1].Value
+            $h.Replace($a, '@@A@@').Replace($b, $a).Replace('@@A@@', $b)
+        }
+        (Get-FailedCheck $report).Check | Should -Contain 'Manifest'
+    }
+
+    It 'fails the <Form> report whose screenshot lacks <Attribute>' -ForEach @(
+        @{ Form = 'embedded'; Linked = $false; Attribute = 'data-captured' }, @{ Form = 'embedded'; Linked = $false; Attribute = 'data-url' }
+        @{ Form = 'linked'; Linked = $true; Attribute = 'data-captured' }, @{ Form = 'linked'; Linked = $true; Attribute = 'data-url' }
+    ) {
+        $report = New-TestReport -Folder $folder -Linked:$Linked
+        Edit-Report $report { param($h) ([regex]" $Attribute=""[^""]*""").Replace($h, '', 1) }
+        $failed = Get-FailedCheck $report
+        $failed.Check | Should -Be @('Metadata 003_Admin_users_seg01.jpg')
+        $failed[0].Detail | Should -BeLike '*differs from the report*'
     }
 }

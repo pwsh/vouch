@@ -1928,7 +1928,7 @@ Describe 'Report content (-Options)' {
     }
 
     It 'shows the company block with the logo as an image and the details on their own lines' {
-        $script:Html | Should -Match '<header class="company"><img class="logo" alt="Company logo" src="data:image/png;base64,iVBORw0KGgo=">'
+        $script:Html | Should -Match '<header class="company"><img class="logo" data-vouch-logo alt="Company logo" src="data:image/png;base64,iVBORw0KGgo=">'
         $script:Html | Should -Match '<div class="company-name">ACME &lt;script&gt;'
         $script:Html | Should -Match "<div class=""company-details"">1 Main St`nSpringfield &lt;b&gt;x&lt;/b&gt;</div>"
         $script:Html | Should -Match 'white-space: pre-line'
@@ -2152,7 +2152,7 @@ Describe 'Get-LogoDataUri' {
             -Options (New-ReportOptions -LogoDataUri $logo.DataUri -CompanyName 'ACME')
         $html | Should -Not -Match '<svg'
         $html | Should -Not -Match '<script>'
-        $html | Should -Match '<img class="logo" alt="Company logo" src="data:image/svg\+xml;base64,'
+        $html | Should -Match '<img class="logo" data-vouch-logo alt="Company logo" src="data:image/svg\+xml;base64,'
     }
 
     It 'warns and gives no logo for <Case>' -ForEach @(
@@ -2506,5 +2506,48 @@ Describe 'Capture log: the second sink of the progress events' {
         { Write-RunEvent -Type 'error' -Data ([ordered]@{ message = 'x' }) 6>$null } | Should -Not -Throw
         $script:CaptureLogComplete | Should -BeFalse
         @(Get-Content -LiteralPath $events).Count | Should -Be 1
+    }
+}
+
+Describe 'Ending a run with an error: details and log state (fix round 1)' {
+    AfterEach {
+        $script:EventLogPath = ''
+        $script:CaptureLogPath = ''
+        $script:EventItem = $null
+        $script:CaptureLogComplete = $true
+        $script:CaptureLogWarned = $false
+    }
+
+    It 'writes the details a page gained just before a run-level error, before the error' {
+        $log = Join-Path $TestDrive 'failed.log'
+        $events = Join-Path $TestDrive 'failed.ndjson'
+        $script:EventLogPath = $events
+        Start-CaptureLog -Path $log
+        $item = [pscustomobject]@{ Index = 1; Status = 'WARNING'; Details = [System.Collections.Generic.List[string]]::new() }
+        $script:EventItem = $item
+        $script:EventDetailCount = 0
+        $item.Details.Add('The zoom could not be set.')
+        Write-RunFailedEvent -Message 'Edge went away.'
+        @(Get-Content -LiteralPath $events | ConvertFrom-Json | ForEach-Object type) | Should -Be @('detail', 'error', 'runEnd')
+        $lines = @(Get-Content -LiteralPath $log | ForEach-Object { $_.Substring(32) })
+        $lines[0..1] | Should -Be @('  Warning: The zoom could not be set.', 'ERROR: Edge went away.')
+    }
+
+    It 'resets the capture log state after a run, so the next run does not report a stale one' {
+        $script:CaptureLogComplete = $false
+        $script:CaptureLogWarned = $true
+        Mock Assert-Environment { }
+        Mock Initialize-NativeInterop { }
+        { Invoke-Main -BoundParameters @{ Verify = 'C:\no\such\report.html' } 6>$null } | Should -Throw
+        $script:CaptureLogComplete | Should -BeTrue
+        $script:CaptureLogWarned | Should -BeFalse
+
+        # A run that fails before its capture log starts says the (absent) log is not incomplete.
+        $events = Join-Path $TestDrive 'early.ndjson'
+        { Invoke-Main -BoundParameters @{ CsvPath = 'C:\no\such\pages.csv'; EventLogPath = $events } 6>$null } | Should -Throw '*not found*'
+        $runEnd = @(Get-Content -LiteralPath $events | ConvertFrom-Json)[-1]
+        $runEnd.type | Should -Be 'runEnd'
+        $runEnd.logPath | Should -Be ''
+        $runEnd.logComplete | Should -BeTrue
     }
 }

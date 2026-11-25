@@ -2208,7 +2208,7 @@ Describe 'Report form, zip and opening the report (headless Edge, page capture a
     It 'shows the report fields from the file' {
         $script:FormHtml | Should -Match '<h1>Q3 ITGC &lt;evidence&gt;</h1>'
         $script:FormHtml | Should -Match 'class="classification top cls-confidential"'
-        $script:FormHtml | Should -Match '<img class="logo" alt="Company logo" src="data:image/png;base64,'
+        $script:FormHtml | Should -Match '<img class="logo" data-vouch-logo alt="Company logo" src="data:image/png;base64,'
         $script:FormHtml | Should -Match '<div class="company-name">ACME Audit</div>'
         $script:FormHtml | Should -Match '<td class="k">Period covered</td><td>2026-07-01 to 2026-09-30</td>'
         $script:FormHtml | Should -Match '<td class="k">Account used</td><td>svc-audit@example.com</td>'

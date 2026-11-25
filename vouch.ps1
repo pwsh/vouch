@@ -3151,7 +3151,7 @@ function Write-RunEvent {
     $eventPath = $script:EventLogPath
     $logPath = $script:CaptureLogPath
     if ([string]::IsNullOrEmpty($eventPath) -and [string]::IsNullOrEmpty($logPath)) { return }
-    if ($Type -in 'navigation', 'action', 'capture', 'prompt', 'promptResult', 'pageEnd') { Write-PendingDetailEvent }
+    if ($Type -in 'navigation', 'action', 'capture', 'prompt', 'promptResult', 'pageEnd', 'error') { Write-PendingDetailEvent }
 
     $record = [ordered]@{
         ts    = [System.DateTimeOffset]::Now.ToString('yyyy-MM-ddTHH:mm:ss.fffzzz', [System.Globalization.CultureInfo]::InvariantCulture)
@@ -5282,7 +5282,8 @@ table.contents ul { margin: 4px 0 0 0; padding-left: 18px; }
         [void]$sb.Append('<header class="company">')
         if ($Options.LogoDataUri) {
             # Only ever an <img> source: an SVG logo shown this way cannot run script.
-            [void]$sb.Append("<img class=""logo"" alt=""Company logo"" src=""$(Encode-Html $Options.LogoDataUri)"">")
+            # data-vouch-logo: -Verify accepts this one image without a hash, and no other.
+            [void]$sb.Append("<img class=""logo"" data-vouch-logo alt=""Company logo"" src=""$(Encode-Html $Options.LogoDataUri)"">")
         }
         [void]$sb.Append('<div class="company-text">')
         if ($Options.CompanyName) { [void]$sb.Append("<div class=""company-name"">$(Encode-Html $Options.CompanyName)</div>") }
@@ -5753,19 +5754,33 @@ function ConvertTo-RunSummaryJson {
     return ($summary | ConvertTo-Json -Depth 6)
 }
 
+function Remove-HtmlComment {
+    # Text inside <!-- --> is never shown, so it is neither checked nor counted. An
+    # unclosed comment hides the rest of the page in a browser, and so here.
+    param([AllowEmptyString()][string]$Html)
+    return [regex]::Replace($Html, '<!--.*?(?:-->|\z)', '', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+}
+
 function Get-ReportImageList {
     <#
-        Every screenshot in a report: each <img> that carries data-sha256 (the logo and
-        anything else without one is not evidence and is skipped), with its attributes
-        read one by one, in whatever order they come, and HTML-decoded. Reading them
-        individually is what lets a linked report (relative src) and a report written
-        by another tool or version be checked; a fixed pattern could not.
-        Returns a list of { Attributes (name -> value, case-insensitive); Position }.
+        The images of a report: each <img> outside comments, with its attributes read one
+        by one, in whatever order they come, and HTML-decoded. Reading them individually
+        is what lets a linked report (relative src) and a report written by another tool
+        or version be checked; a fixed pattern could not. The tag is found the way a
+        browser reads it: a ">" inside a quoted value does not end it, and "<img/src=..."
+        is an image too - otherwise an image could be shown that -Verify never sees.
+        Without -All only the screenshots (data-sha256) are returned.
+        Returns a list of { Attributes (name -> value, case-insensitive); Position; Hashed }.
     #>
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$Html)
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Html,
+        [switch]$All
+    )
     $list = [System.Collections.Generic.List[object]]::new()
-    $attributePattern = [regex]'\s([^\s=/>"'']+)(?:\s*=\s*(?:"([^"]*)"|''([^'']*)''|([^\s"''>]+)))?'
-    foreach ($tag in [regex]::Matches($Html, '<img\b[^>]*>', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+    $Html = Remove-HtmlComment -Html $Html
+    $attributePattern = [regex]'[\s/]+([^\s=/>"'']+)(?:\s*=\s*(?:"([^"]*)"|''([^'']*)''|([^\s"''>]+)))?'
+    $tagPattern = '<img(?=[\s/>])(?:[^>"'']|"[^"]*"|''[^'']*'')*>'
+    foreach ($tag in [regex]::Matches($Html, $tagPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
         $attributes = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         # Group 0 starts with "<img"; the attributes follow it.
         foreach ($match in $attributePattern.Matches($tag.Value.Substring(4))) {
@@ -5776,13 +5791,13 @@ function Get-ReportImageList {
             else { $match.Groups[4].Value }
             $attributes[$name] = [System.Net.WebUtility]::HtmlDecode($raw)
         }
-        if ($attributes.ContainsKey('data-sha256')) {
-            $list.Add([pscustomobject]@{ Attributes = $attributes; Position = $tag.Index })
+        $hashed = $attributes.ContainsKey('data-sha256')
+        if ($hashed -or $All) {
+            $list.Add([pscustomobject]@{ Attributes = $attributes; Position = $tag.Index; Hashed = $hashed })
         }
     }
     return , $list
 }
-
 function Resolve-ReportImagePath {
     <#
         Where a linked image's file is, for -Verify. The report is untrusted input: a
@@ -5845,8 +5860,24 @@ function Test-ReportIntegrity {
     $results = [System.Collections.Generic.List[object]]::new()
     $add = { param($Check, $Ok, $Detail) $results.Add([pscustomobject]@{ Check = $Check; Ok = [bool]$Ok; Detail = $Detail }) }
 
-    $images = Get-ReportImageList -Html $html
+    # A <base> element sends a browser to another place for every relative image, while
+    # -Verify reads the files next to the report. Vouch never writes one.
+    if ([regex]::IsMatch((Remove-HtmlComment -Html $html), '<base(?=[\s/>])', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+        & $add 'Report' $false 'The report contains a <base> element, which makes a browser load the images from somewhere else than the files checked here. A report made by Vouch never contains one.'
+    }
+    $allImages = Get-ReportImageList -Html $html -All
+    $images = @($allImages | Where-Object Hashed)
     if ($images.Count -eq 0) { & $add 'Report' $false 'No hashed screenshots found - not a Vouch 1.2+ report, or it has no captures.' }
+    # Every image a browser would show must be one that is checked; only the company
+    # logo (data-vouch-logo) is shown without a hash.
+    $unhashed = 0
+    foreach ($image in @($allImages | Where-Object { -not $_.Hashed })) {
+        if ($image.Attributes.ContainsKey('data-vouch-logo')) { continue }
+        $unhashed++
+        $source = if ($image.Attributes.ContainsKey('src')) { [string]$image.Attributes['src'] } else { '' }
+        if ($source.Length -gt 60) { $source = $source.Substring(0, 60) + '...' }
+        & $add "Unverified image $unhashed" $false "the report shows an image ($(if ($source) { $source } else { 'no src' })) that has no SHA-256, so it cannot be checked. A report made by Vouch never contains one."
+    }
 
     $manifestLines = [System.Collections.Generic.List[string]]::new()
     $number = 0
@@ -5863,6 +5894,11 @@ function Test-ReportIntegrity {
             continue
         }
 
+        # srcset lets a browser show another picture than src, which is the one checked.
+        if ($attributes.ContainsKey('srcset')) {
+            & $add "Image $label" $false 'it has a srcset, so a browser may show another picture than the one checked'
+            continue
+        }
         $bytes = $null
         $source = & $read 'src'
         try {
@@ -7024,6 +7060,8 @@ function Invoke-Main {
         $script:EventLogPath = ''
         $script:StopRequested = $false
         $script:CaptureLogPath = ''
+        $script:CaptureLogComplete = $true
+        $script:CaptureLogWarned = $false
         $script:EventItem = $null
     }
 }
