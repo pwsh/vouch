@@ -360,7 +360,7 @@ Plain page after the slow one,$Web/ok,,N,
         Mock New-HtmlReport {
             $global:VouchE2E.Items = $Items
             $global:VouchE2E.Run = $Run
-            & $script:RealNewHtmlReport -Items $Items -Run $Run
+            & $script:RealNewHtmlReport -Items $Items -Run $Run -Options $Options
         }
 
         Invoke-Main 6>$null
@@ -544,7 +544,7 @@ Plain page after the slow one,$Web/ok,,N,
         $config['output']['reportName'] = 'cfg.html'
         $config['output']['saveImages'] = $true
         $config['output']['jsonSummary'] = $true
-        $config['report']['title'] = 'Not applied yet'
+        $config['report']['title'] = 'Configured title'
         $capture = [ordered]@{ type = 'capture'; scroll = [ordered]@{ mode = 'none' } }
         # Third in the file: the pages after it must keep the CSV run's numbers and file names.
         $config['pages'].Insert(2, [ordered]@{ id = 'off'; name = 'Switched off'; url = "$Web/ok"; enabled = $false; actions = @($capture) })
@@ -573,7 +573,7 @@ Plain page after the slow one,$Web/ok,,N,
         Mock New-HtmlReport {
             $global:VouchCfg.Items = $Items
             $global:VouchCfg.Run = $Run
-            & $script:RealNewHtmlReportForConfig -Items $Items -Run $Run
+            & $script:RealNewHtmlReportForConfig -Items $Items -Run $Run -Options $Options
         }
         # Record that the page's own timing reached the engine, then do the real work.
         Mock Wait-PageReady -ParameterFilter { $TimeoutSec -eq 9 } {
@@ -643,10 +643,9 @@ Plain page after the slow one,$Web/ok,,N,
         $script:CfgItems['Own timing'].Captures.Count | Should -Be 1
     }
 
-    It 'says once which settings have no effect yet' {
-        $lines = @($script:CfgOutput -split "`r?`n" | Where-Object { $_ -like 'WARNING: this version of Vouch does not apply*' })
-        $lines.Count | Should -Be 1
-        $lines[0] | Should -Match 'report\.title'
+    It 'applies every setting of the file: the report title is used, and nothing is listed as having no effect' {
+        $script:CfgOutput | Should -Not -Match 'does not apply'
+        [System.IO.File]::ReadAllText($script:CfgReportFile) | Should -Match '<h1>Configured title</h1>'
     }
 
     It 'produces a report that -Verify accepts' {
@@ -720,7 +719,7 @@ Tall page,$Web/tall?px=3000,,Y,
         @($script:Single).Count | Should -Be 1
         $script:Single.PSObject.Properties.Name | Should -Be @(
             'Index', 'Name', 'Url', 'FinalUrl', 'Notes', 'StepsText', 'ScrollFullPage', 'ScrollArea',
-            'Status', 'HttpStatus', 'Details', 'StepLog', 'Captures', 'CaptureArea', 'ZoomPercent')
+            'Status', 'HttpStatus', 'Details', 'StepLog', 'Captures', 'CaptureArea', 'ZoomPercent', 'Account')
         $script:Single.Captures.GetType().Name | Should -Be 'List`1'
     }
 
@@ -1208,7 +1207,7 @@ Describe 'Invoke-Main with several captures per page (desktop functions mocked)'
         }
         Mock New-HtmlReport {
             $global:VouchMulti.Items = $Items
-            & $script:RealNewHtmlReportForMulti -Items $Items -Run $Run
+            & $script:RealNewHtmlReportForMulti -Items $Items -Run $Run -Options $Options
         }
         Invoke-Main -BoundParameters @{ ConfigPath = $path } 6>$null
         $script:MultiExit = $script:ExitCode
@@ -1403,7 +1402,7 @@ Describe 'Capture area: page content, end to end (nothing mocked but the screen 
         Mock Clear-PageZoom { $global:VouchArea.Clears++; & $script:RealClearPageZoom }
         Mock New-HtmlReport {
             $global:VouchArea.Items = $Items
-            & $script:RealNewHtmlReportForArea -Items $Items -Run $Run
+            & $script:RealNewHtmlReportForArea -Items $Items -Run $Run -Options $Options
         }
         Invoke-Main -BoundParameters @{ ConfigPath = $path } 6>$null
         $script:AreaExit = $script:ExitCode
@@ -2103,5 +2102,247 @@ Describe 'Progress events, stop and -TabId (headless Edge, desktop functions moc
         @($events.type) | Should -Be @('error', 'runEnd')
         $events[0].message | Should -Match 'has no pages'
         $events[1].exitCode | Should -Be 1
+    }
+}
+
+Describe 'Report form, zip and opening the report (headless Edge, page capture area, nothing of the page path mocked)' -Tag 'Integration' {
+    BeforeAll {
+        Close-CdpSocket
+        # The page capture area needs neither the screen nor the window; they must not be used.
+        Mock Get-ScreenCapture { throw 'the screen must not be captured in a page-area run' }
+        Mock Set-EdgeForeground { throw 'the window must not be brought forward in a page-area run' }
+        $script:RealNewHtmlReportForForm = ${function:New-HtmlReport}
+        $global:VouchForm = @{ Opened = @() }
+        Mock Open-ReportFile { $global:VouchForm.Opened += $Path }
+        Mock New-HtmlReport {
+            $global:VouchForm.Items = $Items
+            $global:VouchForm.Options = $Options
+            & $script:RealNewHtmlReportForForm -Items $Items -Run $Run -Options $Options
+        }
+
+        $folder = Join-Path -Path $TestDrive -ChildPath 'form'
+        [void](New-Item -ItemType Directory -Path $folder)
+        $bitmap = [System.Drawing.Bitmap]::new(40, 20)
+        try { $bitmap.Save((Join-Path $folder 'logo.png'), [System.Drawing.Imaging.ImageFormat]::Png) } finally { $bitmap.Dispose() }
+
+        $config = Get-DefaultVouchConfig
+        $config['browser']['profileDir'] = $script:ProfileDir
+        $config['browser']['debugPort'] = $script:CdpPort
+        $config['defaults']['captureArea'] = 'page'
+        $config['defaults']['account'] = 'svc-audit@example.com'
+        $config['defaults']['navigationTimeoutSec'] = 10
+        $config['defaults']['settleSeconds'] = 0.1
+        $config['defaults']['scrollSettleSeconds'] = 0.1
+        $config['output']['dir'] = 'out'
+        $config['output']['reportName'] = 'evidence {date}'
+        $config['output']['embedImages'] = $false
+        $config['output']['jsonSummary'] = $true
+        $config['output']['openReport'] = $true
+        $config['output']['zip']['enabled'] = $true
+        $config['output']['zip']['name'] = '{report} {classification} {nope}'
+        $config['report']['title'] = 'Q3 ITGC <evidence>'
+        $config['report']['classification'] = 'Confidential'
+        $config['report']['logoPath'] = 'logo.png'
+        $config['report']['company']['name'] = 'ACME Audit'
+        $config['report']['company']['details'] = "1 Main Street`nSpringfield"
+        $config['report']['period']['from'] = '2026-07-01'
+        $config['report']['period']['to'] = '2026-09-30'
+        $config['pages'].Add([ordered]@{ id = 'p1'; name = 'Plain'; url = "$Web/ok" })
+        $config['pages'].Add([ordered]@{ id = 'p2'; name = 'Tabs'; url = "$Web/tabs"; overrides = [ordered]@{ account = 'admin@example.com' }
+                actions = @([ordered]@{ type = 'capture'; label = 'First view' }
+                    [ordered]@{ type = 'capture'; label = 'Tall'; scroll = [ordered]@{ mode = 'page' } }) })
+        $script:FormConfig = Join-Path -Path $folder -ChildPath 'form.json'
+        [System.IO.File]::WriteAllText($script:FormConfig, ($config | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+        $script:FormLog = Join-Path -Path $folder -ChildPath 'events.ndjson'
+
+        Mock Test-InteractiveRun { $true }
+        $script:FormOutput = Invoke-Main -BoundParameters @{ ConfigPath = $script:FormConfig; EventLogPath = $script:FormLog } 6>&1 | Out-String
+        $script:FormExit = $script:ExitCode
+        $script:FormItems = @($global:VouchForm.Items)
+        $script:FormEvents = @(Get-Content -LiteralPath $script:FormLog -Encoding utf8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
+        $script:FormEnd = $script:FormEvents[-1]
+        $script:FormReport = $script:FormEnd.reportPath
+        $script:FormHtml = [System.IO.File]::ReadAllText($script:FormReport)
+
+        function Invoke-VouchVerify([string]$Report) {
+            $pwsh = (Get-Process -Id $PID).Path
+            $out = Join-Path -Path $TestDrive -ChildPath ("verify-{0}.txt" -f [guid]::NewGuid())
+            $process = Start-Process -FilePath $pwsh -NoNewWindow -Wait -PassThru -RedirectStandardOutput $out `
+                -ArgumentList @('-NoProfile', '-NonInteractive', '-File', "`"$script:VouchPath`"", '-Verify', "`"$Report`"")
+            return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = (Get-Content -LiteralPath $out -Raw) }
+        }
+        function Copy-Evidence([string]$Name) {
+            # A copy of the extracted zip, to be tampered with.
+            $target = Join-Path -Path $TestDrive -ChildPath $Name
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($script:FormEnd.zipPath, $target)
+            return Join-Path -Path $target -ChildPath ([System.IO.Path]::GetFileName($script:FormReport))
+        }
+        Add-Type -AssemblyName System.IO.Compression.ZipFile
+    }
+
+    AfterAll { Remove-Variable -Name VouchForm -Scope Global -ErrorAction SilentlyContinue }
+
+    It 'writes a linked report that verifies, and keeps no base64 copy of the images' {
+        $script:FormExit | Should -Be 0 -Because $script:FormOutput
+        $script:FormReport | Should -BeLike "*\out\evidence $((Get-Date).ToString('yyyy-MM-dd')).html"
+        $results = @(Test-ReportIntegrity -Path $script:FormReport)
+        @($results | Where-Object { -not $_.Ok }) | Should -BeNullOrEmpty
+        $images = @($script:FormItems | ForEach-Object { $_.Captures })
+        $images.Count | Should -BeGreaterOrEqual 3
+        @($results | Where-Object Check -like 'Image *').Count | Should -Be $images.Count
+        @($images | Where-Object { $_.Base64 }) | Should -BeNullOrEmpty
+        $script:FormHtml | Should -Not -Match 'data:image/jpeg'
+        $script:FormHtml | Should -Match ([regex]::Escape("src=""images/evidence%20$((Get-Date).ToString('yyyy-MM-dd'))/001_Plain_seg01.jpg"""))
+        $script:FormHtml | Should -Match '<strong>Linked report:</strong>'
+    }
+
+    It 'shows the report fields from the file' {
+        $script:FormHtml | Should -Match '<h1>Q3 ITGC &lt;evidence&gt;</h1>'
+        $script:FormHtml | Should -Match 'class="classification top cls-confidential"'
+        $script:FormHtml | Should -Match '<img class="logo" alt="Company logo" src="data:image/png;base64,'
+        $script:FormHtml | Should -Match '<div class="company-name">ACME Audit</div>'
+        $script:FormHtml | Should -Match '<td class="k">Period covered</td><td>2026-07-01 to 2026-09-30</td>'
+        $script:FormHtml | Should -Match '<td class="k">Account used</td><td>svc-audit@example.com</td>'
+        $script:FormHtml | Should -Match '<dt>Account</dt><dd>admin@example.com</dd>'
+        $script:FormHtml | Should -Match '<li><a href="#item-2-c2">Capture 2: Tall</a></li>'
+        $script:FormHtml | Should -Match '<figure id="item-2-c2">'
+    }
+
+    It 'records the page''s account inside each image file' {
+        $tabs = $script:FormItems | Where-Object Name -eq 'Tabs'
+        $bytes = [System.IO.File]::ReadAllBytes($tabs.Captures[0].FilePath)
+        (Get-ImageMetadata -Bytes $bytes).Account | Should -Be 'admin@example.com'
+    }
+
+    It 'makes one zip with exactly the report, the summary and the images, named from the template' {
+        $output = $script:FormOutput
+        $output | Should -Match 'the zip name has the token \{nope\}'
+        $zip = $script:FormEnd.zipPath
+        $zip | Should -Exist
+        [System.IO.Path]::GetFileName($zip) | Should -Be "evidence $((Get-Date).ToString('yyyy-MM-dd')) Confidential {nope}.zip"
+        $stem = [System.IO.Path]::GetFileNameWithoutExtension($script:FormReport)
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
+        try { $entries = @($archive.Entries.FullName | Sort-Object) } finally { $archive.Dispose() }
+        $expected = @("$stem.html", "$stem.json", "images/$stem/SHA256SUMS") + @($script:FormItems | ForEach-Object { $_.Captures } | ForEach-Object { "images/$stem/$($_.FileName)" })
+        $entries | Should -Be @($expected | Sort-Object)
+        $entries | Should -Not -Contain 'events.ndjson'
+        $script:FormHtml | Should -Not -Match '\.zip'
+    }
+
+    It 'records the zip and its SHA-256 on the console, in the JSON summary and in runEnd' {
+        $hash = (Get-FileHash -LiteralPath $script:FormEnd.zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $script:FormEnd.zipSha256 | Should -Be $hash
+        $script:FormOutput | Should -Match ([regex]::Escape("Zip: $($script:FormEnd.zipPath) (SHA-256 $hash)"))
+        $summary = Get-Content -LiteralPath $script:FormEnd.jsonSummaryPath -Raw | ConvertFrom-Json -DateKind String
+        $summary.Zip.Path | Should -Be $script:FormEnd.zipPath
+        $summary.Zip.Sha256 | Should -Be $hash
+        $summary.ReportDetails.ImageForm | Should -Be 'linked'
+        $summary.ReportDetails.Classification | Should -Be 'Confidential'
+        $summary.ReportDetails.CaptureWindow.First | Should -Not -BeNullOrEmpty
+        ($summary.Items | Where-Object Name -eq 'Tabs').Account | Should -Be 'admin@example.com'
+    }
+
+    It 'gives an extracted copy that verifies on its own' {
+        $copy = Copy-Evidence 'extracted'
+        @(Test-ReportIntegrity -Path $copy | Where-Object { -not $_.Ok }) | Should -BeNullOrEmpty
+        $summary = Get-Content -LiteralPath ([System.IO.Path]::ChangeExtension($copy, '.json')) -Raw | ConvertFrom-Json
+        $summary.Zip.Sha256 | Should -BeNullOrEmpty -Because 'a file inside the zip cannot hold the zip''s own hash'
+    }
+
+    It 'opens the report once, after everything, in an interactive run' {
+        @($global:VouchForm.Opened) | Should -Be @($script:FormReport)
+        $script:FormEvents[-1].type | Should -Be 'runEnd'
+    }
+
+    It '-Verify exits 4, naming the file, when one linked image was altered' {
+        $copy = Copy-Evidence 'altered'
+        $name = ($script:FormItems | Where-Object Name -eq 'Tabs').Captures[1].FileName
+        $file = Join-Path (Split-Path $copy) "images\$([System.IO.Path]::GetFileNameWithoutExtension($copy))\$name"
+        $bytes = [System.IO.File]::ReadAllBytes($file)
+        $bytes[$bytes.Length - 30] = $bytes[$bytes.Length - 30] -bxor 0xFF
+        [System.IO.File]::WriteAllBytes($file, $bytes)
+        $result = Invoke-VouchVerify $copy
+        $result.ExitCode | Should -Be 4
+        $result.Output | Should -Match "FAIL\s+Image $([regex]::Escape($name))"
+        $result.Output | Should -Match 'NOT VERIFIED'
+    }
+
+    It 'the real script with -Verify writes nothing into an event file' {
+        $log = Join-Path -Path $TestDrive -ChildPath 'verify-events.ndjson'
+        $pwsh = (Get-Process -Id $PID).Path
+        $process = Start-Process -FilePath $pwsh -NoNewWindow -Wait -PassThru -RedirectStandardOutput (Join-Path $TestDrive 'verify-events.txt') `
+            -ArgumentList @('-NoProfile', '-NonInteractive', '-File', "`"$script:VouchPath`"", '-Verify', "`"$($script:FormReport)`"", '-EventLogPath', "`"$log`"")
+        $process.ExitCode | Should -Be 0
+        $log | Should -Not -Exist
+    }
+
+    It '-Verify fails when one linked image was removed' {
+        $copy = Copy-Evidence 'removed'
+        $name = ($script:FormItems | Where-Object Name -eq 'Plain').Captures[0].FileName
+        Remove-Item -LiteralPath (Join-Path (Split-Path $copy) "images\$([System.IO.Path]::GetFileNameWithoutExtension($copy))\$name")
+        $result = Invoke-VouchVerify $copy
+        $result.ExitCode | Should -Be 4
+        $result.Output | Should -Match "FAIL\s+Image $([regex]::Escape($name))\s+the image file .* is missing"
+    }
+
+    It 'takes every report switch typed on the command line over the file, and embeds the images with -LinkImages:$false' {
+        Mock Test-InteractiveRun { $false }
+        $bound = @{
+            ConfigPath = $script:FormConfig; ReportName = 'typed'; ReportTitle = 'Typed title'; Classification = 'Public'
+            LogoPath = (Join-Path $TestDrive 'no-such-logo.png'); CompanyName = 'Typed Co'; CompanyDetails = 'Typed details'
+            Description = 'Typed description'; Origin = 'Typed origin'; GeneratedBy = 'Typed person'
+            PeriodFrom = 'typed-from'; PeriodTo = 'typed-to'; PeriodLabel = 'Typed period'; Account = 'typed@example.com'
+            NoIndex = [switch]$true; LinkImages = [switch]$false; Zip = [switch]$true; ZipName = '{title} {period}'; OpenReport = [switch]$true
+        }
+        $output = Invoke-Main -BoundParameters $bound 6>&1 | Out-String
+        $script:ExitCode | Should -Be 0 -Because $output
+        $report = Join-Path (Split-Path $script:FormConfig) 'out\typed.html'
+        $html = [System.IO.File]::ReadAllText($report)
+        $html | Should -Match '<h1>Typed title</h1>'
+        $html | Should -Match 'class="classification top cls-public"'
+        $html | Should -Not -Match 'class="logo"'
+        $output | Should -Match 'WARNING: The logo file .*no-such-logo\.png. was not found, so the report has no logo\.'
+        foreach ($text in 'Typed Co', 'Typed details', 'Typed description', 'Typed origin', 'Typed person', 'Typed period: typed-from to typed-to') {
+            $html | Should -Match ([regex]::Escape($text)) -Because $text
+        }
+        $html | Should -Match '<dt>Account</dt><dd>typed@example.com</dd>'
+        $html | Should -Not -Match 'admin@example.com' -Because '-Account beats the page''s own account too'
+        $html | Should -Not -Match 'id="contents"'
+        $html | Should -Match '<strong>Self-contained report:</strong>'
+        ([regex]::Matches($html, 'src="data:image/jpeg;base64,')).Count | Should -BeGreaterOrEqual 3
+        @(Test-ReportIntegrity -Path $report | Where-Object { -not $_.Ok }) | Should -BeNullOrEmpty
+        (Join-Path (Split-Path $report) 'Typed title Typed period.zip') | Should -Exist
+        @($global:VouchForm.Opened).Count | Should -Be 1 -Because 'only the interactive run before opened it'
+        $output | Should -Match 'The report is not opened: nobody is watching this run'
+
+        # The same zip name again: a number is added, nothing is replaced.
+        $before = (Get-FileHash -LiteralPath (Join-Path (Split-Path $report) 'Typed title Typed period.zip')).Hash
+        Invoke-Main -BoundParameters $bound 6>$null
+        (Join-Path (Split-Path $report) 'Typed title Typed period_2.zip') | Should -Exist
+        (Get-FileHash -LiteralPath (Join-Path (Split-Path $report) 'Typed title Typed period.zip')).Hash | Should -Be $before
+    }
+
+    It 'takes the report switches in a CSV run too' {
+        Mock Test-InteractiveRun { $false }
+        $csv = Join-Path -Path $TestDrive -ChildPath 'switches.csv'
+        "Name,Url,Steps,ScrollFullPage,Notes`r`nPlain,$Web/ok,,N,`r`nTall,$Web/tall?px=2500,,Y," | Set-Content -LiteralPath $csv -Encoding utf8
+        $out = Join-Path -Path $TestDrive -ChildPath 'csv-out'
+        $bound = @{
+            CsvPath = $csv; OutputDir = $out; ReportName = 'csv-{classification}'; EdgeProfileDir = $script:ProfileDir; DebugPort = $script:CdpPort
+            NavigationTimeoutSec = 10; SettleSeconds = [double]0.1; ScrollSettleSeconds = [double]0.1; MaxScrollSegments = 5; ImageFormat = 'jpeg'
+            JpegQuality = 80; CaptureArea = 'page'; ZoomPercent = 100
+            ReportTitle = 'CSV title'; Classification = 'internal'; Account = 'csv@example.com'; LinkImages = [switch]$true; Zip = [switch]$true
+        }
+        Invoke-Main -BoundParameters $bound 6>$null
+        $script:ExitCode | Should -Be 0
+        $report = Join-Path $out 'csv-Internal.html'
+        $html = [System.IO.File]::ReadAllText($report)
+        $html | Should -Match '<h1>CSV title</h1>'
+        $html | Should -Match 'cls-internal'
+        $html | Should -Match '<td class="k">Account used</td><td>csv@example.com</td>'
+        $html | Should -Match '<h2 id="contents">Contents</h2>'
+        $html | Should -Match 'src="images/csv-Internal/001_Plain_seg01.jpg"'
+        @(Test-ReportIntegrity -Path $report | Where-Object { -not $_.Ok }) | Should -BeNullOrEmpty
+        (Join-Path $out 'csv-Internal.zip') | Should -Exist
     }
 }

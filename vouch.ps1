@@ -9,7 +9,8 @@
     screen captures (GDI CopyFromScreen) of the primary display, so the Windows taskbar
     clock is part of every image. Long pages are captured as a series of viewport
     segments. Everything is assembled into a single self-contained HTML report with
-    base64-embedded images. -CaptureArea can narrow the images to the Edge window or to
+    base64-embedded images (or, with -LinkImages, a report that links to the image
+    files next to it). -CaptureArea can narrow the images to the Edge window or to
     the page content only (see below).
 
 .PARAMETER CsvPath
@@ -30,6 +31,117 @@
 
 .PARAMETER OutputDir
     Folder for the report. Defaults to the reports folder next to the script.
+
+.PARAMETER ReportName
+    File name of the report (.html is added when missing). Default:
+    VouchReport_<date>_<time>.html. May contain the tokens {report} (the default name),
+    {title}, {date} (yyyy-MM-dd), {time} (HHmmss), {period} and {classification}.
+    A report of the same name in the output folder is replaced.
+
+.PARAMETER EdgeProfileDir
+    The Edge profile the run uses (sign-ins are kept there). Default:
+    %LOCALAPPDATA%\Vouch\EdgeProfile, the profile -LoginSetup prepares.
+
+.PARAMETER DebugPort
+    The local port Edge's debugging connection uses, 1024 to 65535 (default 9222). An
+    Edge already listening there is reused and left open.
+
+.PARAMETER NavigationTimeoutSec
+    How long to wait for each page to finish loading, 5 to 600 seconds (default 30).
+
+.PARAMETER SettleSeconds
+    Extra time after a page has loaded (and after each click) before anything is
+    captured, 0 to 120 seconds (default 2), for content that appears late.
+
+.PARAMETER ScrollSettleSeconds
+    Time after each scroll before the next screenshot, 0 to 120 seconds (default 1).
+
+.PARAMETER MaxScrollSegments
+    The most screenshots taken while scrolling one page, 1 to 500 (default 30). A page
+    that is longer is reported with a warning.
+
+.PARAMETER ImageFormat
+    jpeg (default, smaller) or png (lossless).
+
+.PARAMETER JpegQuality
+    JPEG quality, 1 to 100 (default 85).
+
+.PARAMETER SaveImages
+    Also save every screenshot as a file in images\<report name>\ next to the report,
+    with a SHA256SUMS file. -LinkImages always saves them.
+
+.PARAMETER KeepBrowserOpen
+    Leave the Edge this run started open at the end (an Edge that was already running
+    is always left open).
+
+.PARAMETER ReportTitle
+    The report's title and main heading. Default: Audit Evidence Report.
+
+.PARAMETER Classification
+    Marks the report Public, Internal, Private or Confidential: a coloured banner at the
+    top and bottom, repeated on every printed page. Empty (default): no marking.
+
+.PARAMETER LogoPath
+    A company logo (PNG, JPEG, GIF or SVG file, at most 1 MB) shown at the top of the
+    report. It is copied into the report. A missing or unreadable logo is a warning; the
+    report is still written without it.
+
+.PARAMETER CompanyName
+    The company name shown at the top of the report.
+
+.PARAMETER CompanyDetails
+    More lines about the company (address, engagement, ...), shown under its name. Line
+    breaks are kept; a configuration file (report.company.details) is the easier place
+    for several lines.
+
+.PARAMETER Description
+    What this evidence is for, shown in the report's run details.
+
+.PARAMETER Origin
+    Where the capture was made (for example the office, the system or the request it
+    answers), shown in the run details.
+
+.PARAMETER GeneratedBy
+    Who produced the report, shown in the run details. Default: the Windows user that
+    runs Vouch.
+
+.PARAMETER PeriodFrom
+    Start of the period the evidence covers, shown exactly as typed (for example
+    2026-07-01). This is the period under audit, not the time of the captures, which
+    the report records separately.
+
+.PARAMETER PeriodTo
+    End of the period the evidence covers, shown exactly as typed.
+
+.PARAMETER PeriodLabel
+    A name for the period (for example Q3 2026), shown with the dates.
+
+.PARAMETER Account
+    The account used to sign in to the applications (for example svc-audit@example.com),
+    shown in the run details, on each page and inside each image file. A configuration
+    file can name another account for a page (overrides.account); this switch beats both.
+
+.PARAMETER NoIndex
+    Leave out the contents list near the top of the report.
+
+.PARAMETER LinkImages
+    Keep the screenshots as separate files (images\<report name>\) that the report links
+    to, instead of copying them into the report. The report is much smaller, but the
+    image folder must always travel with it (or use -Zip). -Verify checks both forms.
+
+.PARAMETER Zip
+    After the report is written, put the report, the JSON summary (if any) and the image
+    folder (if any) into one zip file in the output folder, ready to attach to a
+    workpaper. Extracting it gives a working report.
+
+.PARAMETER ZipName
+    Name of the zip file (default {report}.zip). Tokens: {report} (the report's name),
+    {title}, {date} (yyyy-MM-dd), {time} (HHmmss), {period}, {classification}. An existing
+    file is never replaced: a number is added instead.
+
+.PARAMETER OpenReport
+    Open the report in the default browser when everything is finished. Only when a
+    person started the run; never in a scheduled or -NoPrompt run.
 
 .PARAMETER FailOnWarning
     Exit with code 3 when no item failed but at least one produced a warning (for
@@ -163,13 +275,48 @@ param(
 
     [string]$EventLogPath = '',
 
-    [string]$TabId = ''
+    [string]$TabId = '',
+
+    [string]$ReportTitle = '',
+
+    [ValidateSet('', 'Public', 'Internal', 'Private', 'Confidential')]
+    [string]$Classification = '',
+
+    [string]$LogoPath = '',
+
+    [string]$CompanyName = '',
+
+    [string]$CompanyDetails = '',
+
+    [string]$Description = '',
+
+    [string]$Origin = '',
+
+    [string]$GeneratedBy = '',
+
+    [string]$PeriodFrom = '',
+
+    [string]$PeriodTo = '',
+
+    [string]$PeriodLabel = '',
+
+    [string]$Account = '',
+
+    [switch]$NoIndex,
+
+    [switch]$LinkImages,
+
+    [switch]$Zip,
+
+    [string]$ZipName = '',
+
+    [switch]$OpenReport
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion       = '1.3.0'
+$script:ToolVersion       = '2.0.0'
 $script:ExitCode          = 0
 $script:CdpSocket         = $null
 $script:CdpWebSocketUrl   = ''
@@ -1472,43 +1619,6 @@ function Select-VouchPage {
     return , $selected
 }
 
-function Get-InactiveConfigSetting {
-    <#
-        TEMPORARY - shrink as each setting starts working (report fields, zip, open
-        when done).
-        Settings the file may set that this engine does not apply yet. A non-default
-        value is listed so the user is told it had no effect rather than finding out
-        from the evidence. Returns the setting paths, each once.
-    #>
-    param([Parameter(Mandatory)][System.Collections.IDictionary]$Config)
-
-    $defaults = Get-DefaultVouchConfig
-    $names = [System.Collections.Generic.List[string]]::new()
-    $check = {
-        param([string]$Name, $Value, $Default)
-        if ($null -eq $Value) { return }
-        if ($Value -is [string] -and [string]::IsNullOrWhiteSpace($Value) -and [string]::IsNullOrWhiteSpace([string]$Default)) { return }
-        if ($Value -ne $Default -and -not $names.Contains($Name)) { $names.Add($Name) }
-    }
-    $pageKeys = @('account')
-    foreach ($key in $pageKeys) { & $check "defaults.$key" $Config['defaults'][$key] $defaults['defaults'][$key] }
-    foreach ($key in 'embedImages', 'openReport') { & $check "output.$key" $Config['output'][$key] $defaults['output'][$key] }
-    & $check 'output.zip.enabled' $Config['output']['zip']['enabled'] $false
-    foreach ($key in @($defaults['report'].Keys)) {
-        if ($defaults['report'][$key] -is [System.Collections.IDictionary]) {
-            foreach ($inner in @($defaults['report'][$key].Keys)) {
-                & $check "report.$key.$inner" $Config['report'][$key][$inner] $defaults['report'][$key][$inner]
-            }
-        }
-        else { & $check "report.$key" $Config['report'][$key] $defaults['report'][$key] }
-    }
-    foreach ($page in $Config['pages']) {
-        if ($page['overrides'] -isnot [System.Collections.IDictionary]) { continue }
-        foreach ($key in $pageKeys) { & $check "page overrides: $key" $page['overrides'][$key] $defaults['defaults'][$key] }
-    }
-    return , $names
-}
-
 #endregion
 
 #region Edge / CDP ------------------------------------------------------------
@@ -2509,7 +2619,9 @@ function New-CaptureMetadata {
         [string]$User = "$env:USERDOMAIN\$env:USERNAME",
         [string]$Screen = '',
         [ValidateSet('screen', 'window', 'page')][string]$CaptureArea = 'screen',
-        [int]$ZoomPercent = 100
+        [int]$ZoomPercent = 100,
+        # The account the application was signed in with ('' when none was named).
+        [AllowEmptyString()][string]$Account = ''
     )
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
     return [ordered]@{
@@ -2527,6 +2639,7 @@ function New-CaptureMetadata {
         Screen        = $Screen
         CaptureArea   = $CaptureArea
         ZoomPercent   = $ZoomPercent
+        Account       = $Account
     }
 }
 
@@ -3353,7 +3466,7 @@ function Restore-EdgeForeground {
     $title = ''
     if ($null -eq $script:EdgeProcess) {
         if (-not (Test-CdpSocketOpen)) { return }
-        try { $title = [string](Invoke-CdpEval -Expression 'document.title' -TimeoutSec 5) }
+        try { $title = [string](Invoke-CdpEval -Expression 'document.title' -TimeoutSec 2) }
         catch { Write-Verbose "Could not read the page title: $($_.Exception.Message)" }
         if ([string]::IsNullOrWhiteSpace($title)) { return }
     }
@@ -4334,7 +4447,9 @@ function New-CaptureRecord {
         [AllowEmptyString()][string]$Label = '',
         # What the image shows (screen, window, page) and at which page zoom.
         [ValidateSet('screen', 'window', 'page')][string]$CaptureArea = 'screen',
-        [int]$ZoomPercent = 100
+        [int]$ZoomPercent = 100,
+        # For a linked report: no base64 copy (Base64 = ''); the image is in its file.
+        [switch]$NoBase64
     )
 
     # PowerShell hands a Nullable parameter over already unwrapped.
@@ -4345,7 +4460,7 @@ function New-CaptureRecord {
         Url           = $Url
         SegmentIndex  = $SegmentIndex
         SegmentCount  = $SegmentCount
-        Base64        = [Convert]::ToBase64String($Bytes)
+        Base64        = $(if ($NoBase64) { '' } else { [Convert]::ToBase64String($Bytes) })
         Bytes         = $Bytes.Length
         Sha256        = Get-Sha256Hex -Bytes $Bytes
         FileName      = $FileName
@@ -4420,6 +4535,7 @@ function Add-ItemCapture {
     $metadataArguments = @{
         RunId = $Context.RunId; ItemIndex = $Item.Index; ItemName = $Item.Name; RequestedUrl = $Item.Url; PageUrl = $PageUrl
         CapturedAt = $capturedAt; SegmentIndex = $SegmentIndex; SegmentCount = $SegmentCount; CaptureArea = $area; ZoomPercent = $ZoomPercent
+        Account = $(if ($Item.PSObject.Properties['Account']) { [string]$Item.Account } else { '' })
     }
     if ($area -eq 'page') {
         $encoded = Get-PageCapture -Format $Context.Format -Quality $Context.Quality -ZoomPercent $ZoomPercent -Clip $PageClip
@@ -4453,9 +4569,12 @@ function Add-ItemCapture {
         $filePath = Join-Path -Path $Context.ImagesDir -ChildPath $fileName
         [System.IO.File]::WriteAllBytes($filePath, $bytes)
     }
+    # A linked report (-LinkImages) reads the images from their files: the run then does
+    # not keep a base64 copy of every image in memory until the report is written.
+    $linked = $Context.ContainsKey('EmbedImages') -and -not $Context.EmbedImages
     $Item.Captures.Add((New-CaptureRecord -Bytes $bytes -Url $PageUrl -SegmentIndex $SegmentIndex -SegmentCount $SegmentCount `
         -FilePath $filePath -FileName $fileName -CapturedAt $capturedAt -CaptureNumber $CaptureNumber -Label $Label `
-        -CaptureArea $area -ZoomPercent $ZoomPercent))
+        -CaptureArea $area -ZoomPercent $ZoomPercent -NoBase64:$linked))
     Write-RunEvent -Type 'capture' -Data ([ordered]@{
         pageId = $script:EventPageId; pageIndex = $Item.Index; captureNumber = $CaptureNumber; label = $Label
         segment = $SegmentIndex; segmentCount = $SegmentCount; fileName = $fileName; area = $area; zoomPercent = $ZoomPercent
@@ -4583,15 +4702,242 @@ function Get-CaptureAreaText {
     return $text
 }
 
+function Get-ClassificationStyle {
+    <#
+        The marking for a classification level: its banner text and one restrained colour
+        per level, so a reader tells the levels apart at a glance and in grey-scale print
+        (the text itself always names the level). '' or an unknown value: no marking.
+        The spelling is the schema's, whatever case the command line used.
+    #>
+    param([AllowEmptyString()][string]$Level = '')
+    $styles = [ordered]@{
+        Public       = @{ Color = '#1c6b2c'; Border = '#9fd6ab'; Background = '#eef8f0' }
+        Internal     = @{ Color = '#12507d'; Border = '#9cc2df'; Background = '#eaf2f9' }
+        Private      = @{ Color = '#5b3a8c'; Border = '#c4b2df'; Background = '#f3eef9' }
+        Confidential = @{ Color = '#9b1c1c'; Border = '#e0a0a0'; Background = '#fbecec' }
+    }
+    foreach ($name in $styles.Keys) {
+        if ($name -eq $Level.Trim()) {
+            $style = $styles[$name]
+            return [pscustomobject]@{
+                Level = $name; Text = $name.ToUpperInvariant(); CssClass = "cls-$($name.ToLowerInvariant())"
+                Color = $style.Color; Border = $style.Border; Background = $style.Background
+            }
+        }
+    }
+    return $null
+}
+
+function Get-LogoDataUri {
+    <#
+        The company logo as a data URI, so the report stays one file. The type is read
+        from the file's first bytes, not trusted from its name. An SVG can carry script:
+        it is only ever used as the src of an <img>, where browsers never run it, and is
+        never written into the page itself. A logo is decoration, not evidence, so every
+        problem is a warning for the console and the report is written without it.
+        Returns { DataUri; Warning } - one of them is ''.
+    #>
+    param(
+        [AllowEmptyString()][string]$Path = '',
+        [long]$MaxBytes = 1MB
+    )
+    $result = { param($Uri, $Warning) [pscustomobject]@{ DataUri = $Uri; Warning = $Warning } }
+    if ([string]::IsNullOrWhiteSpace($Path)) { return (& $result '' '') }
+    $noLogo = 'so the report has no logo.'
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            return (& $result '' "The logo file '$Path' was not found, $noLogo")
+        }
+        $length = (Get-Item -LiteralPath $Path).Length
+        if ($length -gt $MaxBytes) {
+            return (& $result '' ("The logo file '{0}' is {1:N0} KB; a logo may be at most {2:N0} KB, {3} Use a smaller image." -f $Path, [Math]::Ceiling($length / 1KB), ($MaxBytes / 1KB), $noLogo))
+        }
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+    }
+    catch {
+        return (& $result '' "The logo file '$Path' could not be read ($($_.Exception.Message)), $noLogo")
+    }
+
+    $starts = {
+        param([byte[]]$Signature)
+        if ($bytes.Length -lt $Signature.Length) { return $false }
+        for ($i = 0; $i -lt $Signature.Length; $i++) { if ($bytes[$i] -ne $Signature[$i]) { return $false } }
+        return $true
+    }
+    $mime = ''
+    if (& $starts ([byte[]](0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A))) { $mime = 'image/png' }
+    elseif (& $starts ([byte[]](0xFF, 0xD8, 0xFF))) { $mime = 'image/jpeg' }
+    elseif (& $starts ([byte[]](0x47, 0x49, 0x46, 0x38))) { $mime = 'image/gif' }
+    elseif ([System.IO.Path]::GetExtension($Path) -eq '.svg') {
+        $head = [System.Text.Encoding]::UTF8.GetString($bytes, 0, [Math]::Min($bytes.Length, 4096))
+        if ($head -match '<svg[\s>]') { $mime = 'image/svg+xml' }
+    }
+    if (-not $mime) {
+        return (& $result '' "The logo file '$Path' is not a PNG, JPEG, GIF or SVG image, $noLogo")
+    }
+    return (& $result "data:$mime;base64,$([Convert]::ToBase64String($bytes))" '')
+}
+
+function Get-PeriodText {
+    <#
+        The period the evidence covers, as the user wrote it. Dates are free text and are
+        never parsed or reformatted: 03/04/2026 means another day in another country, and
+        the report must say exactly what the auditor typed. '' when nothing was given.
+    #>
+    param(
+        [AllowEmptyString()][string]$From = '',
+        [AllowEmptyString()][string]$To = '',
+        [AllowEmptyString()][string]$Label = ''
+    )
+    $From = $From.Trim(); $To = $To.Trim(); $Label = $Label.Trim()
+    $range = if ($From -and $To) { "$From to $To" } elseif ($From) { "from $From" } elseif ($To) { "up to $To" } else { '' }
+    if ($Label -and $range) { return "${Label}: $range" }
+    if ($Label) { return $Label }
+    return $range
+}
+
+function Get-CaptureWindow {
+    <#
+        When the screenshots were really taken: the first and last capture time of the
+        run, each with its UTC offset. This is measured, unlike the period the user
+        typed, so the report keeps the two apart. First/Last keep the records' own ISO
+        text (for the JSON summary); Text is the report's line.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items)
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $times = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in $Items) {
+        foreach ($capture in @($item.Captures)) {
+            if ($null -eq $capture -or -not $capture.PSObject.Properties['CapturedAt']) { continue }
+            $parsed = [System.DateTimeOffset]::MinValue
+            if ([System.DateTimeOffset]::TryParseExact([string]$capture.CapturedAt, 'yyyy-MM-ddTHH:mm:ss.fffzzz', $invariant,
+                    [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+                $times.Add([pscustomobject]@{ When = $parsed; Text = [string]$capture.CapturedAt })
+            }
+        }
+    }
+    if ($times.Count -eq 0) { return [pscustomobject]@{ First = ''; Last = ''; Text = 'No screenshot was taken.' } }
+    $sorted = @($times | Sort-Object -Property { $_.When.UtcDateTime })
+    $show = { param($t) $t.When.ToString('yyyy-MM-dd HH:mm:ss', $invariant) + ' (UTC' + $t.When.ToString('zzz', $invariant) + ')' }
+    $first = $sorted[0]
+    $last = $sorted[-1]
+    $text = if ($sorted.Count -eq 1) { "$(& $show $first) (one screenshot)" } else { "$(& $show $first) to $(& $show $last)" }
+    return [pscustomobject]@{ First = $first.Text; Last = $last.Text; Text = $text }
+}
+
+function New-ReportOptions {
+    <#
+        Everything New-HtmlReport may add to the report beyond the run's own data, in one
+        object, so the report code never reads settings or files. Blank title means the
+        default title; the classification is written in the schema's spelling.
+        LogoDataUri is the logo already read (Get-LogoDataUri); LogoPath only names it.
+        ImageFolder: for a linked report, the images folder relative to the report
+        (images/<report name>), used as the start of every image's src.
+    #>
+    param(
+        [AllowEmptyString()][string]$Title = '',
+        [AllowEmptyString()][string]$Classification = '',
+        [AllowEmptyString()][string]$LogoPath = '',
+        [AllowEmptyString()][string]$LogoDataUri = '',
+        [AllowEmptyString()][string]$CompanyName = '',
+        [AllowEmptyString()][string]$CompanyDetails = '',
+        [AllowEmptyString()][string]$Description = '',
+        [AllowEmptyString()][string]$Origin = '',
+        [AllowEmptyString()][string]$GeneratedBy = '',
+        [AllowEmptyString()][string]$PeriodFrom = '',
+        [AllowEmptyString()][string]$PeriodTo = '',
+        [AllowEmptyString()][string]$PeriodLabel = '',
+        [AllowEmptyString()][string]$Account = '',
+        [bool]$ShowIndex = $true,
+        [bool]$EmbedImages = $true,
+        [AllowEmptyString()][string]$ImageFolder = ''
+    )
+    $style = Get-ClassificationStyle -Level $Classification
+    return [pscustomobject]@{
+        Title          = $(if ([string]::IsNullOrWhiteSpace($Title)) { 'Audit Evidence Report' } else { $Title.Trim() })
+        Classification = $(if ($null -ne $style) { $style.Level } else { '' })
+        LogoPath       = $LogoPath
+        LogoDataUri    = $LogoDataUri
+        CompanyName    = $CompanyName.Trim()
+        CompanyDetails = $CompanyDetails.Trim()
+        Description    = $Description.Trim()
+        Origin         = $Origin.Trim()
+        GeneratedBy    = $GeneratedBy.Trim()
+        PeriodFrom     = $PeriodFrom.Trim()
+        PeriodTo       = $PeriodTo.Trim()
+        PeriodLabel    = $PeriodLabel.Trim()
+        Account        = $Account.Trim()
+        ShowIndex      = $ShowIndex
+        EmbedImages    = $EmbedImages
+        ImageFolder    = $ImageFolder.Trim('/', '\').Replace('\', '/')
+    }
+}
+
+function Get-CaptureSetList {
+    <#
+        A page's capture actions that produced images, in order: number, the label the
+        report shows ("Capture 2: Lockout") and the anchor of its first image. Shared by
+        the contents list and the item sections so their links and ids always agree.
+    #>
+    param([Parameter(Mandatory)][object]$Item)
+    $sets = [ordered]@{}
+    foreach ($capture in @($Item.Captures)) {
+        $number = if ($capture.PSObject.Properties['CaptureNumber']) { [int]$capture.CaptureNumber } else { 1 }
+        # String keys: an int would index an ordered dictionary by position.
+        if ($sets.Contains("$number")) { continue }
+        $label = if ($capture.PSObject.Properties['Label']) { [string]$capture.Label } else { '' }
+        $sets["$number"] = [pscustomobject]@{
+            Number = $number
+            Text   = "Capture $number" + $(if ($label) { ": $label" } else { '' })
+            Anchor = "item-$($Item.Index)-c$number"
+            First  = $capture
+        }
+    }
+    return , @($sets.Values)
+}
+
+function Get-ReportImageSource {
+    <#
+        The src of one image: the image itself (base64) in a self-contained report, or
+        the path of its file next to the report in a linked one (images/<report>/<file>,
+        each part URL-escaped so spaces and # in a report name still resolve from disk).
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Capture,
+        [Parameter(Mandatory)][string]$MimeType,
+        [AllowNull()][object]$Options = $null
+    )
+    if ($null -ne $Options -and -not $Options.EmbedImages) {
+        $parts = @(@($Options.ImageFolder -split '/') + [string]$Capture.FileName | Where-Object { $_ } |
+            ForEach-Object { [System.Uri]::EscapeDataString($_) })
+        return (Encode-Html ($parts -join '/'))
+    }
+    return "data:$MimeType;base64,$($Capture.Base64)"
+}
+
 function New-HtmlReport {
+    <#
+        The report. Without -Options it is the report Vouch has always written. -Options
+        (New-ReportOptions) adds the title, classification banners, company block, run
+        details, contents list and per-page account, and chooses between images inside
+        the file and images linked from the images folder. Every value a user typed goes
+        through Encode-Html. The img data-* attributes keep their order in both forms:
+        Vouch 1.3's -Verify reads self-contained reports with a fixed pattern.
+    #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items,
-        [Parameter(Mandatory)][object]$Run
+        [Parameter(Mandatory)][object]$Run,
+        [AllowNull()][object]$Options = $null
     )
 
     $mimeType = if ($Run.ImageFormat -eq 'png') { 'image/png' } else { 'image/jpeg' }
     $runId = if ($Run.PSObject.Properties['RunId']) { [string]$Run.RunId } else { '' }
     $manifestHash = if ($Run.PSObject.Properties['ManifestSha256']) { [string]$Run.ManifestSha256 } else { '' }
+    $withOptions = $null -ne $Options
+    $defaultTitle = 'Audit Evidence Report'
+    $classification = if ($withOptions) { Get-ClassificationStyle -Level $Options.Classification } else { $null }
+    # Multi-line text (company details, description): encoded, then CSS keeps the breaks.
+    $multiLine = { param([string]$Text) Encode-Html (($Text -replace "`r`n", "`n").Trim()) }
 
     $css = @'
 :root { color-scheme: light; }
@@ -4647,6 +4993,32 @@ a { color: #12507d; }
   .meta td.k { background: #ffffff; }
 }
 '@
+    if ($withOptions) {
+        $css += @'
+
+.company { display: flex; align-items: center; gap: 18px; margin: 0 0 18px 0; padding-bottom: 14px; border-bottom: 1px solid #d5dbe1; }
+.company .logo { max-height: 64px; max-width: 220px; width: auto; height: auto; }
+.company-name { font-size: 16px; font-weight: 700; }
+.company-details, .multiline { white-space: pre-line; }
+.company-details { color: #3a4149; font-size: 13px; }
+.classification { text-align: center; font-weight: 700; letter-spacing: 2px; padding: 5px 10px; border: 1px solid; border-radius: 3px; }
+.classification.top { margin: 0 0 20px 0; }
+.classification.bottom { margin: 22px 0 0 0; }
+table.contents td.sub { padding-left: 26px; }
+table.contents ul { margin: 4px 0 0 0; padding-left: 18px; }
+.contents-wrap { margin-bottom: 26px; }
+'@
+        if ($null -ne $classification) {
+            # On screen and on the first and last printed page: the banners. On every
+            # printed page: the page margin boxes, which Edge repeats per page. The text
+            # comes from the fixed list of levels, never from free text.
+            $css += "`n.classification { color: $($classification.Color); border-color: $($classification.Border); background: $($classification.Background); }`n"
+            $css += "@media print { .classification { background: #ffffff; } }`n"
+            $css += "@page {`n  margin: 16mm 12mm;`n" +
+                "  @top-center { content: ""$($classification.Text)""; color: $($classification.Color); font: 700 9pt ""Segoe UI"", Arial, sans-serif; letter-spacing: 2px; }`n" +
+                "  @bottom-center { content: ""$($classification.Text)""; color: $($classification.Color); font: 700 9pt ""Segoe UI"", Arial, sans-serif; letter-spacing: 2px; }`n}`n"
+        }
+    }
 
     $sb = [System.Text.StringBuilder]::new()
     [void]$sb.AppendLine('<!DOCTYPE html>')
@@ -4654,14 +5026,37 @@ a { color: #12507d; }
     [void]$sb.AppendLine('<head>')
     [void]$sb.AppendLine('<meta charset="utf-8">')
     [void]$sb.AppendLine('<meta name="viewport" content="width=device-width, initial-scale=1">')
-    [void]$sb.AppendLine("<title>Vouch &mdash; Audit Evidence Report - $(Encode-Html $Run.StartTime)</title>")
+    # The default title reads as it always did; a title of the user's own stands alone.
+    $customTitle = $withOptions -and $Options.Title -and $Options.Title -ne $defaultTitle
+    if ($customTitle) {
+        [void]$sb.AppendLine("<title>$(Encode-Html $Options.Title) - $(Encode-Html $Run.StartTime)</title>")
+    }
+    else {
+        [void]$sb.AppendLine("<title>Vouch &mdash; Audit Evidence Report - $(Encode-Html $Run.StartTime)</title>")
+    }
     [void]$sb.AppendLine('<style>')
     [void]$sb.AppendLine($css)
     [void]$sb.AppendLine('</style>')
     [void]$sb.AppendLine('</head>')
     [void]$sb.AppendLine('<body>')
 
-    [void]$sb.AppendLine('<h1>Vouch &mdash; Audit Evidence Report</h1>')
+    if ($null -ne $classification) {
+        [void]$sb.AppendLine("<div class=""classification top $($classification.CssClass)"" role=""note"">$($classification.Text)</div>")
+    }
+    if ($withOptions -and ($Options.LogoDataUri -or $Options.CompanyName -or $Options.CompanyDetails)) {
+        [void]$sb.Append('<header class="company">')
+        if ($Options.LogoDataUri) {
+            # Only ever an <img> source: an SVG logo shown this way cannot run script.
+            [void]$sb.Append("<img class=""logo"" alt=""Company logo"" src=""$(Encode-Html $Options.LogoDataUri)"">")
+        }
+        [void]$sb.Append('<div class="company-text">')
+        if ($Options.CompanyName) { [void]$sb.Append("<div class=""company-name"">$(Encode-Html $Options.CompanyName)</div>") }
+        if ($Options.CompanyDetails) { [void]$sb.Append("<div class=""company-details"">$(& $multiLine $Options.CompanyDetails)</div>") }
+        [void]$sb.AppendLine('</div></header>')
+    }
+
+    if ($customTitle) { [void]$sb.AppendLine("<h1>$(Encode-Html $Options.Title)</h1>") }
+    else { [void]$sb.AppendLine('<h1>Vouch &mdash; Audit Evidence Report</h1>') }
     # Pages captured as the window or the page content only have no taskbar clock: the
     # general wording must then not promise one. Screen-only reports read as before.
     $allScreen = -not @($Items | Where-Object {
@@ -4672,7 +5067,19 @@ a { color: #12507d; }
     [void]$sb.AppendLine("<p class=""subtitle"">$subtitle</p>")
 
     [void]$sb.AppendLine('<div class="meta"><table>')
-    $metaRows = @(
+    $metaRows = [System.Collections.Generic.List[object]]::new()
+    if ($withOptions) {
+        # What the user said about the evidence first, then what the run measured.
+        $addRow = { param($Label, $Text, [switch]$MultiLine) if (-not [string]::IsNullOrWhiteSpace([string]$Text)) { $metaRows.Add([pscustomobject]@{ Label = $Label; Text = [string]$Text; MultiLine = [bool]$MultiLine }) } }
+        if ($null -ne $classification) { & $addRow 'Classification' $classification.Level }
+        & $addRow 'Description' $Options.Description -MultiLine
+        & $addRow 'Origin' $Options.Origin
+        & $addRow 'Period covered' (Get-PeriodText -From $Options.PeriodFrom -To $Options.PeriodTo -Label $Options.PeriodLabel)
+        & $addRow 'Capture window' (Get-CaptureWindow -Items $Items).Text
+        & $addRow 'Account used' $Options.Account
+        & $addRow 'Report generated by' $(if ($Options.GeneratedBy) { $Options.GeneratedBy } else { [string]$Run.User })
+    }
+    foreach ($row in @(
         [pscustomobject]@{ Label = 'Run started';       Text = $Run.StartTime },
         [pscustomobject]@{ Label = 'Run finished';      Text = $Run.EndTime },
         [pscustomobject]@{ Label = 'Time zone';         Text = $Run.TimeZone },
@@ -4688,11 +5095,37 @@ a { color: #12507d; }
         [pscustomobject]@{ Label = 'Screen resolution'; Text = $Run.ScreenResolution },
         [pscustomobject]@{ Label = 'Run ID';            Text = $runId },
         [pscustomobject]@{ Label = 'Manifest SHA-256';  Text = $manifestHash }
-    )
+    )) { $metaRows.Add($row) }
     foreach ($row in $metaRows) {
-        [void]$sb.AppendLine("<tr><td class=""k"">$(Encode-Html $row.Label)</td><td>$(Encode-Html ([string]$row.Text))</td></tr>")
+        if ($row.PSObject.Properties['MultiLine'] -and $row.MultiLine) {
+            [void]$sb.AppendLine("<tr><td class=""k"">$(Encode-Html $row.Label)</td><td class=""multiline"">$(& $multiLine ([string]$row.Text))</td></tr>")
+        }
+        else {
+            [void]$sb.AppendLine("<tr><td class=""k"">$(Encode-Html $row.Label)</td><td>$(Encode-Html ([string]$row.Text))</td></tr>")
+        }
     }
     [void]$sb.AppendLine('</table></div>')
+
+    if ($withOptions -and $Options.ShowIndex) {
+        # Plain #anchors: they work from disk, in any browser, and as links in a PDF printed from the report.
+        $withAccount = @($Items | Where-Object { $_.PSObject.Properties['Account'] -and $_.Account }).Count -gt 0
+        [void]$sb.AppendLine('<nav class="contents-wrap" aria-label="Contents"><h2 id="contents">Contents</h2>')
+        [void]$sb.AppendLine('<table class="summary contents">')
+        [void]$sb.AppendLine('<thead><tr><th>#</th><th>Page</th><th>Status</th><th>Images</th>' + $(if ($withAccount) { '<th>Account</th>' } else { '' }) + '</tr></thead>')
+        [void]$sb.AppendLine('<tbody>')
+        foreach ($item in $Items) {
+            $sets = Get-CaptureSetList -Item $item
+            $sub = ''
+            if ($sets.Count -gt 1) {
+                $sub = '<ul>' + (($sets | ForEach-Object { "<li><a href=""#$($_.Anchor)"">$(Encode-Html $_.Text)</a></li>" }) -join '') + '</ul>'
+            }
+            $account = if ($item.PSObject.Properties['Account'] -and $item.Account) { Encode-Html $item.Account } else { '&mdash;' }
+            [void]$sb.AppendLine("<tr><td>$($item.Index)</td><td><a href=""#item-$($item.Index)"">$(Encode-Html $item.Name)</a>$sub</td>" +
+                "<td><span class=""$(Get-StatusCssClass -Status $item.Status)"">$(Encode-Html $item.Status)</span></td>" +
+                "<td>$(@($item.Captures).Count)</td>" + $(if ($withAccount) { "<td>$account</td>" } else { '' }) + '</tr>')
+        }
+        [void]$sb.AppendLine('</tbody></table></nav>')
+    }
 
     [void]$sb.AppendLine('<h2>Summary</h2>')
     [void]$sb.AppendLine('<p class="counts">' +
@@ -4726,6 +5159,15 @@ a { color: #12507d; }
         'inside the image file, and is identified below by the SHA-256 hash of that file. The manifest hash covers all of them at once: ' +
         'record it in the workpaper at capture time, and anyone can later confirm the evidence is unchanged with ' +
         '<code>vouch.ps1 -Verify &lt;report&gt;</code>, or check saved images with <code>sha256sum -c SHA256SUMS</code>.</p>')
+    if ($withOptions) {
+        if ($Options.EmbedImages) {
+            [void]$sb.AppendLine('<p class="integrity-note"><strong>Self-contained report:</strong> every screenshot is stored inside this file, so it can be moved or attached on its own.</p>')
+        }
+        else {
+            [void]$sb.AppendLine("<p class=""integrity-note""><strong>Linked report:</strong> the screenshots are separate files in the folder <code>$(Encode-Html $Options.ImageFolder)</code> next to this file. " +
+                'That folder must always travel with the report (keep them together, or send the zip Vouch made); without it the screenshots are not shown and the report cannot be verified.</p>')
+        }
+    }
     [void]$sb.AppendLine("<p class=""manifest"" data-manifest-sha256=""$(Encode-Html $manifestHash)"">Run ID <code>$(Encode-Html $runId)</code><br>" +
         "Manifest SHA-256 <code>$(Encode-Html $manifestHash)</code></p>")
     [void]$sb.AppendLine('<table class="summary hashes"><thead><tr><th>#</th><th>File</th><th>Captured</th><th>SHA-256</th></tr></thead><tbody>')
@@ -4759,6 +5201,9 @@ a { color: #12507d; }
         $itemArea = if ($item.PSObject.Properties['CaptureArea']) { [string]$item.CaptureArea } else { 'screen' }
         $itemZoom = if ($item.PSObject.Properties['ZoomPercent']) { [int]$item.ZoomPercent } else { 100 }
         [void]$sb.AppendLine("<dt>Capture area</dt><dd>$(Encode-Html (Get-CaptureAreaText -Area $itemArea -ZoomPercent $itemZoom -Captures @($item.Captures)))</dd>")
+        if ($withOptions -and $item.PSObject.Properties['Account'] -and $item.Account) {
+            [void]$sb.AppendLine("<dt>Account</dt><dd>$(Encode-Html $item.Account)</dd>")
+        }
         [void]$sb.AppendLine('</dl>')
 
         if (-not [string]::IsNullOrWhiteSpace($item.Notes)) {
@@ -4802,6 +5247,11 @@ a { color: #12507d; }
             # exactly as before.
             $captureSets = @($item.Captures | ForEach-Object { if ($_.PSObject.Properties['CaptureNumber']) { [int]$_.CaptureNumber } else { 1 } } |
                 Sort-Object -Unique).Count
+            # The first image of each capture gets the id the contents list links to.
+            $anchors = @{}
+            if ($withOptions -and $captureSets -gt 1) {
+                foreach ($set in (Get-CaptureSetList -Item $item)) { $anchors[$set.Number] = $set.Anchor }
+            }
             foreach ($capture in $item.Captures) {
                 $segmentText = if ($capture.SegmentCount -gt 1) { " &middot; segment $($capture.SegmentIndex) of $($capture.SegmentCount)" } else { '' }
                 $captureNumber = if ($capture.PSObject.Properties['CaptureNumber']) { [int]$capture.CaptureNumber } else { 1 }
@@ -4810,9 +5260,12 @@ a { color: #12507d; }
                 if ($captureSets -gt 1 -or $label) {
                     $setText = "Capture $captureNumber" + $(if ($label) { ": $label" } else { '' })
                 }
-                [void]$sb.AppendLine('<figure>')
-                # The data-* attributes are what -Verify checks each image against; keep
-                # their order in step with Test-ReportIntegrity.
+                $anchor = $anchors[$captureNumber]
+                if ($anchor) { $anchors.Remove($captureNumber); [void]$sb.AppendLine("<figure id=""$anchor"">") }
+                else { [void]$sb.AppendLine('<figure>') }
+                # The data-* attributes are what -Verify checks each image against. Their
+                # order is kept for Vouch 1.3's -Verify, which reads self-contained reports
+                # with a fixed pattern; Test-ReportIntegrity itself reads them in any order.
                 [void]$sb.Append('<img alt="')
                 [void]$sb.Append((Encode-Html "$($item.Name)$(if ($setText) { " - $setText" }) screenshot $($capture.SegmentIndex) of $($capture.SegmentCount)"))
                 [void]$sb.Append('" data-file="')
@@ -4823,10 +5276,8 @@ a { color: #12507d; }
                 [void]$sb.Append((Encode-Html $capture.CapturedAt))
                 [void]$sb.Append('" data-url="')
                 [void]$sb.Append((Encode-Html $capture.Url))
-                [void]$sb.Append('" src="data:')
-                [void]$sb.Append($mimeType)
-                [void]$sb.Append(';base64,')
-                [void]$sb.Append($capture.Base64)
+                [void]$sb.Append('" src="')
+                [void]$sb.Append((Get-ReportImageSource -Capture $capture -MimeType $mimeType -Options $Options))
                 [void]$sb.AppendLine('">')
                 $setHtml = if ($setText) { "<strong>$(Encode-Html $setText)</strong> &middot; " } else { '' }
                 [void]$sb.AppendLine("<figcaption>$($setHtml)Captured $(Encode-Html $capture.Timestamp)$segmentText &middot; $(Encode-Html $capture.Url)<br>" +
@@ -4841,6 +5292,9 @@ a { color: #12507d; }
     $footerNote = if ($allScreen) { 'Screenshots are unretouched captures of the primary display.' }
     else { 'Screenshots are unretouched captures of the primary display, the Edge window, or the page content as rendered by Edge, as each page states.' }
     [void]$sb.AppendLine("<footer>Generated by vouch.ps1 v$($Run.ToolVersion) on $(Encode-Html $Run.EndTime) ($(Encode-Html $Run.TimeZone)). $footerNote</footer>")
+    if ($null -ne $classification) {
+        [void]$sb.AppendLine("<div class=""classification bottom $($classification.CssClass)"" role=""note"">$($classification.Text)</div>")
+    }
     [void]$sb.AppendLine('</body>')
     [void]$sb.AppendLine('</html>')
 
@@ -4978,20 +5432,46 @@ function Invoke-LoginSetup {
 function ConvertTo-RunSummaryJson {
     <#
         Machine-readable companion to the HTML report (-JsonSummary): the same run
-        metadata and per-item results, without the image data.
+        metadata and per-item results, without the image data. With -Options it also
+        carries what the report says about the evidence (ReportDetails) and, with -Zip,
+        the evidence package (Zip; its hash is known only after the zip was made, so the
+        copy of this file inside the zip has Sha256 null).
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items,
         [Parameter(Mandatory)][object]$Run,
         [Parameter(Mandatory)][string]$ReportPath,
-        [Parameter(Mandatory)][int]$ExitCode
+        [Parameter(Mandatory)][int]$ExitCode,
+        [AllowNull()][object]$Options = $null,
+        # { Path; Sha256 } of the zip, or $null when none is made.
+        [AllowNull()][object]$Zip = $null
     )
 
     $summary = [ordered]@{
         Report    = $ReportPath
         ExitCode  = $ExitCode
         Run       = $Run
-        Items     = @(foreach ($item in $Items) {
+    }
+    if ($null -ne $Options) {
+        $window = Get-CaptureWindow -Items $Items
+        $summary['ReportDetails'] = [ordered]@{
+            Title          = $Options.Title
+            Classification = $Options.Classification
+            Company        = [ordered]@{ Name = $Options.CompanyName; Details = $Options.CompanyDetails }
+            LogoPath       = $(if ($Options.LogoDataUri) { $Options.LogoPath } else { '' })
+            Description    = $Options.Description
+            Origin         = $Options.Origin
+            GeneratedBy    = $(if ($Options.GeneratedBy) { $Options.GeneratedBy } elseif ($Run.PSObject.Properties['User']) { [string]$Run.User } else { '' })
+            Period         = [ordered]@{ From = $Options.PeriodFrom; To = $Options.PeriodTo; Label = $Options.PeriodLabel }
+            CaptureWindow  = [ordered]@{ First = $window.First; Last = $window.Last }
+            Account        = $Options.Account
+            ShowIndex      = [bool]$Options.ShowIndex
+            ImageForm      = $(if ($Options.EmbedImages) { 'embedded' } else { 'linked' })
+            ImageFolder    = $(if ($Options.EmbedImages) { '' } else { $Options.ImageFolder })
+        }
+    }
+    if ($null -ne $Zip) { $summary['Zip'] = [ordered]@{ Path = [string]$Zip.Path; Sha256 = $Zip.Sha256 } }
+    $summary['Items'] = @(foreach ($item in $Items) {
             [ordered]@{
                 Index          = $item.Index
                 Name           = $item.Name
@@ -5003,6 +5483,7 @@ function ConvertTo-RunSummaryJson {
                 ScrollArea     = $(if ($item.PSObject.Properties['ScrollArea']) { $item.ScrollArea } else { '' })
                 CaptureArea    = $(if ($item.PSObject.Properties['CaptureArea']) { $item.CaptureArea } else { 'screen' })
                 ZoomPercent    = $(if ($item.PSObject.Properties['ZoomPercent']) { $item.ZoomPercent } else { 100 })
+                Account        = $(if ($item.PSObject.Properties['Account']) { [string]$item.Account } else { '' })
                 Details        = @($item.Details)
                 Steps          = @($item.StepLog | ForEach-Object { [ordered]@{ Text = $_.Text; Ok = $_.Ok; Message = $_.Message } })
                 Captures       = @($item.Captures | ForEach-Object {
@@ -5026,17 +5507,87 @@ function ConvertTo-RunSummaryJson {
                 })
             }
         })
-    }
     return ($summary | ConvertTo-Json -Depth 6)
+}
+
+function Get-ReportImageList {
+    <#
+        Every screenshot in a report: each <img> that carries data-sha256 (the logo and
+        anything else without one is not evidence and is skipped), with its attributes
+        read one by one, in whatever order they come, and HTML-decoded. Reading them
+        individually is what lets a linked report (relative src) and a report written
+        by another tool or version be checked; a fixed pattern could not.
+        Returns a list of { Attributes (name -> value, case-insensitive); Position }.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Html)
+    $list = [System.Collections.Generic.List[object]]::new()
+    $attributePattern = [regex]'\s([^\s=/>"'']+)(?:\s*=\s*(?:"([^"]*)"|''([^'']*)''|([^\s"''>]+)))?'
+    foreach ($tag in [regex]::Matches($Html, '<img\b[^>]*>', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+        $attributes = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        # Group 0 starts with "<img"; the attributes follow it.
+        foreach ($match in $attributePattern.Matches($tag.Value.Substring(4))) {
+            $name = $match.Groups[1].Value
+            if ($attributes.ContainsKey($name)) { continue }   # the first one counts, as in a browser
+            $raw = if ($match.Groups[2].Success) { $match.Groups[2].Value }
+            elseif ($match.Groups[3].Success) { $match.Groups[3].Value }
+            else { $match.Groups[4].Value }
+            $attributes[$name] = [System.Net.WebUtility]::HtmlDecode($raw)
+        }
+        if ($attributes.ContainsKey('data-sha256')) {
+            $list.Add([pscustomobject]@{ Attributes = $attributes; Position = $tag.Index })
+        }
+    }
+    return , $list
+}
+
+function Resolve-ReportImagePath {
+    <#
+        Where a linked image's file is, for -Verify. The report is untrusted input: a
+        tampered or hostile report must not make -Verify read files elsewhere on the
+        machine or on the network. Only a relative path that stays inside the report's
+        own folder is accepted; anything rooted, on another drive or share, with a URL
+        scheme, an alternate data stream (any ':'), a query or fragment, or climbing out
+        with '..' is refused with a plain reason. Never throws.
+        Returns { Path; Problem } - one of them is ''.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ReportDirectory,
+        [AllowEmptyString()][string]$Source = ''
+    )
+    $refuse = { param([string]$Why) [pscustomobject]@{ Path = ''; Problem = $Why } }
+    if ([string]::IsNullOrWhiteSpace($Source)) { return (& $refuse 'the report names no image for it') }
+    try { $relative = [System.Uri]::UnescapeDataString($Source.Trim()) }
+    catch { return (& $refuse "its image address '$Source' cannot be read") }
+
+    foreach ($text in @($Source.Trim(), $relative)) {
+        if ($text -match '^[A-Za-z]:') { return (& $refuse "its image '$Source' is on a drive of this computer, not next to the report; only images in the report's own folder are checked") }
+        if ($text -match '^[A-Za-z][A-Za-z0-9+\-]*:') { return (& $refuse "its image '$Source' is a web or other address, not a file next to the report; only images in the report's own folder are checked") }
+        if ($text -match '^[\\/]') { return (& $refuse "its image '$Source' is not inside the report's folder (a rooted or network path); only images in the report's own folder are checked") }
+        if ($text.Contains(':')) { return (& $refuse "its image '$Source' is not a plain file name") }
+        if ($text -match '[?#]') { return (& $refuse "its image '$Source' is not a plain file name (it has a ? or #)") }
+        if ($text -match '[\x00-\x1f]') { return (& $refuse "its image '$Source' contains control characters") }
+    }
+    try {
+        $root = [System.IO.Path]::GetFullPath($ReportDirectory).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+        $full = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($root, $relative.Replace('/', '\')))
+    }
+    catch { return (& $refuse "its image '$Source' is not a valid file name") }
+    if (-not $full.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return (& $refuse "its image '$Source' points outside the report's folder; only images in the report's own folder are checked")
+    }
+    return [pscustomobject]@{ Path = $full; Problem = '' }
 }
 
 function Test-ReportIntegrity {
     <#
-        Re-checks a report without trusting anything but its own contents: every embedded
-        image is hashed again and compared with the hash printed for it, the metadata
-        inside each image must match the report (capture time, page URL), the manifest
-        hash is recomputed from the per-image hashes, and saved images (images\<report>\
-        with SHA256SUMS) are hashed from disk. Returns one row per check.
+        Re-checks a report without trusting anything but its own contents: every image
+        is hashed again and compared with the hash printed for it, the metadata inside
+        each image must match the report (capture time, page URL), the manifest hash is
+        recomputed from the per-image hashes, and saved images (images\<report>\ with
+        SHA256SUMS) are hashed from disk. Returns one row per check.
+        Images may be inside the report (data: URIs) or, in a linked report, files next
+        to it (Resolve-ReportImagePath decides which files may be read at all). A
+        problem with one image is a failed check with a reason, never an exception.
 
         This proves the report and images are unchanged since the manifest hash was
         recorded; it cannot tell on its own whether someone rebuilt all hashes together,
@@ -5045,33 +5596,67 @@ function Test-ReportIntegrity {
     param([Parameter(Mandatory)][string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Report not found: $Path" }
+    $Path = (Resolve-Path -LiteralPath $Path).ProviderPath
+    $reportDirectory = Split-Path -Path $Path -Parent
     $html = [System.IO.File]::ReadAllText($Path)
-    $decode = { param([string]$Text) [System.Net.WebUtility]::HtmlDecode($Text) }
     $results = [System.Collections.Generic.List[object]]::new()
     $add = { param($Check, $Ok, $Detail) $results.Add([pscustomobject]@{ Check = $Check; Ok = [bool]$Ok; Detail = $Detail }) }
 
-    $pattern = '<img alt="[^"]*" data-file="([^"]*)" data-sha256="([0-9a-f]{64})" data-captured="([^"]*)" data-url="([^"]*)" src="data:image/(?:jpeg|png);base64,([A-Za-z0-9+/=]+)">'
-    $images = [regex]::Matches($html, $pattern)
+    $images = Get-ReportImageList -Html $html
     if ($images.Count -eq 0) { & $add 'Report' $false 'No hashed screenshots found - not a Vouch 1.2+ report, or it has no captures.' }
 
     $manifestLines = [System.Collections.Generic.List[string]]::new()
+    $number = 0
     foreach ($image in $images) {
-        $file = & $decode $image.Groups[1].Value
-        $listed = $image.Groups[2].Value
-        $bytes = [System.Convert]::FromBase64String($image.Groups[5].Value)
-        $actual = Get-Sha256Hex -Bytes $bytes
+        $number++
+        $attributes = $image.Attributes
+        $read = { param($Name) if ($attributes.ContainsKey($Name)) { [string]$attributes[$Name] } else { '' } }
+        $file = & $read 'data-file'
+        $listed = & $read 'data-sha256'
+        $label = if ($file) { $file } else { "#$number" }
         $manifestLines.Add("$listed  $file")
-        & $add "Image $file" ($actual -eq $listed) $(if ($actual -eq $listed) { "SHA-256 $actual" } else { "hash is $actual, report lists $listed" })
+        if ($listed -cnotmatch '^[0-9a-f]{64}$') {
+            & $add "Image $label" $false 'the report lists no valid SHA-256 hash for it'
+            continue
+        }
 
-        $metadata = Get-ImageMetadata -Bytes $bytes
+        $bytes = $null
+        $source = & $read 'src'
+        try {
+            if ($source -match '^\s*data:') {
+                $embedded = [regex]::Match($source, '^\s*data:image/(?:jpeg|png);base64,([A-Za-z0-9+/=\s]+)$')
+                if (-not $embedded.Success) { & $add "Image $label" $false 'it is not an embedded JPEG or PNG image'; continue }
+                $bytes = [System.Convert]::FromBase64String($embedded.Groups[1].Value)
+            }
+            else {
+                $located = Resolve-ReportImagePath -ReportDirectory $reportDirectory -Source $source
+                if ($located.Problem) { & $add "Image $label" $false "not checked: $($located.Problem)"; continue }
+                if (-not (Test-Path -LiteralPath $located.Path -PathType Leaf)) {
+                    & $add "Image $label" $false "the image file '$source' is missing (a linked report needs its images folder next to it)"
+                    continue
+                }
+                $bytes = [System.IO.File]::ReadAllBytes($located.Path)
+            }
+        }
+        catch {
+            & $add "Image $label" $false "the image could not be read: $($_.Exception.Message)"
+            continue
+        }
+
+        $actual = Get-Sha256Hex -Bytes $bytes
+        & $add "Image $label" ($actual -eq $listed) $(if ($actual -eq $listed) { "SHA-256 $actual" } else { "hash is $actual, report lists $listed" })
+
+        $metadata = $null
+        try { $metadata = Get-ImageMetadata -Bytes $bytes }
+        catch { Write-Verbose "No metadata readable in $label`: $($_.Exception.Message)" }
         if ($null -eq $metadata) {
-            & $add "Metadata $file" $false 'no embedded metadata'
+            & $add "Metadata $label" $false 'no embedded metadata'
         }
         else {
             $problems = @()
-            if ([string]$metadata.CapturedAt -ne (& $decode $image.Groups[3].Value)) { $problems += "capture time $($metadata.CapturedAt) differs from the report" }
-            if ([string]$metadata.PageUrl -ne (& $decode $image.Groups[4].Value)) { $problems += "page URL $($metadata.PageUrl) differs from the report" }
-            & $add "Metadata $file" ($problems.Count -eq 0) $(if ($problems.Count -eq 0) { "$($metadata.ItemName) | $($metadata.CapturedAt) | $($metadata.PageUrl)" } else { $problems -join '; ' })
+            if ([string]$metadata.CapturedAt -ne (& $read 'data-captured')) { $problems += "capture time $($metadata.CapturedAt) differs from the report" }
+            if ([string]$metadata.PageUrl -ne (& $read 'data-url')) { $problems += "page URL $($metadata.PageUrl) differs from the report" }
+            & $add "Metadata $label" ($problems.Count -eq 0) $(if ($problems.Count -eq 0) { "$($metadata.ItemName) | $($metadata.CapturedAt) | $($metadata.PageUrl)" } else { $problems -join '; ' })
         }
     }
 
@@ -5085,8 +5670,8 @@ function Test-ReportIntegrity {
         }
     }
 
-    # Saved image files, when the run used -SaveImages.
-    $imagesDir = Join-Path -Path (Split-Path -Path $Path -Parent) -ChildPath (Join-Path 'images' ([System.IO.Path]::GetFileNameWithoutExtension($Path)))
+    # Saved image files, when the run used -SaveImages (or a linked report).
+    $imagesDir = Join-Path -Path $reportDirectory -ChildPath (Join-Path 'images' ([System.IO.Path]::GetFileNameWithoutExtension($Path)))
     $sums = Join-Path -Path $imagesDir -ChildPath 'SHA256SUMS'
     if (Test-Path -LiteralPath $sums -PathType Leaf) {
         $sumsText = [System.IO.File]::ReadAllText($sums)
@@ -5096,7 +5681,10 @@ function Test-ReportIntegrity {
             $null = $line -match '^([0-9a-f]{64})  (.+)$'
             $expected = $Matches[1]
             $name = $Matches[2]
-            $filePath = Join-Path -Path $imagesDir -ChildPath $name
+            # A name from the file is checked like a linked src: it must stay in the folder.
+            $located = Resolve-ReportImagePath -ReportDirectory $imagesDir -Source ([System.Uri]::EscapeDataString($name))
+            if ($located.Problem) { & $add "File $name" $false "not checked: $($located.Problem)"; continue }
+            $filePath = $located.Path
             if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) { & $add "File $name" $false 'missing'; continue }
             $actual = Get-Sha256Hex -Bytes ([System.IO.File]::ReadAllBytes($filePath))
             & $add "File $name" ($actual -eq $expected) $(if ($actual -eq $expected) { 'matches' } else { "hash is $actual, expected $expected" })
@@ -5122,6 +5710,178 @@ function Invoke-VerifyReport {
     }
     Write-Host "NOT VERIFIED: $failed of $($results.Count) check(s) failed." -ForegroundColor Red
     return 4
+}
+
+function Expand-NameTemplate {
+    <#
+        Fills the tokens of a file name template ("{title} {period}.zip"). Token names
+        ignore case. A token Vouch does not know is left exactly as written and listed in
+        Unknown, so the caller can say so: a typo must show, not silently vanish.
+        Returns { Text; Unknown }. The result is not yet a safe file name
+        (ConvertTo-SafeOutputName).
+    #>
+    param(
+        [AllowEmptyString()][string]$Template = '',
+        # Token name (without braces) -> value.
+        [System.Collections.IDictionary]$Values = @{}
+    )
+    $known = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($key in $Values.Keys) { $known[[string]$key] = [string]$Values[$key] }
+    $unknown = [System.Collections.Generic.List[string]]::new()
+    $text = [regex]::Replace($Template, '\{([^{}]*)\}', {
+            param($match)
+            $name = $match.Groups[1].Value
+            if ($known.ContainsKey($name)) { return $known[$name] }
+            if (-not $unknown.Contains($match.Value)) { $unknown.Add($match.Value) }
+            return $match.Value
+        })
+    return [pscustomobject]@{ Text = $text; Unknown = [string[]]@($unknown) }
+}
+
+function ConvertTo-SafeOutputName {
+    <#
+        A file name a person reads (the report or the zip), made safe for Windows but
+        kept readable: spaces, dots and letters of any language stay; only what Windows
+        forbids in a name (\ / : * ? " < > | and control characters) becomes "_" - so a
+        name can never point into another folder. Like Get-SafeFileName it never ends
+        with a dot or space and never gives a reserved device name (CON, NUL, COM1...).
+        -Extension is added when the name does not already end with it.
+    #>
+    param(
+        [AllowEmptyString()][string]$Name = '',
+        [Parameter(Mandatory)][string]$Extension,
+        [string]$Fallback = 'VouchEvidence'
+    )
+    $Extension = '.' + $Extension.TrimStart('.')
+    $safe = $Name -replace '[\x00-\x1f\\/:*?"<>|]+', '_'
+    $safe = ($safe -replace '\s+', ' ').Trim(' ', '.')
+    if ($safe.EndsWith($Extension, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $safe = $safe.Substring(0, $safe.Length - $Extension.Length).Trim(' ', '.')
+    }
+    if ([string]::IsNullOrWhiteSpace($safe) -or $safe -match '^_+$') { $safe = $Fallback }
+    if ($safe -match '^(?i)(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\..*)?$') { $safe = "_$safe" }
+    if ($safe.Length -gt 150) { $safe = $safe.Substring(0, 150).Trim(' ', '.') }
+    return "$safe$Extension"
+}
+
+function Get-AvailableFilePath {
+    <#
+        The path itself when nothing is there yet, otherwise the first free "name_2.ext",
+        "name_3.ext", ...: evidence packages are never replaced without anyone noticing.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $Path }
+    $folder = Split-Path -Path $Path -Parent
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+    $extension = [System.IO.Path]::GetExtension($Path)
+    for ($n = 2; ; $n++) {
+        $candidate = Join-Path -Path $folder -ChildPath "${stem}_$n$extension"
+        if (-not (Test-Path -LiteralPath $candidate)) { return $candidate }
+    }
+}
+
+function Get-NameTokenValues {
+    <#
+        The values of the name tokens for one run: {report} {title} {date} {time}
+        {period} {classification}. The date and time are those the run started at, so
+        the report and its zip carry the same ones.
+    #>
+    param(
+        [Parameter(Mandatory)][datetime]$When,
+        [AllowEmptyString()][string]$Report = '',
+        [AllowEmptyString()][string]$Title = '',
+        [AllowEmptyString()][string]$PeriodFrom = '',
+        [AllowEmptyString()][string]$PeriodTo = '',
+        [AllowEmptyString()][string]$PeriodLabel = '',
+        [AllowEmptyString()][string]$Classification = ''
+    )
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $period = if ($PeriodLabel.Trim()) { $PeriodLabel.Trim() } else { (@($PeriodFrom.Trim(), $PeriodTo.Trim()) | Where-Object { $_ }) -join ' to ' }
+    return [ordered]@{
+        report         = $Report
+        title          = $(if ($Title.Trim()) { $Title.Trim() } else { 'Audit Evidence Report' })
+        date           = $When.ToString('yyyy-MM-dd', $invariant)
+        time           = $When.ToString('HHmmss', $invariant)
+        period         = $period
+        classification = $(if ($null -ne ($style = Get-ClassificationStyle -Level $Classification)) { $style.Level } else { '' })
+    }
+}
+
+function New-EvidenceArchive {
+    <#
+        The evidence package: one zip holding the report, its JSON summary and its image
+        folder with SHA256SUMS, at the same relative places, so the extracted copy is a
+        working report whose links and -Verify still work. Only these files go in - not
+        the log, the event file or anything else that happens to be in the output folder.
+        The zip is created new (never over an existing file) and removed again if it
+        cannot be completed. Returns { Path; Sha256; Entries }.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ZipPath,
+        [Parameter(Mandatory)][string]$ReportPath,
+        [AllowEmptyString()][string]$SummaryPath = '',
+        [AllowEmptyString()][string]$ImagesDir = '',
+        # The image file names to include (the run's own, from its manifest).
+        [AllowEmptyCollection()][string[]]$ImageFiles = @()
+    )
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.ZipFile
+    $reportFolder = Split-Path -Path $ReportPath -Parent
+    $files = [System.Collections.Generic.List[object]]::new()
+    $files.Add([pscustomobject]@{ Source = $ReportPath; Entry = [System.IO.Path]::GetFileName($ReportPath) })
+    if ($SummaryPath -and (Test-Path -LiteralPath $SummaryPath -PathType Leaf)) {
+        $files.Add([pscustomobject]@{ Source = $SummaryPath; Entry = [System.IO.Path]::GetFileName($SummaryPath) })
+    }
+    if ($ImagesDir -and (Test-Path -LiteralPath $ImagesDir -PathType Container)) {
+        $folderEntry = [System.IO.Path]::GetRelativePath($reportFolder, $ImagesDir).Replace('\', '/')
+        foreach ($name in @(@($ImageFiles) + 'SHA256SUMS' | Select-Object -Unique)) {
+            $source = Join-Path -Path $ImagesDir -ChildPath $name
+            if (Test-Path -LiteralPath $source -PathType Leaf) {
+                $files.Add([pscustomobject]@{ Source = $source; Entry = "$folderEntry/$name" })
+            }
+        }
+    }
+
+    $stream = [System.IO.FileStream]::new($ZipPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    $completed = $false
+    try {
+        $archive = [System.IO.Compression.ZipArchive]::new($stream, [System.IO.Compression.ZipArchiveMode]::Create, $true)
+        try {
+            foreach ($file in $files) {
+                # Images are already compressed; the HTML and JSON shrink a lot.
+                $level = if ($file.Entry -match '(?i)\.(jpe?g|png)$') { [System.IO.Compression.CompressionLevel]::NoCompression } else { [System.IO.Compression.CompressionLevel]::Optimal }
+                [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.Source, $file.Entry, $level)
+            }
+        }
+        finally { $archive.Dispose() }
+        $completed = $true
+    }
+    finally {
+        $stream.Dispose()
+        if (-not $completed) { Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue }
+    }
+    return [pscustomobject]@{
+        Path    = $ZipPath
+        Sha256  = Get-FileSha256Hex -Path $ZipPath
+        Entries = [string[]]@($files.Entry)
+    }
+}
+
+function Get-FileSha256Hex {
+    # SHA-256 of a file read as a stream: a zip of a large run need not fit in memory.
+    param([Parameter(Mandatory)][string]$Path)
+    $stream = [System.IO.File]::OpenRead($Path)
+    try { return [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant() }
+    finally { $stream.Dispose() }
+}
+
+function Open-ReportFile {
+    <#
+        Opens the finished report with whatever Windows uses for .html files. Its own
+        function so the tests can see whether it was called without a browser opening.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    Invoke-Item -LiteralPath $Path
 }
 
 function Start-RunLog {
@@ -5185,6 +5945,26 @@ function Get-RunSettingDefinition {
         [pscustomobject]@{ Name = 'NoPrompt';             Type = 'bool';   Section = '';         Key = '' }
         [pscustomobject]@{ Name = 'EventLogPath';         Type = 'string'; Section = '';         Key = '' }
         [pscustomobject]@{ Name = 'TabId';                Type = 'string'; Section = '';         Key = '' }
+        # The report, its form and the output package. A dotted key is a nested value
+        # (report.period.from). Invert: the switch says the opposite of the file's key
+        # (-NoIndex = "showIndex": false, -LinkImages = "embedImages": false).
+        [pscustomobject]@{ Name = 'Account';              Type = 'string'; Section = 'defaults'; Key = 'account' }
+        [pscustomobject]@{ Name = 'ReportTitle';          Type = 'string'; Section = 'report';   Key = 'title' }
+        [pscustomobject]@{ Name = 'Classification';       Type = 'string'; Section = 'report';   Key = 'classification' }
+        [pscustomobject]@{ Name = 'LogoPath';             Type = 'string'; Section = 'report';   Key = 'logoPath' }
+        [pscustomobject]@{ Name = 'CompanyName';          Type = 'string'; Section = 'report';   Key = 'company.name' }
+        [pscustomobject]@{ Name = 'CompanyDetails';       Type = 'string'; Section = 'report';   Key = 'company.details' }
+        [pscustomobject]@{ Name = 'Description';          Type = 'string'; Section = 'report';   Key = 'description' }
+        [pscustomobject]@{ Name = 'Origin';               Type = 'string'; Section = 'report';   Key = 'origin' }
+        [pscustomobject]@{ Name = 'GeneratedBy';          Type = 'string'; Section = 'report';   Key = 'generatedBy' }
+        [pscustomobject]@{ Name = 'PeriodFrom';           Type = 'string'; Section = 'report';   Key = 'period.from' }
+        [pscustomobject]@{ Name = 'PeriodTo';             Type = 'string'; Section = 'report';   Key = 'period.to' }
+        [pscustomobject]@{ Name = 'PeriodLabel';          Type = 'string'; Section = 'report';   Key = 'period.label' }
+        [pscustomobject]@{ Name = 'NoIndex';              Type = 'bool';   Section = 'report';   Key = 'showIndex'; Invert = $true }
+        [pscustomobject]@{ Name = 'LinkImages';           Type = 'bool';   Section = 'output';   Key = 'embedImages'; Invert = $true }
+        [pscustomobject]@{ Name = 'Zip';                  Type = 'bool';   Section = 'output';   Key = 'zip.enabled' }
+        [pscustomobject]@{ Name = 'ZipName';              Type = 'string'; Section = 'output';   Key = 'zip.name' }
+        [pscustomobject]@{ Name = 'OpenReport';           Type = 'bool';   Section = 'output';   Key = 'openReport' }
     )
 }
 
@@ -5211,13 +5991,17 @@ function Get-ConfigValue {
     elseif ($Config.PSObject.Properties[$Section]) { $container = $Config.$Section }
     if ($null -eq $container) { return $notFound }
 
-    $value = $null
-    if ($container -is [System.Collections.IDictionary]) {
-        if (@($container.Keys) -notcontains $Key) { return $notFound }
-        $value = $container[$Key]
+    # A dotted key ("period.from") walks into nested objects.
+    $value = $container
+    foreach ($part in $Key.Split('.')) {
+        if ($null -eq $value) { return $notFound }
+        if ($value -is [System.Collections.IDictionary]) {
+            if (@($value.Keys) -notcontains $part) { return $notFound }
+            $value = $value[$part]
+        }
+        elseif ($value -isnot [string] -and $value -isnot [ValueType] -and $value.PSObject.Properties[$part]) { $value = $value.$part }
+        else { return $notFound }
     }
-    elseif ($container.PSObject.Properties[$Key]) { $value = $container.$Key }
-    else { return $notFound }
 
     if ($null -eq $value) { return $notFound }
     if ($value -is [string] -and [string]::IsNullOrWhiteSpace($value)) { return $notFound }
@@ -5254,7 +6038,10 @@ function Resolve-RunSettings {
             if ($definition.Section) {
                 $fromConfig = Get-ConfigValue -Config $Config -Section $definition.Section -Key $definition.Key
             }
-            if ($fromConfig.Found) { $value = $fromConfig.Value }
+            if ($fromConfig.Found) {
+                $value = $fromConfig.Value
+                if ($definition.PSObject.Properties['Invert'] -and $definition.Invert) { $value = -not [bool]$value }
+            }
             elseif ($null -ne $Defaults -and @($Defaults.Keys) -contains $name) { $value = $Defaults[$name] }
         }
 
@@ -5323,8 +6110,8 @@ function Get-PageSettings {
         know where a value came from.
         A value typed on the command line beats a page override too: the precedence is
         command line > configuration > default, whatever part of the file it is in.
-        (-CaptureArea and -ZoomPercent are the page-level settings that also have a
-        command-line switch.)
+        (-Account, -CaptureArea and -ZoomPercent are the page-level settings that also
+        have a command-line switch.)
     #>
     param(
         [Parameter(Mandatory)][object]$Settings,
@@ -5352,7 +6139,7 @@ function Get-PageSettings {
     $schemaDefaults = Get-DefaultVouchConfig
     foreach ($key in $pageLevelKeys) {
         $name = $key.Substring(0, 1).ToUpperInvariant() + $key.Substring(1)
-        # -CaptureArea / -ZoomPercent typed on the command line: already in the run settings.
+        # -Account / -CaptureArea / -ZoomPercent typed on the command line: already in the run settings.
         if ($BoundNames -contains $name) { continue }
         $value = $schemaDefaults['defaults'][$key]
         $fromConfig = Get-ConfigValue -Config $Config -Section 'defaults' -Key $key
@@ -5417,6 +6204,8 @@ function New-CaptureItem {
         # The page's capture area and zoom as set; each capture records what it got.
         CaptureArea    = 'screen'
         ZoomPercent    = 100
+        # The account the page is captured with (defaults.account or the page's own), '' for none.
+        Account        = ''
     }
 }
 
@@ -5730,6 +6519,7 @@ function Invoke-CaptureItem {
     $captureMode = Get-PageCaptureMode -Settings $Settings
     $Item.CaptureArea = $captureMode.Area
     $Item.ZoomPercent = $captureMode.ZoomPercent
+    if ($Item.PSObject.Properties['Account'] -and $Settings.PSObject.Properties['Account']) { $Item.Account = ([string]$Settings.Account).Trim() }
 
     try {
         # The zoom goes on before the page loads, so the page lays itself out once, at
@@ -6010,8 +6800,15 @@ function Invoke-CaptureRun {
     # The configuration path is command-line only, so it is known before the file is read.
     $settings = Resolve-RunSettings -BoundParameters $split.Bound -Defaults $split.Defaults -Config $null
 
-    # Events and the stop file first, so that even a run that cannot start says why.
-    Initialize-RunEvent -EventLogPath $settings.EventLogPath
+    # Events and the stop file first, so that even a run that cannot start says why -
+    # but only for a capture run: -Verify and -LoginSetup capture nothing and must not
+    # write into an event file a program may be following.
+    if (Test-CaptureRunMode -Settings $settings) {
+        Initialize-RunEvent -EventLogPath $settings.EventLogPath
+    }
+    else {
+        $script:EventLogPath = ''
+    }
     $script:CdpTabId = $settings.TabId
 
     if ($boundNames -contains 'CsvPath' -and $boundNames -contains 'ConfigPath') {
@@ -6073,24 +6870,37 @@ function Invoke-CaptureRun {
         $loaded += " ($($allDefinitions.Count - $definitions.Count) other page(s) not selected or switched off)"
     }
     Write-Host $loaded -ForegroundColor Cyan
-    if ($null -ne $config) {
-        $inactive = Get-InactiveConfigSetting -Config $config
-        if ($inactive.Count -gt 0) {
-            Write-Host "WARNING: this version of Vouch does not apply these configuration settings yet, so they have no effect: $($inactive -join ', ')." -ForegroundColor Yellow
-        }
-    }
 
     if (-not (Test-Path -LiteralPath $settings.OutputDir)) {
         [void](New-Item -ItemType Directory -Path $settings.OutputDir -Force)
     }
     $resolvedOutputDir = (Resolve-Path -LiteralPath $settings.OutputDir).Path
 
+    # One moment names everything of this run: the default report name, {date}, {time}.
+    $runStamp = Get-Date
+    $tokenArguments = @{
+        When = $runStamp; Title = $settings.ReportTitle; Classification = $settings.Classification
+        PeriodFrom = $settings.PeriodFrom; PeriodTo = $settings.PeriodTo; PeriodLabel = $settings.PeriodLabel
+    }
+    $defaultReportStem = "VouchReport_$($runStamp.ToString('yyyy-MM-dd_HHmmss'))"
     $effectiveReportName = $settings.ReportName
     if ([string]::IsNullOrWhiteSpace($effectiveReportName)) {
-        $effectiveReportName = "VouchReport_$((Get-Date).ToString('yyyy-MM-dd_HHmmss')).html"
+        $effectiveReportName = "$defaultReportStem.html"
+    }
+    elseif ($effectiveReportName -match '\{[^{}]*\}') {
+        # {report} in the report's own name is the name it would have had.
+        $expanded = Expand-NameTemplate -Template $effectiveReportName -Values (Get-NameTokenValues @tokenArguments -Report $defaultReportStem)
+        foreach ($token in $expanded.Unknown) { Write-Host "WARNING: the report name has the token $token, which Vouch does not know; it is left as written." -ForegroundColor Yellow }
+        $extension = if ($expanded.Text -match '(?i)\.htm$') { 'htm' } else { 'html' }
+        $effectiveReportName = ConvertTo-SafeOutputName -Name $expanded.Text -Extension $extension -Fallback $defaultReportStem
     }
     if ($effectiveReportName -notmatch '(?i)\.html?$') { $effectiveReportName += '.html' }
     $reportPath = Join-Path -Path $resolvedOutputDir -ChildPath $effectiveReportName
+    $reportStem = [System.IO.Path]::GetFileNameWithoutExtension($effectiveReportName)
+
+    # A linked report shows the image files, so they must be saved.
+    $embedImages = -not $settings.LinkImages
+    if (-not $embedImages) { $settings.SaveImages = $true }
 
     # One folder per report, so a later run never overwrites the images (and with them
     # the hashes) of an earlier one.
@@ -6111,6 +6921,7 @@ function Invoke-CaptureRun {
         Extension  = $imageExtension
         SaveImages = [bool]$settings.SaveImages
         ImagesDir  = $imagesDir
+        EmbedImages = $embedImages
         Screen     = "$($screenBounds.Width)x$($screenBounds.Height)"
     }
     $runStart = [System.DateTimeOffset]::Now
@@ -6118,6 +6929,8 @@ function Invoke-CaptureRun {
     $captureDesktop = $null
     $desktopNote = 'The signed-in desktop (-UseVirtualDesktop not set)'
     $script:InteractiveRun = Test-InteractiveRun -NoPrompt $settings.NoPrompt
+    # Kept for the end of the run (opening the report): InteractiveRun is reset before that.
+    $interactiveRun = $script:InteractiveRun
     Write-RunEvent -Type 'runStart' -Data ([ordered]@{
         toolVersion = $script:ToolVersion; pageCount = $definitions.Count; reportPath = $reportPath
         source = $sourcePath; interactive = $script:InteractiveRun; stopFile = (Get-StopFilePath); processId = $PID })
@@ -6253,17 +7066,59 @@ function Invoke-CaptureRun {
         [System.IO.File]::WriteAllText((Join-Path -Path $imagesDir -ChildPath 'SHA256SUMS'), $manifest, [System.Text.UTF8Encoding]::new($false))
     }
 
-    $html = New-HtmlReport -Items @($items) -Run $run
+    # A logo is decoration: any problem with it is a warning and the report goes on.
+    $logoPath = $settings.LogoPath
+    if ($logoPath) { $logoPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($logoPath) }
+    $logo = Get-LogoDataUri -Path $logoPath
+    if ($logo.Warning) { Write-Host "WARNING: $($logo.Warning)" -ForegroundColor Yellow }
+    $reportOptions = New-ReportOptions -Title $settings.ReportTitle -Classification $settings.Classification `
+        -LogoPath $logoPath -LogoDataUri $logo.DataUri -CompanyName $settings.CompanyName -CompanyDetails $settings.CompanyDetails `
+        -Description $settings.Description -Origin $settings.Origin -GeneratedBy $settings.GeneratedBy `
+        -PeriodFrom $settings.PeriodFrom -PeriodTo $settings.PeriodTo -PeriodLabel $settings.PeriodLabel `
+        -Account $settings.Account -ShowIndex (-not $settings.NoIndex) -EmbedImages $embedImages `
+        -ImageFolder $(if ($imagesDir) { [System.IO.Path]::GetRelativePath($resolvedOutputDir, $imagesDir) } else { '' })
+
+    $html = New-HtmlReport -Items @($items) -Run $run -Options $reportOptions
     [System.IO.File]::WriteAllText($reportPath, $html, [System.Text.UTF8Encoding]::new($false))
+    $html = $null
 
     $reportSizeMb = [Math]::Round((Get-Item -LiteralPath $reportPath).Length / 1MB, 1)
     $script:ExitCode = if ($failCount -gt 0) { 2 } elseif ($settings.FailOnWarning -and $warnCount -gt 0) { 3 } else { 0 }
 
+    # The zip's name is known before the summary is written, so the summary inside the
+    # zip can name it; its hash is known only afterwards (see ConvertTo-RunSummaryJson).
+    $zipPath = ''
+    if ($settings.Zip) {
+        $zipTemplate = if ([string]::IsNullOrWhiteSpace($settings.ZipName)) { '{report}.zip' } else { $settings.ZipName }
+        $expanded = Expand-NameTemplate -Template $zipTemplate -Values (Get-NameTokenValues @tokenArguments -Report $reportStem)
+        foreach ($token in $expanded.Unknown) { Write-Host "WARNING: the zip name has the token $token, which Vouch does not know; it is left as written." -ForegroundColor Yellow }
+        $zipPath = Get-AvailableFilePath -Path (Join-Path -Path $resolvedOutputDir -ChildPath (ConvertTo-SafeOutputName -Name $expanded.Text -Extension 'zip' -Fallback $reportStem))
+    }
+
     $summaryPath = ''
+    $writeSummary = {
+        param($Zip)
+        $json = ConvertTo-RunSummaryJson -Items @($items) -Run $run -ReportPath $reportPath -ExitCode $script:ExitCode -Options $reportOptions -Zip $Zip
+        [System.IO.File]::WriteAllText($summaryPath, $json, [System.Text.UTF8Encoding]::new($false))
+    }
     if ($settings.JsonSummary) {
         $summaryPath = [System.IO.Path]::ChangeExtension($reportPath, '.json')
-        $json = ConvertTo-RunSummaryJson -Items @($items) -Run $run -ReportPath $reportPath -ExitCode $script:ExitCode
-        [System.IO.File]::WriteAllText($summaryPath, $json, [System.Text.UTF8Encoding]::new($false))
+        & $writeSummary $(if ($zipPath) { [pscustomobject]@{ Path = $zipPath; Sha256 = $null } } else { $null })
+    }
+
+    $archive = $null
+    if ($zipPath) {
+        try {
+            $archive = New-EvidenceArchive -ZipPath $zipPath -ReportPath $reportPath -SummaryPath $summaryPath -ImagesDir $imagesDir `
+                -ImageFiles ([string[]]@($items | ForEach-Object { $_.Captures } | ForEach-Object { $_.FileName }))
+        }
+        catch {
+            # The report itself is written and complete; only the package is missing.
+            Write-Host "WARNING: the zip file '$zipPath' could not be made: $($_.Exception.Message) The report and its files are in $resolvedOutputDir." -ForegroundColor Yellow
+            $archive = $null
+        }
+        # Now with the zip's hash - or without the zip, which then does not exist.
+        if ($summaryPath) { & $writeSummary $archive }
     }
 
     Write-Host ''
@@ -6274,13 +7129,40 @@ function Invoke-CaptureRun {
     if ($settings.SaveImages) { Write-Host "Individual images: $imagesDir" }
     Write-Host "Report: $reportPath ($reportSizeMb MB)" -ForegroundColor Cyan
     if ($summaryPath) { Write-Host "Summary: $summaryPath" }
+    if ($null -ne $archive) { Write-Host "Zip: $($archive.Path) (SHA-256 $($archive.Sha256))" -ForegroundColor Cyan }
     Remove-StopFile
     Write-RunEvent -Type 'runEnd' -Data ([ordered]@{
         exitCode = $script:ExitCode; reportPath = $reportPath; jsonSummaryPath = $summaryPath
         counts = [ordered]@{
             pages = $definitions.Count; run = $items.Count; ok = $okCount; warning = $warnCount; failed = $failCount
             notRun = $definitions.Count - $items.Count; captures = [int]$captureCount }
-        stopped = [bool]$script:StopRequested })
+        stopped = [bool]$script:StopRequested
+        zipPath = $(if ($null -ne $archive) { $archive.Path } else { '' })
+        zipSha256 = $(if ($null -ne $archive) { $archive.Sha256 } else { '' }) })
+
+    # Last of all, when everything (the zip too) is finished - and only for a person.
+    if ($settings.OpenReport) {
+        if ($interactiveRun) {
+            try { Open-ReportFile -Path $reportPath }
+            catch { Write-Host "WARNING: the report could not be opened: $($_.Exception.Message) It is at $reportPath." -ForegroundColor Yellow }
+        }
+        else {
+            Write-Host 'The report is not opened: nobody is watching this run (a scheduled or -NoPrompt run).'
+        }
+    }
+}
+
+function Test-CaptureRunMode {
+    <#
+        Whether these settings start a capture run (and so a run with progress events),
+        rather than -Verify or -LoginSetup, which capture nothing. A further mode that
+        captures nothing (the Designer) belongs on the "no" side here too.
+    #>
+    param([Parameter(Mandatory)][object]$Settings)
+    foreach ($mode in 'Verify', 'LoginSetup', 'Designer') {
+        if ($Settings.PSObject.Properties[$mode] -and $Settings.$mode) { return $false }
+    }
+    return $true
 }
 
 function Initialize-RunEvent {

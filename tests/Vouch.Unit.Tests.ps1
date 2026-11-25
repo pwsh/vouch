@@ -339,6 +339,9 @@ Describe 'Resolve-RunSettings' {
             LoginSetup = [switch]$false; ConfigPath = ''; Only = [string[]]@()
             CaptureArea = 'screen'; ZoomPercent = 100
             NoPrompt = [switch]$false; EventLogPath = ''; TabId = ''
+            Account = ''; ReportTitle = ''; Classification = ''; LogoPath = ''; CompanyName = ''; CompanyDetails = ''
+            Description = ''; Origin = ''; GeneratedBy = ''; PeriodFrom = ''; PeriodTo = ''; PeriodLabel = ''
+            NoIndex = [switch]$false; LinkImages = [switch]$false; Zip = [switch]$false; ZipName = ''; OpenReport = [switch]$false
         }
         $config = '{
             "browser":  { "profileDir": "C:\\cfg-profile", "debugPort": 9333, "keepBrowserOpen": true },
@@ -931,59 +934,40 @@ Describe 'Configuration file' {
         }
     }
 
-    Context 'Get-InactiveConfigSetting' {
-        It 'lists nothing for the defaults' {
-            (Get-InactiveConfigSetting -Config (Get-DefaultVouchConfig)).Count | Should -Be 0
-        }
-
-        It 'lists each setting that is set but not applied yet, once' {
-            $config = Get-DefaultVouchConfig
-            $config['defaults']['captureArea'] = 'window'
-            $config['output']['zip']['enabled'] = $true
-            $config['output']['embedImages'] = $false
-            $config['report']['title'] = 'Q3'
-            $config['report']['period']['label'] = 'Q3 2026'
-            $config['defaults']['settleSeconds'] = 5
-            foreach ($n in 1, 2) {
-                $config['pages'].Add([ordered]@{ overrides = [ordered]@{ zoomPercent = 80; settleSeconds = 1 } })
-            }
-            $config['defaults']['account'] = 'svc-audit'
-            $inactive = Get-InactiveConfigSetting -Config $config
-            $inactive | Should -Be @(
-                'defaults.account', 'output.embedImages', 'output.zip.enabled', 'report.title', 'report.period.label')
-        }
-
-        It 'no longer lists the capture area and zoom, which now work' {
-            $config = Get-DefaultVouchConfig
-            $config['defaults']['captureArea'] = 'window'
-            $config['defaults']['zoomPercent'] = 150
-            $config['pages'].Add([ordered]@{ overrides = [ordered]@{ captureArea = 'page'; zoomPercent = 80 } })
-            (Get-InactiveConfigSetting -Config $config).Count | Should -Be 0
+    Context 'Every setting of the file now works' {
+        It 'has no list of settings without effect any more' {
+            Get-Command -Name Get-InactiveConfigSetting -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
+            (Get-Content -LiteralPath $script:VouchPath -Raw) | Should -Not -Match 'does not apply these configuration settings'
         }
     }
 
-    Context 'Get-InactiveConfigSetting for page actions' {
-        It 'no longer lists pause actions, waitFor or one-tall-image captures' {
+    Context 'The account: defaults.account, a page''s own, and -Account' {
+        BeforeAll {
             $config = Get-DefaultVouchConfig
-            $config['defaults']['waitFor'] = '#ready'
-            $config['pages'].Add([ordered]@{ overrides = [ordered]@{ waitFor = '#grid' }; actions = @(
-                    [ordered]@{ type = 'Pause'; message = 'MFA' }
-                    [ordered]@{ type = 'waitFor'; selector = '#x' }
-                    [ordered]@{ type = 'capture'; scroll = [ordered]@{ mode = 'auto'; as = 'single' } }
-                    [ordered]@{ type = 'capture'; scroll = [ordered]@{ mode = 'none'; as = 'single' } }
-                    [ordered]@{ type = 'pause' }) })
-            (Get-InactiveConfigSetting -Config $config).Count | Should -Be 0
+            $config['defaults']['account'] = 'svc-audit@example.com'
+            $run = Resolve-RunSettings -BoundParameters @{} -Config $config -Defaults @{ Account = ''; SettleSeconds = [double]2 }
+            $own = [pscustomobject]@{ Overrides = [ordered]@{ account = 'admin@example.com' } }
+            $plain = [pscustomobject]@{ Overrides = [ordered]@{} }
         }
 
-        It 'no longer lists onNotReady or promptTimeoutSec, which now work' {
-            $config = Get-DefaultVouchConfig
-            $config['defaults']['onNotReady'] = 'prompt'
-            $config['defaults']['promptTimeoutSec'] = 60
-            $config['pages'].Add([ordered]@{ overrides = [ordered]@{ onNotReady = 'prompt'; promptTimeoutSec = 30 } })
-            (Get-InactiveConfigSetting -Config $config).Count | Should -Be 0
+        It 'gives a page the run''s account, or its own' {
+            $run.Account | Should -Be 'svc-audit@example.com'
+            (Get-PageSettings -Settings $run -Definition $plain -Config $config).Account | Should -Be 'svc-audit@example.com'
+            (Get-PageSettings -Settings $run -Definition $own -Config $config).Account | Should -Be 'admin@example.com'
+        }
+
+        It 'lets -Account typed on the command line beat the file and the page' {
+            $typed = Resolve-RunSettings -BoundParameters @{ Account = 'typed@example.com' } -Config $config -Defaults @{ Account = '' }
+            $typed.Account | Should -Be 'typed@example.com'
+            (Get-PageSettings -Settings $typed -Definition $own -Config $config -BoundNames 'Account').Account | Should -Be 'typed@example.com'
+        }
+
+        It 'puts it on the item and so into each image''s metadata' {
+            $item = New-CaptureItem -Definition ([pscustomobject]@{ Index = 1; Name = 'A'; Url = 'https://a/'; Notes = ''; StepsText = ''; ScrollFullPage = $false })
+            $item.Account | Should -Be ''
+            @($item.PSObject.Properties.Name)[-1] | Should -Be 'Account'
         }
     }
-
     Context 'Get-RunLogDirectory' {
         BeforeAll {
             $folder = Join-Path -Path $TestDrive -ChildPath 'logcfg'
@@ -1808,6 +1792,8 @@ Describe 'Handing the screen back to Edge after the dialog' {
         Mock Get-EdgeWindowHandle { [IntPtr]::Zero }
         Restore-EdgeForeground
         Should -Invoke Get-EdgeWindowHandle -Times 1 -Exactly -ParameterFilter { $ExpectedTitle -eq 'Users - Admin' -and $TimeoutSec -eq 1 }
+        # A busy page must not hold the run up for long after the dialog.
+        Should -Invoke Invoke-CdpEval -Times 1 -Exactly -ParameterFilter { $TimeoutSec -le 2 }
     }
 
     It 'looks for an Edge it knows by its process without reading the title' {
@@ -1886,5 +1872,451 @@ Describe 'Small checks added with the prompts' {
         $policy = Get-NotReadyPolicy -Settings ([pscustomobject]@{ OnNotReady = 'prompt'; PromptTimeoutSec = 45 })
         $policy.OnNotReady | Should -Be 'prompt'
         $policy.PromptTimeoutSec | Should -Be 45
+    }
+}
+
+Describe 'Report content (-Options)' {
+    BeforeAll {
+        $script:Markup = '<script>alert(1)</script>'
+        $run = [pscustomobject]@{
+            StartTime = '2026-09-23 10:00:00'; EndTime = '2026-09-23 10:05:00'; TimeZone = 'UTC'; Computer = 'PC'; User = 'DOM\user'
+            OperatingSystem = 'Windows'; EdgeVersion = 'Edg/1'; BrowserInstance = 'b'; CaptureDesktop = 'd'; ToolVersion = '2.0.0'
+            CsvPath = 'c.json'; ImageFormat = 'jpeg'; ImageDescription = 'JPEG'; ScreenResolution = '1x1'; Total = 2; OkCount = 2
+            WarnCount = 0; FailCount = 0; CaptureCount = 4; RunId = 'r'; ManifestSha256 = ('a' * 64)
+        }
+        $at = { param($Minute) [System.DateTimeOffset]::new(2026, 9, 23, 10, $Minute, 0, [TimeSpan]::FromHours(2)) }
+        function New-OptionItem([int]$Index, [string]$Name, [string]$Account, [object[]]$Captures) {
+            $list = [System.Collections.Generic.List[object]]::new()
+            foreach ($c in $Captures) { $list.Add($c) }
+            [pscustomobject]@{
+                Index = $Index; Name = $Name; Url = 'https://a/'; FinalUrl = 'https://a/'; Notes = ''; StepsText = ''; ScrollFullPage = $false
+                ScrollArea = ''; Status = 'OK'; HttpStatus = 200; Details = [System.Collections.Generic.List[string]]::new()
+                StepLog = [System.Collections.Generic.List[object]]::new(); Captures = $list; CaptureArea = 'page'; ZoomPercent = 100; Account = $Account
+            }
+        }
+        $script:Items = @(
+            (New-OptionItem 1 "Payroll $($script:Markup)" "svc<b>@example.com" @(
+                (New-CaptureRecord -Bytes ([byte[]](1)) -Url 'https://a/' -SegmentIndex 1 -SegmentCount 1 -FileName '001_P_seg01.jpg' -Label "Policy $($script:Markup)" -CapturedAt (& $at 3))
+                (New-CaptureRecord -Bytes ([byte[]](2)) -Url 'https://a/' -SegmentIndex 1 -SegmentCount 2 -FileName '001_P_c02_seg01.jpg' -CaptureNumber 2 -CapturedAt (& $at 4))
+                (New-CaptureRecord -Bytes ([byte[]](3)) -Url 'https://a/' -SegmentIndex 2 -SegmentCount 2 -FileName '001_P_c02_seg02.jpg' -CaptureNumber 2 -CapturedAt (& $at 5))))
+            (New-OptionItem 2 'Plain' '' @(
+                (New-CaptureRecord -Bytes ([byte[]](4)) -Url 'https://a/' -SegmentIndex 1 -SegmentCount 1 -FileName '002_Plain_seg01.jpg' -CapturedAt (& $at 1)))))
+        $script:Options = New-ReportOptions -Title "Q3 $($script:Markup)" -Classification 'confidential' -CompanyName "ACME $($script:Markup)" `
+            -CompanyDetails "1 Main St`r`nSpringfield <b>x</b>" -Description "Why`nwe $($script:Markup)" -Origin "HQ $($script:Markup)" `
+            -GeneratedBy "Jane $($script:Markup)" -PeriodFrom '01/07/2026' -PeriodTo '2026-09-30' -PeriodLabel "Q3 $($script:Markup)" `
+            -Account "svc-default $($script:Markup)" -LogoDataUri 'data:image/png;base64,iVBORw0KGgo='
+        $script:Html = New-HtmlReport -Items $script:Items -Run $run -Options $script:Options
+        $script:Run = $run
+    }
+
+    It 'never emits a typed value unencoded' {
+        $script:Html | Should -Not -Match '<script>alert'
+        $script:Html | Should -Not -Match '<b>'
+        ([regex]::Matches($script:Html, '&lt;script&gt;alert\(1\)&lt;/script&gt;')).Count | Should -BeGreaterOrEqual 9
+    }
+
+    It 'uses the title as the page title and the main heading' {
+        $script:Html | Should -Match '<title>Q3 &lt;script&gt;alert\(1\)&lt;/script&gt; - 2026-09-23 10:00:00</title>'
+        $script:Html | Should -Match '<h1>Q3 &lt;script&gt;alert\(1\)&lt;/script&gt;</h1>'
+        $script:Html | Should -Not -Match 'Vouch &mdash; Audit Evidence Report'
+    }
+
+    It 'keeps the old heading for the default title' {
+        $html = New-HtmlReport -Items $script:Items -Run $script:Run -Options (New-ReportOptions)
+        $html | Should -Match '<h1>Vouch &mdash; Audit Evidence Report</h1>'
+    }
+
+    It 'shows the company block with the logo as an image and the details on their own lines' {
+        $script:Html | Should -Match '<header class="company"><img class="logo" alt="Company logo" src="data:image/png;base64,iVBORw0KGgo=">'
+        $script:Html | Should -Match '<div class="company-name">ACME &lt;script&gt;'
+        $script:Html | Should -Match "<div class=""company-details"">1 Main St`nSpringfield &lt;b&gt;x&lt;/b&gt;</div>"
+        $script:Html | Should -Match 'white-space: pre-line'
+    }
+
+    It 'adds the run details: <Label>' -ForEach @(
+        @{ Label = 'Classification'; Text = 'Confidential' }
+        @{ Label = 'Origin'; Text = 'HQ &lt;script&gt;alert(1)&lt;/script&gt;' }
+        @{ Label = 'Period covered'; Text = 'Q3 &lt;script&gt;alert(1)&lt;/script&gt;: 01/07/2026 to 2026-09-30' }
+        @{ Label = 'Capture window'; Text = '2026-09-23 10:01:00 (UTC+02:00) to 2026-09-23 10:05:00 (UTC+02:00)' }
+        @{ Label = 'Account used'; Text = 'svc-default &lt;script&gt;alert(1)&lt;/script&gt;' }
+        @{ Label = 'Report generated by'; Text = 'Jane &lt;script&gt;alert(1)&lt;/script&gt;' }
+        @{ Label = 'Captured by'; Text = 'DOM\user' }
+    ) {
+        $script:Html | Should -Match ([regex]::Escape("<tr><td class=""k"">$Label</td><td>$Text</td></tr>"))
+    }
+
+    It 'keeps the line breaks of the description' {
+        $script:Html | Should -Match ([regex]::Escape("<td class=""k"">Description</td><td class=""multiline"">Why`nwe &lt;script&gt;"))
+    }
+
+    It 'falls back to the Windows user for "generated by"' {
+        New-HtmlReport -Items $script:Items -Run $script:Run -Options (New-ReportOptions) |
+            Should -Match ([regex]::Escape('<tr><td class="k">Report generated by</td><td>DOM\user</td></tr>'))
+    }
+
+    It 'shows the period exactly as typed (<Case>)' -ForEach @(
+        @{ Case = 'both dates'; From = '2026-07-01'; To = '30.09.2026'; Label = ''; Expected = '2026-07-01 to 30.09.2026' }
+        @{ Case = 'from only'; From = '07/01/2026'; To = ''; Label = ''; Expected = 'from 07/01/2026' }
+        @{ Case = 'to only'; From = ''; To = '2026-09-30'; Label = ''; Expected = 'up to 2026-09-30' }
+        @{ Case = 'label only'; From = ''; To = ''; Label = 'FY2026'; Expected = 'FY2026' }
+        @{ Case = 'nothing'; From = ''; To = ''; Label = ''; Expected = '' }
+    ) {
+        Get-PeriodText -From $From -To $To -Label $Label | Should -Be $Expected
+    }
+
+    It 'measures the capture window from the images, not from what was typed' {
+        $window = Get-CaptureWindow -Items $script:Items
+        $window.First | Should -Be '2026-09-23T10:01:00.000+02:00'
+        $window.Last | Should -Be '2026-09-23T10:05:00.000+02:00'
+        (Get-CaptureWindow -Items @()).Text | Should -Be 'No screenshot was taken.'
+    }
+
+    It 'shows the account on each page that has one' {
+        $script:Html | Should -Match '<dt>Account</dt><dd>svc&lt;b&gt;@example.com</dd>'
+        ([regex]::Matches($script:Html, '<dt>Account</dt>')).Count | Should -Be 1
+    }
+
+    Context 'classification banner' {
+        It 'shows a <Level> banner at the top and the bottom, and on every printed page' -ForEach @(
+            @{ Level = 'Public'; Color = '#1c6b2c' }, @{ Level = 'Internal'; Color = '#12507d' }
+            @{ Level = 'Private'; Color = '#5b3a8c' }, @{ Level = 'Confidential'; Color = '#9b1c1c' }
+        ) {
+            $html = New-HtmlReport -Items $script:Items -Run $script:Run -Options (New-ReportOptions -Classification $Level)
+            $upper = $Level.ToUpperInvariant()
+            $banners = [regex]::Matches($html, "<div class=""classification (top|bottom) cls-$($Level.ToLowerInvariant())"" role=""note"">$upper</div>")
+            @($banners | ForEach-Object { $_.Groups[1].Value }) | Should -Be @('top', 'bottom')
+            $html.IndexOf('class="classification top') | Should -BeLessThan $html.IndexOf('<h1>')
+            $html.IndexOf('class="classification bottom') | Should -BeGreaterThan $html.IndexOf('<footer>')
+            $html | Should -Match "@top-center \{ content: ""$upper""; color: $Color"
+            $html | Should -Match "@bottom-center \{ content: ""$upper"""
+            $html | Should -Match "\.classification \{ color: $Color"
+        }
+
+        It 'shows no banner, no marking and no page margin rule without a classification' {
+            $html = New-HtmlReport -Items $script:Items -Run $script:Run -Options (New-ReportOptions)
+            $html | Should -Not -Match 'class="classification'
+            $html | Should -Not -Match '@page'
+            $html | Should -Not -Match '<td class="k">Classification</td>'
+        }
+
+        It 'ignores a level that is not in the list' {
+            (New-ReportOptions -Classification 'Secret').Classification | Should -Be ''
+        }
+    }
+
+    Context 'contents index' {
+        It 'lists every page in order with its status, image count and account' {
+            $index = [regex]::Match($script:Html, '(?s)<nav class="contents-wrap".*?</nav>').Value
+            $index | Should -Not -BeNullOrEmpty
+            $index | Should -Match '<th>Account</th>'
+            $rows = [regex]::Matches($index, '<tr><td>(\d+)</td><td><a href="#(item-\d+)">([^<]*)</a>')
+            @($rows | ForEach-Object { $_.Groups[1].Value }) | Should -Be @('1', '2')
+            $rows[0].Groups[3].Value | Should -Be 'Payroll &lt;script&gt;alert(1)&lt;/script&gt;'
+            $index | Should -Match '<td><span class="badge ok">OK</span></td><td>3</td><td>svc&lt;b&gt;@example.com</td>'
+            $index | Should -Match '<td>1</td><td>&mdash;</td></tr>'
+            $script:Html.IndexOf('id="contents"') | Should -BeLessThan $script:Html.IndexOf('<h2>Summary</h2>')
+        }
+
+        It 'lists the captures of a page with several as sub-entries' {
+            $index = [regex]::Match($script:Html, '(?s)<nav class="contents-wrap".*?</nav>').Value
+            $subs = [regex]::Matches($index, '<li><a href="#(item-1-c\d)">([^<]*)</a></li>')
+            @($subs | ForEach-Object { $_.Groups[2].Value }) | Should -Be @('Capture 1: Policy &lt;script&gt;alert(1)&lt;/script&gt;', 'Capture 2')
+            $index | Should -Not -Match 'item-2-c'
+        }
+
+        It 'links only to ids that exist in the report, each once' {
+            $targets = @([regex]::Matches($script:Html, 'href="#([^"]+)"') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+            $targets | Should -Contain 'item-1-c2'
+            foreach ($target in $targets) {
+                ([regex]::Matches($script:Html, "id=""$([regex]::Escape($target))""")).Count | Should -Be 1 -Because $target
+            }
+        }
+
+        It 'puts the capture anchor on the first image of each capture' {
+            $script:Html | Should -Match '<figure id="item-1-c2">\r?\n<img alt="Payroll &lt;script&gt;alert\(1\)&lt;/script&gt; - Capture 2 screenshot 1 of 2"'
+        }
+
+        It 'is shown for one page with one capture too' {
+            $html = New-HtmlReport -Items @($script:Items[1]) -Run $script:Run -Options (New-ReportOptions)
+            $html | Should -Match '<h2 id="contents">Contents</h2>'
+            $html | Should -Not -Match '<th>Account</th>'
+        }
+
+        It 'is left out with showIndex false' {
+            $html = New-HtmlReport -Items $script:Items -Run $script:Run -Options (New-ReportOptions -ShowIndex $false)
+            $html | Should -Not -Match 'id="contents"'
+        }
+    }
+
+    Context 'report form' {
+        It 'says a self-contained report is self-contained' {
+            $script:Html | Should -Match '<strong>Self-contained report:</strong>'
+            ([regex]::Matches($script:Html, 'src="data:image/jpeg;base64,')).Count | Should -Be 4
+        }
+
+        It 'links images of a linked report by relative, escaped paths, and says the folder must travel with it' {
+            $html = New-HtmlReport -Items $script:Items -Run $script:Run -Options (New-ReportOptions -EmbedImages $false -ImageFolder 'images\Q3 #1')
+            $html | Should -Not -Match 'base64,'
+            $html | Should -Match ([regex]::Escape('data-url="https://a/" src="images/Q3%20%231/001_P_c02_seg01.jpg">'))
+            $html | Should -Match ([regex]::Escape('<strong>Linked report:</strong> the screenshots are separate files in the folder <code>images/Q3 #1</code>'))
+        }
+    }
+
+    Context 'without options (as before this version)' {
+        BeforeAll {
+            $script:Plain = New-HtmlReport -Items $script:Items -Run $script:Run
+        }
+
+        It 'has the same title, heading, sections and image markup as before' {
+            $script:Plain | Should -Match '<title>Vouch &mdash; Audit Evidence Report - 2026-09-23 10:00:00</title>'
+            $script:Plain | Should -Match '<h1>Vouch &mdash; Audit Evidence Report</h1>'
+            @([regex]::Matches($script:Plain, '<h2>([^<]*)</h2>') | ForEach-Object { $_.Groups[1].Value } | Select-Object -First 3) |
+                Should -Be @('Summary', 'Integrity', 'Evidence')
+            ([regex]::Matches($script:Plain, '<figure>')).Count | Should -Be 4
+            $metaLabels = @([regex]::Matches($script:Plain, '<tr><td class="k">([^<]*)</td>') | ForEach-Object { $_.Groups[1].Value })
+            $metaLabels | Should -Be @('Run started', 'Run finished', 'Time zone', 'Computer', 'Captured by', 'Operating system', 'Browser',
+                'Browser instance', 'Desktop', 'Capture tool', 'Definition file', 'Image format', 'Screen resolution', 'Run ID', 'Manifest SHA-256')
+        }
+
+        It 'adds nothing of the options' {
+            foreach ($pattern in 'contents', 'classification', 'company', 'Self-contained report', 'Linked report', '<dt>Account</dt>', 'multiline', '@page', 'id="item-1-c') {
+                $script:Plain | Should -Not -Match ([regex]::Escape($pattern)) -Because $pattern
+            }
+        }
+    }
+
+    Context 'JSON summary' {
+        It 'carries every report field under clear names' {
+            $zip = [pscustomobject]@{ Path = 'C:\out\r.zip'; Sha256 = ('c' * 64) }
+            $json = ConvertTo-RunSummaryJson -Items $script:Items -Run $script:Run -ReportPath 'C:\out\r.html' -ExitCode 0 -Options $script:Options -Zip $zip | ConvertFrom-Json -DateKind String
+            $details = $json.ReportDetails
+            $details.Title | Should -Be "Q3 $($script:Markup)"
+            $details.Classification | Should -Be 'Confidential'
+            $details.Company.Name | Should -Be "ACME $($script:Markup)"
+            $details.Company.Details | Should -Be "1 Main St`r`nSpringfield <b>x</b>"
+            $details.Description | Should -Be "Why`nwe $($script:Markup)"
+            $details.Origin | Should -Be "HQ $($script:Markup)"
+            $details.GeneratedBy | Should -Be "Jane $($script:Markup)"
+            $details.Period.From | Should -Be '01/07/2026'
+            $details.Period.To | Should -Be '2026-09-30'
+            $details.Period.Label | Should -Be "Q3 $($script:Markup)"
+            $details.CaptureWindow.First | Should -Be '2026-09-23T10:01:00.000+02:00'
+            $details.CaptureWindow.Last | Should -Be '2026-09-23T10:05:00.000+02:00'
+            $details.Account | Should -Be "svc-default $($script:Markup)"
+            $details.ShowIndex | Should -BeTrue
+            $details.ImageForm | Should -Be 'embedded'
+            $json.Zip.Path | Should -Be 'C:\out\r.zip'
+            $json.Zip.Sha256 | Should -Be ('c' * 64)
+            $json.Items[0].Account | Should -Be 'svc<b>@example.com'
+            $json.Items[1].Account | Should -Be ''
+        }
+
+        It 'has neither without options or a zip' {
+            $json = ConvertTo-RunSummaryJson -Items $script:Items -Run $script:Run -ReportPath 'C:\r.html' -ExitCode 0 | ConvertFrom-Json
+            $json.PSObject.Properties['ReportDetails'] | Should -BeNullOrEmpty
+            $json.PSObject.Properties['Zip'] | Should -BeNullOrEmpty
+        }
+    }
+}
+
+Describe 'Get-LogoDataUri' {
+    BeforeAll {
+        $folder = Join-Path $TestDrive 'logos'
+        [void](New-Item -ItemType Directory -Path $folder)
+        $write = { param($Name, [byte[]]$Bytes) $path = Join-Path $folder $Name; [System.IO.File]::WriteAllBytes($path, $Bytes); $path }
+        $script:Logos = @{
+            png  = & $write 'logo.png' ([byte[]](0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2))
+            jpeg = & $write 'logo.jpg' ([byte[]](0xFF, 0xD8, 0xFF, 0xE0, 1, 2))
+            gif  = & $write 'logo.gif' ([System.Text.Encoding]::ASCII.GetBytes('GIF89a....'))
+            svg  = & $write 'logo.svg' ([System.Text.Encoding]::UTF8.GetBytes('<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'))
+            text = & $write 'logo.png.txt' ([System.Text.Encoding]::ASCII.GetBytes('hello'))
+            fake = & $write 'fake.png' ([System.Text.Encoding]::ASCII.GetBytes('<svg></svg>'))
+        }
+    }
+
+    It 'embeds a <Kind> logo as <Mime>, read from the file''s content' -ForEach @(
+        @{ Kind = 'png'; Mime = 'image/png' }, @{ Kind = 'jpeg'; Mime = 'image/jpeg' }
+        @{ Kind = 'gif'; Mime = 'image/gif' }, @{ Kind = 'svg'; Mime = 'image/svg+xml' }
+    ) {
+        $logo = Get-LogoDataUri -Path $script:Logos[$Kind]
+        $logo.Warning | Should -Be ''
+        $logo.DataUri | Should -BeLike "data:$($Mime);base64,*"
+        [System.Convert]::FromBase64String($logo.DataUri.Substring($logo.DataUri.IndexOf(',') + 1)) |
+            Should -Be ([System.IO.File]::ReadAllBytes($script:Logos[$Kind]))
+    }
+
+    It 'only ever puts an SVG into an img src, base64-encoded, never into the page' {
+        $logo = Get-LogoDataUri -Path $script:Logos.svg
+        $html = New-HtmlReport -Items @() -Run ([pscustomobject]@{ ImageFormat = 'jpeg'; StartTime = 's'; EndTime = 'e'; User = 'u' }) `
+            -Options (New-ReportOptions -LogoDataUri $logo.DataUri -CompanyName 'ACME')
+        $html | Should -Not -Match '<svg'
+        $html | Should -Not -Match '<script>'
+        $html | Should -Match '<img class="logo" alt="Company logo" src="data:image/svg\+xml;base64,'
+    }
+
+    It 'warns and gives no logo for <Case>' -ForEach @(
+        @{ Case = 'a missing file'; Key = ''; Pattern = '*was not found, so the report has no logo.' }
+        @{ Case = 'a file that is no image'; Key = 'text'; Pattern = '*is not a PNG, JPEG, GIF or SVG image*' }
+        @{ Case = 'a .png that is not one'; Key = 'fake'; Pattern = '*is not a PNG, JPEG, GIF or SVG image*' }
+    ) {
+        $path = if ($Key) { $script:Logos[$Key] } else { Join-Path $TestDrive 'nope.png' }
+        $logo = Get-LogoDataUri -Path $path
+        $logo.DataUri | Should -Be ''
+        $logo.Warning | Should -BeLike $Pattern
+    }
+
+    It 'warns and gives no logo above the size limit' {
+        $logo = Get-LogoDataUri -Path $script:Logos.png -MaxBytes 4
+        $logo.DataUri | Should -Be ''
+        $logo.Warning | Should -BeLike '*a logo may be at most*Use a smaller image.'
+        $big = Join-Path $TestDrive 'big.png'
+        [System.IO.File]::WriteAllBytes($big, [byte[]]::new(1MB + 1))
+        (Get-LogoDataUri -Path $big).Warning | Should -BeLike '*1,025 KB; a logo may be at most 1,024 KB*'
+    }
+
+    It 'does nothing without a path' {
+        $logo = Get-LogoDataUri -Path ''
+        $logo.DataUri | Should -Be ''
+        $logo.Warning | Should -Be ''
+    }
+}
+
+Describe 'File names from templates' {
+    It 'fills every known token' {
+        $values = Get-NameTokenValues -When ([datetime]'2026-09-30 17:05:09') -Report 'VouchReport_x' -Title 'Q3 ITGC' `
+            -PeriodFrom '2026-07-01' -PeriodTo '2026-09-30' -Classification 'confidential'
+        $result = Expand-NameTemplate -Template '{report}|{TITLE}|{date}|{time}|{period}|{classification}' -Values $values
+        $result.Text | Should -Be 'VouchReport_x|Q3 ITGC|2026-09-30|170509|2026-07-01 to 2026-09-30|Confidential'
+        $result.Unknown.Count | Should -Be 0
+    }
+
+    It 'prefers the period label, and uses the default title when none is set' {
+        $values = Get-NameTokenValues -When (Get-Date) -PeriodFrom 'a' -PeriodTo 'b' -PeriodLabel 'Q3 2026'
+        $values.period | Should -Be 'Q3 2026'
+        $values.title | Should -Be 'Audit Evidence Report'
+    }
+
+    It 'leaves an unknown token as written and lists it' {
+        $result = Expand-NameTemplate -Template '{report}-{client}-{client}.zip' -Values @{ report = 'r' }
+        $result.Text | Should -Be 'r-{client}-{client}.zip'
+        $result.Unknown | Should -Be @('{client}')
+    }
+
+    It 'makes <Name> the safe file name <Expected>' -ForEach @(
+        @{ Name = 'Q3 ITGC: payroll/HR?.zip'; Expected = 'Q3 ITGC_ payroll_HR_.zip' }
+        @{ Name = '..\..\evil'; Expected = '_.._evil.zip' }
+        @{ Name = 'C:\Windows\x'; Expected = 'C_Windows_x.zip' }
+        @{ Name = 'report  {x} .'; Expected = 'report {x}.zip' }
+        @{ Name = 'CON'; Expected = '_CON.zip' }
+        @{ Name = ''; Expected = 'VouchEvidence.zip' }
+        @{ Name = 'Contrôle d''accès 2026'; Expected = 'Contrôle d''accès 2026.zip' }
+        @{ Name = 'already.ZIP'; Expected = 'already.zip' }
+    ) {
+        ConvertTo-SafeOutputName -Name $Name -Extension 'zip' | Should -Be $Expected
+    }
+
+    It 'adds a number instead of replacing an existing file' {
+        $folder = Join-Path $TestDrive 'names'
+        [void](New-Item -ItemType Directory -Path $folder)
+        $path = Join-Path $folder 'r.zip'
+        Get-AvailableFilePath -Path $path | Should -Be $path
+        Set-Content -LiteralPath $path -Value 'x'
+        Get-AvailableFilePath -Path $path | Should -Be (Join-Path $folder 'r_2.zip')
+        Set-Content -LiteralPath (Join-Path $folder 'r_2.zip') -Value 'x'
+        Get-AvailableFilePath -Path $path | Should -Be (Join-Path $folder 'r_3.zip')
+    }
+}
+
+Describe 'The report switches on the command line' {
+    BeforeAll {
+        $script:FileConfig = @{
+            defaults = @{ account = 'file-account' }
+            output   = @{ embedImages = $false; openReport = $true; zip = @{ enabled = $true; name = '{title}.zip' } }
+            report   = @{
+                title = 'File title'; classification = 'Internal'; logoPath = 'C:\file-logo.png'; showIndex = $false
+                company = @{ name = 'File Co'; details = 'File details' }; description = 'File description'; origin = 'File origin'
+                generatedBy = 'File person'; period = @{ from = 'f-from'; to = 'f-to'; label = 'f-label' }
+            }
+        }
+    }
+
+    It 'reads <Name> from the file as <FromFile>' -ForEach @(
+        @{ Name = 'Account'; FromFile = 'file-account' }
+        @{ Name = 'ReportTitle'; FromFile = 'File title' }
+        @{ Name = 'Classification'; FromFile = 'Internal' }
+        @{ Name = 'LogoPath'; FromFile = 'C:\file-logo.png' }
+        @{ Name = 'CompanyName'; FromFile = 'File Co' }
+        @{ Name = 'CompanyDetails'; FromFile = 'File details' }
+        @{ Name = 'Description'; FromFile = 'File description' }
+        @{ Name = 'Origin'; FromFile = 'File origin' }
+        @{ Name = 'GeneratedBy'; FromFile = 'File person' }
+        @{ Name = 'PeriodFrom'; FromFile = 'f-from' }
+        @{ Name = 'PeriodTo'; FromFile = 'f-to' }
+        @{ Name = 'PeriodLabel'; FromFile = 'f-label' }
+        @{ Name = 'NoIndex'; FromFile = $true }
+        @{ Name = 'LinkImages'; FromFile = $true }
+        @{ Name = 'Zip'; FromFile = $true }
+        @{ Name = 'ZipName'; FromFile = '{title}.zip' }
+        @{ Name = 'OpenReport'; FromFile = $true }
+    ) {
+        (Resolve-RunSettings -BoundParameters @{} -Defaults @{} -Config $script:FileConfig).$Name | Should -Be $FromFile
+    }
+
+    It 'lets -<Name> typed on the command line beat the file' -ForEach @(
+        @{ Name = 'Account'; Typed = 'typed' }, @{ Name = 'ReportTitle'; Typed = 'typed' }, @{ Name = 'Classification'; Typed = 'Public' }
+        @{ Name = 'LogoPath'; Typed = 'typed' }, @{ Name = 'CompanyName'; Typed = 'typed' }, @{ Name = 'CompanyDetails'; Typed = 'typed' }
+        @{ Name = 'Description'; Typed = 'typed' }, @{ Name = 'Origin'; Typed = 'typed' }, @{ Name = 'GeneratedBy'; Typed = 'typed' }
+        @{ Name = 'PeriodFrom'; Typed = 'typed' }, @{ Name = 'PeriodTo'; Typed = 'typed' }, @{ Name = 'PeriodLabel'; Typed = 'typed' }
+        @{ Name = 'NoIndex'; Typed = $false }, @{ Name = 'LinkImages'; Typed = $false }, @{ Name = 'Zip'; Typed = $false }
+        @{ Name = 'ZipName'; Typed = 'typed.zip' }, @{ Name = 'OpenReport'; Typed = $false }
+    ) {
+        $bound = @{ $Name = $(if ($Typed -is [bool]) { [switch]$Typed } else { $Typed }) }
+        (Resolve-RunSettings -BoundParameters $bound -Defaults @{} -Config $script:FileConfig).$Name | Should -Be $Typed
+    }
+
+    It 'shows the index and embeds images when the file says nothing' {
+        $settings = Resolve-RunSettings -BoundParameters @{} -Defaults @{ NoIndex = [switch]$false; LinkImages = [switch]$false } -Config @{ report = @{}; output = @{} }
+        $settings.NoIndex | Should -BeFalse
+        $settings.LinkImages | Should -BeFalse
+        $settings = Resolve-RunSettings -BoundParameters @{} -Defaults @{} -Config @{ report = @{ showIndex = $true }; output = @{ embedImages = $true } }
+        $settings.NoIndex | Should -BeFalse
+        $settings.LinkImages | Should -BeFalse
+    }
+
+    It 'has a switch and help for every run-level setting, and help for every parameter' {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:VouchPath, [ref]$null, [ref]$null)
+        $parameters = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+        foreach ($definition in Get-RunSettingDefinition) { $parameters | Should -Contain $definition.Name }
+        $help = $ast.GetHelpContent()
+        foreach ($name in $parameters) { $help.Parameters.Keys | Should -Contain $name.ToUpperInvariant() -Because "-$name needs .PARAMETER help" }
+    }
+
+    It 'accepts the classification levels and none on the command line, and nothing else' {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:VouchPath, [ref]$null, [ref]$null)
+        $parameter = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Classification' }
+        $set = $parameter.Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateSet' }
+        @($set.PositionalArguments.Value) | Should -Be @('', 'Public', 'Internal', 'Private', 'Confidential')
+    }
+}
+
+Describe 'Which runs write progress events' {
+    It 'counts a run as a capture run unless it is <Mode>' -ForEach @(@{ Mode = 'Verify'; Value = 'r.html' }, @{ Mode = 'LoginSetup'; Value = $true }, @{ Mode = 'Designer'; Value = $true }) {
+        Test-CaptureRunMode -Settings ([pscustomobject]@{ Verify = ''; LoginSetup = $false }) | Should -BeTrue
+        Test-CaptureRunMode -Settings ([pscustomobject]@{ $Mode = $Value }) | Should -BeFalse
+    }
+
+    It 'writes nothing into the event file for -<Mode>, even when it fails' -ForEach @(
+        @{ Mode = 'Verify'; Bound = @{ Verify = 'C:\no\such\report.html' } }
+        @{ Mode = 'LoginSetup'; Bound = @{ LoginSetup = [switch]$true; EdgeProfileDir = 'C:\no\such\profile' } }
+    ) {
+        $log = Join-Path $TestDrive "events-$Mode.ndjson"
+        Mock Assert-Environment { }
+        Mock Initialize-NativeInterop { }
+        Mock Find-EdgeExecutable { 'C:\edge.exe' }
+        Mock Invoke-LoginSetup { throw 'login setup failed' }
+        $bound = @{ EventLogPath = $log } + $Bound
+        { Invoke-Main -BoundParameters $bound 6>$null } | Should -Throw -ExpectedMessage $(if ($Mode -eq 'Verify') { 'Report not found*' } else { 'login setup failed' })
+        $log | Should -Not -Exist
+        $script:EventLogPath | Should -Be ''
     }
 }
