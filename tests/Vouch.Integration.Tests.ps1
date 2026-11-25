@@ -418,6 +418,192 @@ Plain page after the slow one,$Web/ok,,N,
     }
 }
 
+Describe 'Invoke-Main with a configuration file (desktop functions mocked)' -Tag 'Integration' {
+    # The same pages as the CSV run above, converted to a configuration file, plus a
+    # switched-off page, a page the engine cannot run yet and a page with its own timing.
+    BeforeAll {
+        Close-CdpSocket
+        $script:CsvItems = $script:Items   # from the CSV end-to-end run above
+        $script:RealNewHtmlReportForConfig = ${function:New-HtmlReport}
+        $script:RealWaitPageReady = ${function:Wait-PageReady}
+        $global:VouchCfg = @{ OwnTimeout = 0; OwnSettle = 0 }
+
+        $other = "http://localhost:$($script:OtherOriginPort)"
+        $slow = "http://localhost:$($script:SlowPort)"
+        $csv = Join-Path -Path $TestDrive -ChildPath 'cfg-source.csv'
+        @"
+Name,Url,Steps,ScrollFullPage,Notes
+Plain page,$Web/ok,,N,baseline
+Very tall page,$Web/tall?px=20000,,Y,exceeds the segment cap
+HTTP 404 with body,$Web/status/404,,N,
+HTTP 404 empty body,$Web/status/404?empty=1,,N,
+Expired session same origin,$Web/protected,,N,
+Expired session other origin,$Web/xredirect?to=$other/login,,N,
+Steps with a bad selector,$Web/tabs,clicktext:General;click:#missing,N,
+Link to a slow page,$Web/links?to=$slow/slow?s=3,click:#go,N,
+Inner scrolling panel,$Web/innerscroll?rows=12,,Y,
+Frame with a click,$Web/framepage?rows=12,clicktext:Frame button,Y,
+Frame from another site,$Web/xframe?to=$other/tall,,Y,
+Unreachable host,http://localhost:1/,,N,
+Slow page,$slow/slow?s=12,,N,
+Plain page after the slow one,$Web/ok,,N,
+"@ | Set-Content -LiteralPath $csv -Encoding utf8
+
+        $config = ConvertTo-VouchConfig -Path $csv
+        $config['browser']['profileDir'] = $script:ProfileDir
+        $config['browser']['debugPort'] = $script:CdpPort
+        $config['defaults']['navigationTimeoutSec'] = 5
+        $config['defaults']['settleSeconds'] = 0.2
+        $config['defaults']['scrollSettleSeconds'] = 0.1
+        $config['defaults']['maxScrollSegments'] = 3
+        $config['output']['dir'] = 'cfg-reports'          # relative to the configuration file
+        $config['output']['reportName'] = 'cfg.html'
+        $config['output']['saveImages'] = $true
+        $config['output']['jsonSummary'] = $true
+        $config['report']['title'] = 'Not applied yet'
+        $capture = [ordered]@{ type = 'capture'; scroll = [ordered]@{ mode = 'none' } }
+        # Third in the file: the pages after it must keep the CSV run's numbers and file names.
+        $config['pages'].Insert(2, [ordered]@{ id = 'off'; name = 'Switched off'; url = "$Web/ok"; enabled = $false; actions = @($capture) })
+        $config['pages'].Add([ordered]@{ id = 'newer'; name = 'Needs a newer Vouch'; url = "$Web/ok"
+            actions = @([ordered]@{ type = 'waitFor'; selector = '#x' }, $capture) })
+        $config['pages'].Add([ordered]@{ id = 'timing'; name = 'Own timing'; url = "$Web/ok"
+            overrides = [ordered]@{ navigationTimeoutSec = 9; settleSeconds = 0.73 }; actions = @($capture) })
+
+        $folder = Join-Path -Path $TestDrive -ChildPath 'cfg folder'
+        [void](New-Item -ItemType Directory -Path $folder)
+        $script:ConfigFile = Join-Path -Path $folder -ChildPath 'run.json'
+        [System.IO.File]::WriteAllText($script:ConfigFile, ($config | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+        $script:CfgReportFile = Join-Path -Path $folder -ChildPath 'cfg-reports\cfg.html'
+
+        Mock Set-EdgeForeground { $null }
+        Mock Get-ScreenCapture {
+            $bitmap = [System.Drawing.Bitmap]::new(16, 10)
+            try {
+                if ($Metadata) { Set-JpegMetadata -Image $bitmap -Metadata $Metadata }
+                $stream = [System.IO.MemoryStream]::new()
+                $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                , $stream.ToArray()
+            }
+            finally { $bitmap.Dispose() }
+        }
+        Mock New-HtmlReport {
+            $global:VouchCfg.Items = $Items
+            $global:VouchCfg.Run = $Run
+            & $script:RealNewHtmlReportForConfig -Items $Items -Run $Run
+        }
+        # Record that the page's own timing reached the engine, then do the real work.
+        Mock Wait-PageReady -ParameterFilter { $TimeoutSec -eq 9 } {
+            $global:VouchCfg.OwnTimeout++
+            & $script:RealWaitPageReady -TimeoutSec $TimeoutSec
+        }
+        Mock Start-Sleep -ParameterFilter { $Milliseconds -eq 730 } {
+            $global:VouchCfg.OwnSettle++
+            # Not Start-Sleep: Pester routes even a module-qualified call back into this mock.
+            [System.Threading.Thread]::Sleep($Milliseconds)
+        }
+
+        # Only the configuration is typed; every other setting comes from the file.
+        $script:CfgOutput = Invoke-Main -BoundParameters @{ ConfigPath = $script:ConfigFile } 6>&1 | Out-String
+        $script:CfgExitCode = $script:ExitCode
+        $script:CfgItems = [ordered]@{}
+        foreach ($i in $global:VouchCfg.Items) { $script:CfgItems[$i.Name] = $i }
+    }
+
+    AfterAll { Remove-Variable -Name VouchCfg -Scope Global -ErrorAction SilentlyContinue }
+
+    It 'gives every CSV page the same status, steps and screenshots as the CSV run' {
+        if (-not $script:CsvItems) { Set-ItResult -Skipped -Because 'the CSV end-to-end run did not run in this session' }
+        foreach ($name in $script:CsvItems.Keys) {
+            $want = $script:CsvItems[$name]
+            $got = $script:CfgItems[$name]
+            $got | Should -Not -BeNullOrEmpty -Because $name
+            $got.Index | Should -Be $want.Index -Because $name
+            $got.Status | Should -Be $want.Status -Because $name
+            $got.HttpStatus | Should -Be $want.HttpStatus -Because $name
+            $got.ScrollFullPage | Should -Be $want.ScrollFullPage -Because $name
+            $got.ScrollArea | Should -Be $want.ScrollArea -Because $name
+            @($got.StepLog | ForEach-Object { "$($_.Text)|$($_.Ok)" }) | Should -Be @($want.StepLog | ForEach-Object { "$($_.Text)|$($_.Ok)" }) -Because $name
+            @($got.Captures.FileName) | Should -Be @($want.Captures.FileName) -Because $name
+        }
+    }
+
+    It 'exits 2 like the CSV run and reads its settings from the file' {
+        $script:CfgExitCode | Should -Be 2
+        $script:CfgReportFile | Should -Exist
+        [System.IO.Path]::ChangeExtension($script:CfgReportFile, '.json') | Should -Exist
+        $global:VouchCfg.Run.CsvPath | Should -Be $script:ConfigFile
+        @(Get-ChildItem -LiteralPath (Join-Path (Split-Path $script:CfgReportFile) 'images\cfg') -Filter '*.jpg').Count |
+            Should -Be $global:VouchCfg.Run.CaptureCount
+    }
+
+    It 'skips a switched-off page entirely' {
+        $script:CfgItems.Contains('Switched off') | Should -BeFalse
+        $global:VouchCfg.Run.Total | Should -Be 16
+        @($global:VouchCfg.Items.Index) | Should -Be (1..16)
+        $script:CfgOutput | Should -Match '1 other page\(s\) not selected or switched off'
+    }
+
+    It 'fails a page that needs a newer Vouch without visiting it, and carries on' {
+        $item = $script:CfgItems['Needs a newer Vouch']
+        $item.Status | Should -Be 'FAILED'
+        ($item.Details -join ' ') | Should -Match '"waitFor" action.*cannot run yet'
+        $item.Captures.Count | Should -Be 0
+        $item.HttpStatus | Should -Be 0
+        $item.StepsText | Should -Be 'waitfor:#x'
+        $script:CfgItems['Own timing'].Status | Should -Be 'OK' -Because ($script:CfgItems['Own timing'].Details -join ' | ')
+    }
+
+    It 'applies a page''s own timeout and settle time to that page only' {
+        $global:VouchCfg.OwnTimeout | Should -Be 1
+        $global:VouchCfg.OwnSettle | Should -Be 1
+        $script:CfgItems['Own timing'].Captures.Count | Should -Be 1
+    }
+
+    It 'says once which settings have no effect yet' {
+        $lines = @($script:CfgOutput -split "`r?`n" | Where-Object { $_ -like 'WARNING: this version of Vouch does not apply*' })
+        $lines.Count | Should -Be 1
+        $lines[0] | Should -Match 'report\.title'
+    }
+
+    It 'produces a report that -Verify accepts' {
+        $results = @(Test-ReportIntegrity -Path $script:CfgReportFile)
+        @($results | Where-Object { -not $_.Ok }) | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'vouch.ps1 with -ConfigPath (the real script)' -Tag 'Integration' {
+    BeforeAll {
+        function Invoke-VouchScript {
+            param([string[]]$Arguments)
+            $pwsh = (Get-Process -Id $PID).Path
+            $log = Join-Path -Path $TestDrive -ChildPath ("out-{0}.txt" -f [guid]::NewGuid())
+            $quoted = @($Arguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } })
+            $process = Start-Process -FilePath $pwsh -NoNewWindow -Wait -PassThru -RedirectStandardOutput $log `
+                -ArgumentList (@('-NoProfile', '-NonInteractive', '-File', "`"$script:VouchPath`"") + $quoted)
+            return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = (Get-Content -LiteralPath $log -Raw) }
+        }
+    }
+
+    It 'refuses -CsvPath and -ConfigPath together' {
+        $result = Invoke-VouchScript -Arguments '-CsvPath', 'a.csv', '-ConfigPath', 'b.json'
+        $result.ExitCode | Should -Be 1
+        $result.Output | Should -Match 'Use either -CsvPath or -ConfigPath, not both'
+    }
+
+    It 'starts the log in output.logDir, next to the configuration file' {
+        $folder = Join-Path -Path $TestDrive -ChildPath 'log cfg'
+        [void](New-Item -ItemType Directory -Path $folder)
+        $path = Join-Path -Path $folder -ChildPath 'empty.json'
+        Set-Content -LiteralPath $path -Value '{ "schemaVersion": 1, "output": { "logDir": "logs" }, "pages": [] }' -Encoding utf8
+        $result = Invoke-VouchScript -Arguments '-ConfigPath', $path
+        $result.ExitCode | Should -Be 1
+        $result.Output | Should -Match 'has no pages'
+        $logs = @(Get-ChildItem -LiteralPath (Join-Path $folder 'logs') -Filter 'vouch_*.log')
+        $logs.Count | Should -Be 1
+        Get-Content -LiteralPath $logs[0].FullName -Raw | Should -Match 'has no pages'
+    }
+}
+
 Describe 'Invoke-CaptureItem on its own (one page, desktop functions mocked)' -Tag 'Integration' {
     # The single-page path the Designer will use: no Invoke-Main, no CSV run.
     BeforeAll {
