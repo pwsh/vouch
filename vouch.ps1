@@ -8094,7 +8094,7 @@ function Invoke-DesignerMode {
     <#
         -Designer: serves the Designer panel instead of running a capture. It returns before
         any of a capture run's setup (no transcript, no run events, no capture log). The
-        Designer's code lives in designer\Designer.ps1 so that this file stays one
+        Designer's code lives in designer\Designer.ps1 and Designer.Run.ps1 so that this file stays one
         self-contained engine; it is loaded only here, and a copy of vouch.ps1 without the
         folder still does everything else.
     #>
@@ -8111,7 +8111,9 @@ function Invoke-DesignerMode {
     )
     Assert-Environment
     $designerScript = Join-Path -Path (Split-Path -Path $ScriptPath -Parent) -ChildPath 'designer\Designer.ps1'
-    if (-not (Test-Path -LiteralPath $designerScript -PathType Leaf)) {
+    # Runs from the panel live in a second functions-only file next to it.
+    $designerRunScript = Join-Path -Path (Split-Path -Path $ScriptPath -Parent) -ChildPath 'designer\Designer.Run.ps1'
+    if (-not (Test-Path -LiteralPath $designerScript -PathType Leaf) -or -not (Test-Path -LiteralPath $designerRunScript -PathType Leaf)) {
         throw ("The Vouch Designer needs the folder 'designer' next to vouch.ps1 ($(Split-Path -Path $designerScript -Parent)), and it is not there. " +
             'Copy the whole Vouch folder, not only vouch.ps1. Everything else vouch.ps1 does works without it.')
     }
@@ -8119,6 +8121,7 @@ function Invoke-DesignerMode {
         Write-Host "NOTE: with -Designer only -ConfigPath, -DesignerPort, -EdgeProfileDir, -DebugPort and -KeepBrowserOpen are used; these are ignored: -$($IgnoredParameters -join ', -')" -ForegroundColor Yellow
     }
     . $designerScript
+    . $designerRunScript
     Start-VouchDesigner -ScriptPath $ScriptPath -ConfigPath $ConfigPath -Port $Port -Version $script:ToolVersion -AuditProfileDir $EdgeProfileDir `
         -DebugPort $DebugPort -KeepBrowserOpen:$KeepBrowserOpen
 }

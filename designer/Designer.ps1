@@ -63,8 +63,11 @@ function New-DesignerState {
         # The audit browser profile in effect (Get-DesignerAuditProfile), for the profile guard.
         AuditProfileDir      = ''
         PendingCommentNotice = $false
-        # Paths a run produced, by kind (report, folder, log); Task 9 fills them.
+        # Paths the last run produced, by kind (report, folder, log, zip, preview-report):
+        # filled only from that run's runEnd event (Complete-DesignerRun).
         OpenTargets          = [ordered]@{}
+        # Tests only: append the path to this file instead of opening it (no window).
+        OpenLog              = ''
         Running              = $true
         StopReason           = ''
         PanelProcess         = $null
@@ -84,6 +87,18 @@ function New-DesignerState {
         # The link to the audit Edge (Connect-DesignerBrowser) and the pick in progress.
         Browser              = New-DesignerBrowserState
         Pick                 = New-DesignerPickState
+        # Runs (designer\Designer.Run.ps1): the run in progress or the last one, the script a
+        # run starts (vouch.ps1; a stand-in in tests), the session's temporary folder, the
+        # previews of page tests (id -> files) and each page's last result in this session.
+        Run                  = New-DesignerRunState
+        RunScriptPath        = [System.IO.Path]::GetFullPath($ScriptPath)
+        RunParameterInfo     = $null
+        RunCount             = 0
+        SessionFolder        = ''
+        Previews             = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
+        PageResults          = [ordered]@{}
+        # /api/shutdown during a run: stop it first, then end the loop.
+        ShutdownAfterRun     = $false
         StartedAt            = Get-Date
     }
 }
@@ -258,6 +273,8 @@ function Get-DesignerPathRoute {
         '/api/config/open'       = 'config'
         '/api/config/save'       = 'config'
         '/api/command'           = 'config'
+        '/api/run'               = 'config'
+        '/api/run/plan'          = 'config'
         '/api/config/import-csv' = 'csv'
     }
 }
@@ -480,15 +497,21 @@ function Get-DesignerBodyText {
 
 function Get-DesignerLaterRoute {
     <#
-        Endpoints that later steps implement (browser link, picker, runs). They exist now
-        and answer 501 with a plain message, so the panel can be built against them.
+        Endpoints a later step implements answer 501 with a plain message, so the panel
+        can be built against them before. None are left; the table stays for the next.
     #>
-    $run = 'Running and testing from the Designer comes in a later step. Until then, copy the command from the Run tab into a PowerShell window.'
-    return [ordered]@{
-        'POST /api/run'              = $run
-        'GET /api/run'               = $run
-        'POST /api/run/stop'         = $run
+    return [ordered]@{}
+}
+
+function Get-DesignerQueryNumber {
+    # A whole number from the query string (?since=12), or -Default.
+    param([AllowEmptyString()][string]$Query = '', [Parameter(Mandatory)][string]$Name, [int]$Default = 0)
+    foreach ($pair in $Query.TrimStart('?').Split('&')) {
+        $parts = $pair.Split('=', 2)
+        $value = 0
+        if ($parts.Count -eq 2 -and $parts[0] -ceq $Name -and [int]::TryParse($parts[1], [ref]$value)) { return $value }
     }
+    return $Default
 }
 
 function Invoke-DesignerRequest {
@@ -502,7 +525,9 @@ function Invoke-DesignerRequest {
         [Parameter(Mandatory)][string]$Method,
         [Parameter(Mandatory)][string]$Path,
         [AllowNull()][object]$Body = $null,
-        [Parameter(Mandatory)][object]$State
+        [Parameter(Mandatory)][object]$State,
+        # The query string of a GET (GET /api/run?since=12), '' when none.
+        [AllowEmptyString()][string]$Query = ''
     )
     if ($Body -isnot [System.Collections.IDictionary]) { $Body = [ordered]@{} }
     $Method = $Method.ToUpperInvariant()
@@ -523,6 +548,8 @@ function Invoke-DesignerRequest {
         }
 
         $route = "$Method $Path"
+        $busy = Get-DesignerRunRefusal -State $State -Route $route
+        if ($null -ne $busy) { return $busy }
         switch -CaseSensitive ($route) {
             'GET /api/state'               { return New-DesignerJsonResponse -Data (Get-DesignerStateData -State $State) }
             'POST /api/config/new'         { return Invoke-DesignerNewConfig -State $State }
@@ -543,7 +570,21 @@ function Invoke-DesignerRequest {
             'GET /api/pick'                { return New-DesignerJsonResponse -Data (Get-ElementPickResult -State $State) }
             'POST /api/pick/cancel'        { return Invoke-DesignerPickCancel -State $State }
             'POST /api/action/test'        { return Invoke-DesignerActionTest -Body $Body -State $State }
+            'POST /api/run'                { return Invoke-DesignerRunStart -Body $Body -State $State }
+            'GET /api/run'                 { return New-DesignerJsonResponse -Data (Get-DesignerRunData -State $State -Since (Get-DesignerQueryNumber -Query $Query -Name 'since')) }
+            'POST /api/run/plan'           { return Invoke-DesignerRunPlan -Body $Body -State $State }
+            'POST /api/run/stop'           { return Invoke-DesignerRunStop -Body $Body -State $State }
             'POST /api/shutdown' {
+                if (Test-DesignerRunActive -State $State) {
+                    # Closing during a run: the panel asked the person first; stop the run
+                    # cleanly, and the loop ends when it has (Complete-DesignerRun).
+                    if ($Body['stopRun'] -ne $true) {
+                        return New-DesignerError -Status 409 -Code 'running' -Message 'A run is going.' -Detail 'Stop the run first, or confirm closing the Designer, which stops it.'
+                    }
+                    $State.ShutdownAfterRun = $true
+                    [void](Stop-DesignerRun -State $State)
+                    return New-DesignerJsonResponse -Data ([ordered]@{ ok = $true; waiting = $true; message = 'Stopping the run first; the Vouch Designer closes when it has stopped.' })
+                }
                 $State.Running = $false
                 $State.StopReason = 'The Designer was closed from its window.'
                 return New-DesignerJsonResponse -Data ([ordered]@{ ok = $true; message = 'The Vouch Designer has stopped. You can close this window.' })
@@ -555,13 +596,12 @@ function Invoke-DesignerRequest {
             return New-DesignerError -Status 501 -Code 'later' -Message 'Not available yet.' -Detail $later[$route]
         }
         if ($Path.StartsWith('/preview/', [System.StringComparison]::Ordinal)) {
-            if ($Method -ne 'GET') { return New-DesignerError -Status 405 -Code 'method' -Message 'This kind of request is not supported.' }
-            return New-DesignerError -Status 501 -Code 'later' -Message 'Not available yet.' -Detail 'Previews of a run come in a later step of the Designer.'
+            return Invoke-DesignerPreview -Method $Method -Path $Path -State $State
         }
         foreach ($known in @('/api/state', '/api/config/new', '/api/config/open', '/api/config/save', '/api/config/import-csv', '/api/config/validate',
                 '/api/dialog', '/api/command', '/api/open', '/api/shutdown', '/api/browser/current', '/api/browser/connect', '/api/browser/navigate',
                 '/api/browser/layout', '/api/browser/zoom-off', '/api/page/from-current', '/api/pick/start', '/api/pick', '/api/pick/cancel',
-                '/api/action/test') + @($later.Keys | ForEach-Object { ($_ -split ' ', 2)[1] })) {
+                '/api/action/test', '/api/run', '/api/run/plan', '/api/run/stop') + @($later.Keys | ForEach-Object { ($_ -split ' ', 2)[1] })) {
             if ($known -ceq $Path) { return New-DesignerError -Status 405 -Code 'method' -Message 'This kind of request is not supported here.' -Detail "$Method is not used for $Path." }
         }
         return New-DesignerError -Status 404 -Code 'not-found' -Message 'There is nothing at this address.' -Detail $Path
@@ -635,12 +675,13 @@ function Get-DesignerStateData {
     <#
         GET /api/state: facts about the server, not about the configuration (the panel owns
         that): the link to the audit browser as last seen (no browser call is made here;
-        the loop keeps it current), and what the panel may offer. run is a placeholder
-        until the run step fills it.
+        the loop keeps it current), what the panel may offer, and the run's state
+        (the details come from GET /api/run). A run needs the connected audit Edge.
     #>
     param([Parameter(Mandatory)][object]$State)
     if ($null -eq $State.Schema) { $State.Schema = Get-DesignerSchema }
     $connected = [bool]$State.Browser.Connected
+    $running = Test-DesignerRunActive -State $State
     return [ordered]@{
         version      = $State.Version
         port         = $State.Port
@@ -649,8 +690,8 @@ function Get-DesignerStateData {
         scriptFolder = (Split-Path -Path $State.ScriptPath -Parent)
         browser      = (Get-DesignerBrowserData -State $State)
         pick         = [ordered]@{ state = $State.Pick.State }
-        run          = [ordered]@{ state = 'idle' }
-        capabilities = [ordered]@{ browser = $connected; pick = $connected; test = $connected; run = $false }
+        run          = (Get-DesignerRunSummary -State $State)
+        capabilities = [ordered]@{ browser = $connected; pick = $connected; test = $connected; run = ($connected -or $running) }
         schema       = $State.Schema
         defaults     = Get-DefaultVouchConfig
     }
@@ -994,22 +1035,24 @@ function Invoke-DesignerCommand {
 
 function Invoke-DesignerOpenTarget {
     <#
-        POST /api/open {what}: opens a file or folder the server knows (a run's report,
-        its folder, its capture log, or the configuration's folder) - never a path from
-        the request.
+        POST /api/open {what}: opens a file or folder the server knows - the last run's
+        report, its folder, its capture log or the folder of its zip, a page test's preview
+        report (all learned from that run's runEnd event), or the configuration's folder -
+        never a path from the request.
     #>
     param([Parameter(Mandatory)][System.Collections.IDictionary]$Body, [Parameter(Mandatory)][object]$State)
     $what = Get-DesignerBodyText -Body $Body -Name 'what'
     $target = ''
     if ($what -ceq 'config-folder') { if ($State.ConfigPath) { $target = Split-Path -Path $State.ConfigPath -Parent } }
-    elseif ($what -cin 'report', 'folder', 'log') { if ($State.OpenTargets.Contains($what)) { $target = [string]$State.OpenTargets[$what] } }
+    elseif ($what -cin 'report', 'folder', 'log', 'zip', 'preview-report') { if ($State.OpenTargets.Contains($what)) { $target = [string]$State.OpenTargets[$what] } }
     else {
-        return New-DesignerError -Status 400 -Code 'what' -Message 'There is nothing of that kind to open.' -Detail 'what must be report, folder, log or config-folder.'
+        return New-DesignerError -Status 400 -Code 'what' -Message 'There is nothing of that kind to open.' -Detail 'what must be report, folder, log, zip, preview-report or config-folder.'
     }
     if (-not $target -or -not (Test-Path -LiteralPath $target)) {
         return New-DesignerError -Status 409 -Code 'nothing' -Message 'There is nothing to open yet.' -Detail $(if ($what -eq 'config-folder') { 'Save the configuration first.' } else { 'Run the configuration first; the report, its folder and its log appear here afterwards.' })
     }
-    Open-ReportFile -Path $target
+    if ($State.OpenLog) { [System.IO.File]::AppendAllText($State.OpenLog, "$what|$target`n", [System.Text.UTF8Encoding]::new($false)) }
+    else { Open-ReportFile -Path $target }
     return New-DesignerJsonResponse -Data ([ordered]@{ ok = $true; path = $target })
 }
 
@@ -1275,6 +1318,8 @@ function Get-VouchParameterInfo {
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$null, [ref]$errors)
     $folderLiteral = "'" + (Split-Path -Path ([System.IO.Path]::GetFullPath($ScriptPath)) -Parent).Replace("'", "''") + "'"
     $info = [ordered]@{}
+    # A script without a param block (a test stand-in for vouch.ps1) has no parameters to read.
+    if ($null -eq $ast.ParamBlock) { return $info }
     foreach ($parameter in $ast.ParamBlock.Parameters) {
         $name = $parameter.Name.VariablePath.UserPath
         $type = $parameter.StaticType
@@ -1430,6 +1475,9 @@ function Get-VouchCommandLine {
     $head = 'pwsh -NoProfile -ExecutionPolicy Bypass -File'
 
     $run = "$head $(& $ps $script) -ConfigPath $(& $ps $configFull)"
+    # The same command as arguments, one by one, for a process start (the Designer's runs
+    # add their session-only switches to this list): never a string to be split again.
+    $runArguments = [string[]]@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script, '-ConfigPath', $configFull)
     # A path cmd.exe would change cannot be left out like a setting: no cmd.exe lines then.
     $cmdSafe = $null -ne (& $cmd $script) -and $null -ne (& $cmd $configFull) -and $null -ne (& $cmd $installer)
     $runCmd = if ($cmdSafe) { "$head $(& $cmd $script) -ConfigPath $(& $cmd $configFull)" } else { '' }
@@ -1475,6 +1523,7 @@ function Get-VouchCommandLine {
 
     return [pscustomobject]@{
         Run            = $run
+        RunArguments   = $runArguments
         RunCmd         = $runCmd
         RunExpanded    = $runExpanded
         RunExpandedCmd = $runExpandedCmd
@@ -2218,7 +2267,9 @@ function Get-DesignerBrowserData {
         }
         catch { $different = $false }
     }
+    $running = Test-DesignerRunActive -State $State
     $message = if ($browser.Connected) { 'Connected to the audit Edge.' }
+    elseif ($running) { 'A run is using the audit Edge. The Designer connects to it again when the run ends.' }
     elseif ($browser.Connecting -or $browser.ConnectPending) { 'Connecting to the audit Edge…' }
     elseif ($null -ne $browser.Problem) { [string]$browser.Problem['message'] }
     else { 'Not connected to the audit Edge.' }
@@ -2231,7 +2282,8 @@ function Get-DesignerBrowserData {
         port               = $browser.Port
         profileDir         = $browser.ProfileDir
         launchedByDesigner = [bool]$browser.LaunchedByDesigner
-        problem            = $browser.Problem
+        problem            = $(if ($running) { $null } else { $browser.Problem })
+        inRun              = $running
         zoom               = [ordered]@{ percent = [int]$browser.ZoomPercent; page = $browser.ZoomPage }
         settingsChanged    = $different
         notice             = $browser.Notice
@@ -2276,6 +2328,8 @@ function Invoke-DesignerBrowserTick {
     #>
     param([Parameter(Mandatory)][object]$State)
     $browser = $State.Browser
+    # A run has the browser (it attaches to the same tab): no reconnecting, no looking at tabs.
+    if (Test-DesignerRunActive -State $State) { return }
     if ($browser.ConnectPending) {
         Connect-DesignerBrowser -State $State
         [void](Set-DesignerLayout -State $State -Focus panel)
@@ -2862,7 +2916,10 @@ function Get-DesignerPickerScript {
 function Get-DesignerPickShieldScript {
     <#
         What the browser runs at the very start of every NEW document in the tab while a
-        pick is on (Page.addScriptToEvaluateOnNewDocument), in the page and in its frames.
+        pick is on (Page.addScriptToEvaluateOnNewDocument), in the page and in its frames
+        from the same site. A frame from another site runs in a process of its own, which
+        this connection does not reach: the shield is not there, so in a freshly loaded
+        page clicks and keys inside such a frame act normally until the picker is back.
         A page that reloads or moves on by itself takes the picker with it, and the picker
         only comes back at the next poll: without this, a click in between would act on
         the fresh page (established in headless Edge: a click 250 ms after
@@ -3479,7 +3536,8 @@ function Invoke-DesignerExchange {
         [System.Collections.IDictionary]$Headers = @{},
         [long]$ContentLength = -1,
         [AllowNull()][System.IO.Stream]$BodyStream = $null,
-        [Parameter(Mandatory)][object]$State
+        [Parameter(Mandatory)][object]$State,
+        [AllowEmptyString()][string]$Query = ''
     )
     $head = New-DesignerRequest -Method $Method -Path $Path -Headers $Headers -ContentLength $ContentLength
     $refusal = Test-DesignerRequestHeader -Request $head -State $State
@@ -3494,7 +3552,7 @@ function Invoke-DesignerExchange {
     $request = New-DesignerRequest -Method $Method -Path $Path -Headers $Headers -ContentLength $ContentLength -BodyText $body.Text -BodyTooLarge:$body.TooLarge
     $refusal = Test-DesignerRequestBody -Request $request -State $State
     if ($null -ne $refusal) { return $refusal }
-    return Invoke-DesignerRequest -Method $request.Method -Path $request.Path -Body $request.Body -State $State
+    return Invoke-DesignerRequest -Method $request.Method -Path $request.Path -Body $request.Body -State $State -Query $Query
 }
 
 function Invoke-DesignerContext {
@@ -3506,7 +3564,7 @@ function Invoke-DesignerContext {
         foreach ($name in $request.Headers.AllKeys) { if ($name) { $headers[$name] = $request.Headers[$name] } }
         $length = if ($request.HasEntityBody) { $request.ContentLength64 } else { 0 }
         $stream = if ($request.HasEntityBody) { $request.InputStream } else { $null }
-        $response = Invoke-DesignerExchange -Method $request.HttpMethod -Path $request.Url.AbsolutePath -Headers $headers -ContentLength $length -BodyStream $stream -State $State
+        $response = Invoke-DesignerExchange -Method $request.HttpMethod -Path $request.Url.AbsolutePath -Headers $headers -ContentLength $length -BodyStream $stream -State $State -Query ([string]$request.Url.Query)
     }
     catch {
         $response = New-DesignerError -Status 500 -Code 'failed' -Message 'Something went wrong in the Designer.' -Detail ([string]$_.Exception.Message)
@@ -3595,7 +3653,11 @@ function Start-VouchDesigner {
         [int]$DebugPort = 0,
         [switch]$KeepBrowserOpen,
         [switch]$NoBrowser,
-        [switch]$NoBrowserLaunch
+        [switch]$NoBrowserLaunch,
+        # Tests only: the script a run starts instead of vouch.ps1, and a file that
+        # records what /api/open would open instead of opening it.
+        [string]$RunScriptPath = '',
+        [string]$OpenLog = ''
     )
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
@@ -3619,6 +3681,9 @@ function Start-VouchDesigner {
         $state.Browser.AllowLaunch = -not $NoBrowserLaunch
         $state.Browser.ConnectPending = -not $NoBrowser
         $state.TickHandlers.Add({ param($s) Invoke-DesignerBrowserTick -State $s })
+        $state.TickHandlers.Add({ param($s) Invoke-DesignerRunTick -State $s })
+        if ($RunScriptPath) { $state.RunScriptPath = [System.IO.Path]::GetFullPath($RunScriptPath) }
+        $state.OpenLog = $OpenLog
         $url = "http://localhost:$($state.Port)/?t=$($state.Token)"
         Write-Host "Vouch Designer $Version is running at http://localhost:$($state.Port)/"
         if ($ReadyFile) {
@@ -3641,6 +3706,12 @@ function Start-VouchDesigner {
     }
     finally {
         try { $listener.Stop(); $listener.Close() } catch { Write-Verbose 'The listener was already closed.' }
+        if ($null -ne $state) {
+            # A run still going is stopped cleanly first (then by force after its grace time).
+            try { Stop-DesignerRunForExit -State $state }
+            catch { Write-Host "The run could not be stopped: $($_.Exception.Message)" -ForegroundColor Yellow }
+            try { Remove-DesignerSessionFolder -State $state } catch { Write-Verbose 'The temporary folder was not removed.' }
+        }
         if ($null -ne $state) {
             try { Close-DesignerBrowser -State $state }
             catch { Write-Host "The audit Edge could not be closed: $($_.Exception.Message)" -ForegroundColor Yellow }
