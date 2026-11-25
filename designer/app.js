@@ -16,7 +16,11 @@
   - Picker:  startPick(mode, target) -> /api/pick/start, GET /api/pick, /api/pick/cancel;
     chooseCandidate() lets the person pick one of the verified candidates; applyPick().
   - Action test: testAction(pageIndex, actionIndex) -> /api/action/test (result inline)
-  - Runs (later step): startRun(kind), stopRun(), pollRun() -> /api/run, GET /api/run, /api/run/stop
+  - Runs: startRun('all'|'page') -> POST /api/run (the configuration as shown, unsaved
+    edits included); pollRun() -> GET /api/run?since=n every second while it goes;
+    stopRun(force) -> /api/run/stop; openTarget(kind) -> /api/open; refreshRunPlan() ->
+    /api/run/plan (what a run would do, shown before it starts); page-test previews are
+    fetched with the token and shown as data: images (loadPreviews).
   Everything that came from the audit page (titles, addresses, element words, selectors)
   arrives as JSON strings and is only ever shown with textContent.
 */
@@ -159,7 +163,16 @@
     logo: null,
     command: null,
     commandError: '',
-    run: { state: 'idle', events: [], result: null, message: '' },
+    run: { state: 'idle', number: -1, pages: [], notes: [], sessionFlags: [], open: {} },
+    // Events of the run shown (appended from GET /api/run?since=), and where to go on from.
+    runEvents: [],
+    runSince: 0,
+    runStarting: false,
+    // What a full run / a page test would do now (POST /api/run/plan).
+    runPlan: null,
+    pagePlan: null,
+    // Preview images of the last page test: address -> data: URL (or 'failed').
+    previewImages: {},
     pageResults: {},
     capabilities: { browser: false, pick: false, test: false, run: false },
     browser: { connected: false },
@@ -178,8 +191,10 @@
 
   // ------------------------------------------------------------------ texts
   const LATER_BROWSER = 'This needs the audit browser, which is not connected. See the browser line at the top (Retry), or type the address, words or selector yourself.';
-  const LATER_RUN = 'Running and testing from the Designer comes in a later step. Until then, copy the command from the Run tab into a PowerShell window.';
-  const LATER_RUN_HERE = 'Running and testing from the Designer comes in a later step. Until then, copy the command below into a PowerShell window.';
+  const LATER_RUN = 'Running and testing need the audit browser, which is not connected. See the browser line at the top (Retry), or copy the command from the Run tab into a PowerShell window.';
+  const LATER_RUN_HERE = 'Running and testing need the audit browser, which is not connected. See the browser line at the top (Retry), or copy the command below into a PowerShell window.';
+  const RUN_ACTIVE = ['starting', 'running', 'waitingForUser', 'stopping'];
+  function runActive() { return RUN_ACTIVE.includes(S.run.state) || S.runStarting; }
 
   const SETTING_LABELS = {
     'name': 'Configuration name',
@@ -367,7 +382,9 @@
           text: b.label, onclick: () => finish(b.value),
         }));
       }
-      dialog.onclose = () => finish(options.cancelValue);
+      // A close event of the question before this one may still be on its way while this
+      // one is already shown: only a close that leaves the dialog closed answers.
+      dialog.onclose = () => { if (!dialog.open) finish(options.cancelValue); };
       dialog.oncancel = () => finish(options.cancelValue);
       dialog.showModal();
       const first = buttons.querySelector('.btn-primary') || buttons.querySelector('button');
@@ -433,6 +450,7 @@
     else lightRender();
     scheduleValidate();
     scheduleCommand();
+    scheduleRunPlan();
   }
   function restore(entry) {
     S.config = JSON.parse(entry.json);
@@ -696,7 +714,7 @@
   function setTab(key) {
     S.tab = key;
     renderAll();
-    if (key === 'run') refreshCommand();
+    if (key === 'run') { refreshCommand(); refreshRunPlan(); }
   }
   function renderHeader() {
     const dirty = isDirty();
@@ -822,11 +840,14 @@
   }
 
   // ------------------------------------------------------------------ Pages tab
+  /* The page's last test or run result in this session (from the server), with its time. */
   function pageStatus(page, i) {
     const result = S.pageResults[pageId(page, i)];
-    if (!result) return { text: 'Not tested', cls: 'chip-muted' };
+    if (!result) return { text: 'Not tested', cls: 'chip-muted', title: '' };
     const status = String(result.status || '').toUpperCase();
-    return { text: status === 'OK' ? 'Test OK' : status === 'WARNING' ? 'Test: warning' : status === 'FAILED' ? 'Test failed' : String(result.status), cls: 'chip-' + status.toLowerCase() };
+    const what = result.kind === 'page' ? 'Test' : 'Run';
+    const word = status === 'OK' ? what + ' OK' : status === 'WARNING' ? what + ': warning' : status === 'FAILED' ? what + ' failed' : what + ': ' + String(result.status);
+    return { text: word + (result.time ? ' ' + result.time : ''), cls: 'chip-' + status.toLowerCase(), title: result.text || '' };
   }
   function pageErrorCount(i) {
     const prefix = P('pages', i);
@@ -852,7 +873,7 @@
         h('span', { class: 'page-chips' },
           errors ? h('span', { class: 'chip chip-failed', text: errors === 1 ? '1 problem' : errors + ' problems' }) : null,
           !enabled ? h('span', { class: 'chip chip-muted', text: 'Off' }) : null,
-          status.text ? h('span', { class: 'chip ' + status.cls, text: status.text }) : null));
+          status.text ? h('span', { class: 'chip ' + status.cls, text: status.text, title: status.title || null }) : null));
       select.addEventListener('click', () => selectPage(i));
       select.addEventListener('keydown', ev => {
         if (ev.altKey && (ev.key === 'ArrowUp' || ev.key === 'ArrowDown')) { ev.preventDefault(); movePage(i, ev.key === 'ArrowUp' ? i - 1 : i + 1, true); return; }
@@ -948,8 +969,8 @@
       overridesBlock(i),
       actionsBlock(i),
       h('div', { class: 'test-row' },
-        btn('Test this page', () => startRun('page'), { later: S.capabilities.run ? null : LATER_RUN, fkey: 'test-page' }),
-        h('span', { class: 'chip ' + pageStatus(page, i).cls, text: pageStatus(page, i).text })));
+        btn('Test this page', () => startRun('page'), { later: S.capabilities.run ? null : LATER_RUN, disabled: runActive(), fkey: 'test-page', title: 'Runs this page alone, as a run would, and shows the screenshots in the Run tab' }),
+        h('span', { class: 'chip ' + pageStatus(page, i).cls, text: pageStatus(page, i).text, title: pageStatus(page, i).title || null })));
     return details;
   }
   const OVERRIDE_FIELDS = [
@@ -1159,7 +1180,7 @@
     focusKey('pages[' + S.page + '].name');
     announce('Page added: ' + page.name + '.');
   }
-  function selectPage(i) { S.page = i; S.openAction = -1; keepFocus(renderAll); }
+  function selectPage(i) { S.page = i; S.openAction = -1; keepFocus(renderAll); scheduleRunPlan(); }
   function movePage(from, to, keyboard) {
     const pages = pagesOf(S.config);
     if (to < 0 || to >= pages.length || from === to) return;
@@ -1332,38 +1353,155 @@
   }
 
   // ------------------------------------------------------------------ Run tab
+  function fmtElapsed(sec) {
+    sec = Math.max(0, Math.round(Number(sec) || 0));
+    const m = Math.floor(sec / 60), r = sec % 60;
+    return m + ':' + String(r).padStart(2, '0');
+  }
+  function plural(n, one, many) { return n + ' ' + (n === 1 ? one : many); }
+  /* What a run would do, before it starts: unsaved edits, the output folder, notes, the added switches. */
+  function runPlanBlock() {
+    const plan = S.runPlan;
+    if (!plan) return h('p', { class: 'help', text: 'Working out where the results go…' });
+    const parts = [];
+    if (plan.unsaved) {
+      parts.push(h('div', { class: 'callout callout-accent', role: 'note' },
+        h('strong', { text: 'Running your current edits (not yet saved). ' }),
+        plan.saved ? 'The saved file is not changed by a run.' : 'This configuration has not been saved to a file yet.'));
+    }
+    if (plan.errors && plan.errors.length) {
+      parts.push(h('p', { class: 'callout callout-error', text: plural(plan.errors.length, 'problem', 'problems') + ' must be fixed before anything can run (see the list at the top).' }));
+    }
+    else if (plan.outputFolder) {
+      parts.push(h('p', { class: 'run-where' }, h('span', { class: 'run-where-label', text: 'Reports of a full run go to: ' }), h('code', { class: 'path-text', text: plan.outputFolder })));
+    }
+    const notes = [].concat(plan.notes || []);
+    const pagePlan = S.pagePlan;
+    if (pagePlan && pagePlan.notes) for (const n of pagePlan.notes) if (!notes.includes(n)) notes.push(n);
+    if (notes.length) parts.push(h('ul', { class: 'notes' }, notes.map(n => h('li', { text: n }))));
+    const flags = plan.sessionFlags || [];
+    const pageFlags = pagePlan && pagePlan.sessionFlags ? pagePlan.sessionFlags.filter(f => !flags.includes(f)) : [];
+    if (flags.length) {
+      parts.push(h('details', { class: 'run-flags' },
+        h('summary', { text: 'What the Designer adds to the command below for its runs' }),
+        h('p', { class: 'help', text: 'A run here is the command below, on a copy of what you see, with these settings added for this run only:' }),
+        h('ul', { class: 'notes' }, flags.map(f => h('li', { text: f }))),
+        pageFlags.length ? h('p', { class: 'help', text: 'A page test also adds:' }) : null,
+        pageFlags.length ? h('ul', { class: 'notes' }, pageFlags.map(f => h('li', { text: f }))) : null));
+    }
+    return h('div', { class: 'run-plan' }, parts);
+  }
+  function runStatusText() {
+    const r = S.run;
+    const base = runStateText();
+    if (r.state === 'idle') return base;
+    const bits = [base];
+    if (r.kind) bits.push(r.kind === 'page' ? 'Page test: ' + (r.pageName || r.pageId) : 'Full run');
+    bits.push('time ' + fmtElapsed(r.elapsedSec));
+    const c = r.counts;
+    if (c) bits.push(plural(c.run, 'page', 'pages') + ' run: ' + c.ok + ' OK, ' + c.warning + ' with warnings, ' + c.failed + ' failed' + (c.notRun ? ', ' + c.notRun + ' not run' : '') + ', ' + plural(c.captures, 'image', 'images'));
+    else if (r.pages && r.pages.length) {
+      const done = r.pages.filter(p => p.status !== 'RUNNING').length;
+      const total = r.pages[0].total > 0 ? r.pages[0].total : r.pages.length;
+      bits.push(done + ' of ' + plural(total, 'page', 'pages') + ' done');
+    }
+    return bits.join(' · ');
+  }
+  const STATUS_TEXT = { OK: 'OK', WARNING: 'Warning', FAILED: 'Failed', RUNNING: 'Running…' };
+  function runPageList() {
+    const pages = S.run.pages || [];
+    if (!pages.length) return h('p', { class: 'empty', text: runActive() ? 'Waiting for the first page…' : 'Progress appears here while a run is going.' });
+    return h('ol', { class: 'run-pages', 'aria-label': 'Pages in this run' }, pages.map(p => {
+      const status = String(p.status || 'RUNNING').toUpperCase();
+      const details = p.details || [];
+      return h('li', { class: 'run-page st-' + status.toLowerCase() },
+        h('div', { class: 'run-page-head' },
+          h('span', { class: 'run-page-name', text: p.name || p.pageId || 'Page' }),
+          h('span', { class: 'chip chip-' + (status === 'RUNNING' ? 'accent' : status.toLowerCase()), text: STATUS_TEXT[status] || status }),
+          h('span', { class: 'run-page-count', text: plural(p.captureCount || 0, 'image', 'images') })),
+        details.length ? h('details', { class: 'run-details' },
+          h('summary', { text: status === 'FAILED' ? plural(details.length, 'problem', 'problems') : status === 'WARNING' ? plural(details.length, 'warning', 'warnings') : plural(details.length, 'note', 'notes') }),
+          h('ul', { class: 'notes' }, details.map(d => h('li', { text: d })))) : null);
+    }));
+  }
+  function runResultButtons() {
+    const r = S.run, o = r.open || {};
+    if (r.kind !== 'full' || runActive()) return null;
+    if (!o.report && !o.folder && !o.log && !o.zip) return null;
+    return h('div', { class: 'button-row wrap' },
+      btn('Open report', () => openTarget('report'), { small: true, primary: true, disabled: !o.report, fkey: 'open-report' }),
+      btn('Open folder', () => openTarget('folder'), { small: true, disabled: !o.folder, fkey: 'open-folder' }),
+      btn('Open capture log', () => openTarget('log'), { small: true, disabled: !o.log, fkey: 'open-log' }),
+      o.zip ? btn('Open zip location', () => openTarget('zip'), { small: true, fkey: 'open-zip' }) : null);
+  }
+  function previewBlock() {
+    const r = S.run;
+    if (r.kind !== 'page' || runActive()) return null;
+    const pv = r.preview;
+    const page = (r.pages || [])[0];
+    const parts = [h('h3', { class: 'sub-title', text: 'Preview of the page test' + (r.pageName ? ': ' + r.pageName : '') })];
+    if (page) {
+      const status = String(page.status || '').toUpperCase();
+      parts.push(h('p', {}, h('span', { class: 'chip chip-' + status.toLowerCase(), text: STATUS_TEXT[status] || status }), ' ', plural(page.captureCount || 0, 'image', 'images')));
+    }
+    const images = pv && Array.isArray(pv.images) ? pv.images : [];
+    if (images.length) {
+      parts.push(h('div', { class: 'thumbs' }, images.map((img, k) => {
+        const src = S.previewImages[img.url];
+        const caption = (img.label ? img.label + ' · ' : '') + (img.segmentCount > 1 ? 'part ' + img.segment + ' of ' + img.segmentCount : 'image ' + (k + 1));
+        const inner = src && src !== 'failed' ? h('img', { class: 'thumb-img', src: src, alt: 'Screenshot: ' + caption })
+          : h('span', { class: 'thumb-wait', text: src === 'failed' ? 'Could not be shown' : 'Loading…' });
+        return h('button', { type: 'button', class: 'thumb', dataset: { fkey: 'thumb:' + k }, 'aria-label': 'Show larger: ' + caption, onclick: () => showPreviewImage(img, caption) },
+          inner, h('span', { class: 'thumb-caption', text: caption }));
+      })));
+    }
+    else if (r.state === 'done' || r.state === 'failed') parts.push(h('p', { class: 'help', text: 'This test made no screenshots.' }));
+    if (pv && pv.report) parts.push(h('div', { class: 'button-row' }, btn('Open the preview report', () => openTarget('preview-report'), { small: true, fkey: 'open-preview' })));
+    parts.push(h('p', { class: 'help', text: 'The preview is temporary: it is replaced by the next test of this page and removed when the Designer closes.' }));
+    return h('div', { class: 'preview-block' }, parts);
+  }
   function renderRun() {
     const panel = $('#panel-run');
     const canRun = S.capabilities.run;
     const page = pageAt(S.page);
     const run = S.run;
-    const waiting = run.state === 'waiting';
-    const busy = ['starting', 'running', 'waiting', 'stopping'].includes(run.state);
-    const result = run.result || {};
-    const log = h('ol', { class: 'run-log', 'aria-label': 'Progress', 'aria-live': 'polite' },
-      (run.events || []).map(e => h('li', { class: 'run-event' + (e.status ? ' ev-' + String(e.status).toLowerCase() : '') }, e.time ? h('span', { class: 'ev-time', text: e.time }) : null, e.text)));
+    const active = runActive();
+    const stopping = run.state === 'stopping';
+    const stopButton = run.forceAvailable
+      ? btn('Force stop', () => stopRun(true), { danger: true, fkey: 'run-force', title: 'Ends the run at once; its report may be missing' })
+      : btn(stopping ? 'Stopping…' : 'Stop', () => stopRun(false), { danger: true, disabled: !active || stopping, fkey: 'run-stop', title: 'Ends the run after the current step; the report is still written' });
+    const outcome = (run.state === 'done' || run.state === 'failed') && run.message
+      ? h('div', { class: 'callout ' + (run.state === 'failed' ? 'callout-error' : (run.exitCode === 0 && !(run.counts && run.counts.warning) ? 'callout-ok' : 'callout-warning')), role: 'note' },
+        h('p', { class: 'run-message', text: run.message }),
+        run.errorText && run.errorText !== run.message && !run.message.includes(run.errorText) ? h('pre', { class: 'code run-error', text: run.errorText }) : null)
+      : null;
     panel.replaceChildren(h('div', { class: 'stack' },
-      section('Run', canRun ? 'Run all pages that are switched on, or test the selected page.' : null, [
+      section('Run', canRun ? 'Run all pages that are switched on, or test the selected page on its own. What runs is what you see here, saved or not.' : null, [
         canRun ? null : laterNote(LATER_RUN_HERE),
+        active ? null : runPlanBlock(),
         h('div', { class: 'button-row wrap' },
-          btn('Run all pages', () => startRun('all'), { primary: true, later: canRun ? null : LATER_RUN_HERE, disabled: busy, fkey: 'run-all' }),
-          btn('Test this page' + (page ? ': ' + shortText(pageName(page, S.page), 30) : ''), () => startRun('page'), { later: canRun ? null : LATER_RUN_HERE, disabled: busy || !page, fkey: 'run-page' }),
-          btn('Stop', () => stopRun(), { danger: true, later: canRun ? null : LATER_RUN_HERE, disabled: !busy, fkey: 'run-stop' })),
-        h('p', { class: 'run-state', role: 'status', text: runStateText() }),
-        waiting ? h('div', { class: 'callout callout-accent' }, h('strong', { text: 'Vouch is waiting for you in the Vouch dialog. ' }), (run.prompt && run.prompt.message) || 'Answer it to go on: Continue, Wait or Skip this page.') : null,
-        (run.events || []).length ? log : h('p', { class: 'empty', text: 'Progress appears here while a run is going.' }),
-        h('div', { class: 'button-row wrap' },
-          btn('Open report', () => openTarget('report'), { small: true, disabled: !result.reportPath, later: canRun ? null : LATER_RUN }),
-          btn('Open folder', () => openTarget('folder'), { small: true, disabled: !result.folder, later: canRun ? null : LATER_RUN }),
-          btn('Open capture log', () => openTarget('log'), { small: true, disabled: !result.logPath, later: canRun ? null : LATER_RUN }),
-          btn('Preview', () => { if (result.previewUrl) toast('Preview: ' + result.previewUrl); }, { small: true, disabled: !result.previewUrl, later: canRun ? null : LATER_RUN })),
+          btn('Run all pages', () => startRun('all'), { primary: true, later: canRun ? null : LATER_RUN_HERE, disabled: active, fkey: 'run-all' }),
+          btn('Test this page' + (page ? ': ' + shortText(pageName(page, S.page), 30) : ''), () => startRun('page'), { later: canRun ? null : LATER_RUN_HERE, disabled: active || !page, fkey: 'run-page' }),
+          active ? stopButton : null),
+        h('p', { class: 'run-state', role: 'status', text: runStatusText() }),
+        active && run.unsaved ? h('p', { class: 'help', text: 'Running your current edits (not yet saved).' }) : null,
+        stopping && !run.forceAvailable && run.forceInSec > 0 ? h('p', { class: 'help', text: 'The run ends after its current step. If it has not ended in ' + run.forceInSec + ' s, you can force it to stop.' }) : null,
+        run.forceAvailable ? h('p', { class: 'help warning-text', text: 'The run has not stopped. Force stop ends it at once; its report may then be missing.' }) : null,
+        run.state === 'waitingForUser' ? h('div', { class: 'callout callout-accent', role: 'alert' },
+          h('strong', { text: 'Waiting for you in the Vouch window over the browser. ' }),
+          (run.prompt && run.prompt.title ? '“' + run.prompt.title + '”' + (run.prompt.pageName ? ' (page ' + run.prompt.pageName + ')' : '') + '. ' : '') + 'Answer it there: Continue, Wait or Skip this page.') : null,
+        active && (run.notes || []).length ? h('ul', { class: 'notes' }, run.notes.map(n => h('li', { text: n }))) : null,
+        outcome,
+        runPageList(),
+        runResultButtons(),
+        previewBlock(),
       ]),
       section('Command line', 'To run this configuration without the Designer - in a PowerShell window, a shortcut or a scheduled task.', [h('div', { id: 'command-box' })])));
     renderCommandBox();
   }
   function runStateText() {
     const s = S.run.state;
-    return { idle: 'Nothing is running.', starting: 'Starting…', running: 'Running…', waiting: 'Waiting for your answer in the Vouch dialog.', stopping: 'Stopping after the current step…', done: 'Finished.', failed: 'The run ended with an error.' }[s] || String(s);
+    return { idle: 'Nothing is running.', starting: 'Starting…', running: 'Running…', waitingForUser: 'Waiting for your answer in the Vouch window.', stopping: 'Stopping after the current step…', done: 'Finished.', failed: 'The run did not finish.' }[s] || String(s);
   }
   /*
     A command shown one switch per line (with a hanging indent, wrapping only inside a
@@ -1491,6 +1629,11 @@
           btn('Reconnect', () => retryBrowser(), { small: true, fkey: 'bs-reconnect' })));
       }
       if (b.notice) parts.push(h('p', { class: 'bs-note', text: b.notice }));
+    }
+    else if (b.inRun) {
+      cls = 'is-busy';
+      parts.push(h('div', { class: 'bs-line' }, h('span', { class: 'bs-dot', 'aria-hidden': 'true' }), h('span', { class: 'bs-state', text: 'A run is using the audit browser' })),
+        h('p', { class: 'help', text: 'The Designer leaves the browser alone until the run ends, then connects to it again. You can go on editing.' }));
     }
     else if (b.connecting || S.connecting) {
       cls = 'is-busy';
@@ -1717,38 +1860,136 @@
       poll(true);
     }
   }
-  let runTimer = 0;
-  async function startRun(kind) {
-    if (isDirty() || !S.path) {
-      const ok = await ask({ title: 'Save before running?', body: ['A run uses the saved file. Save your changes first.'], buttons: [{ label: 'Save and run', value: true, primary: true }, { label: 'Cancel', value: false }], cancelValue: false });
-      if (!ok || !(await save(!S.path))) return;
+  /*
+    Runs. What runs is the configuration as shown (unsaved edits too); the saved file is
+    never changed by it. Problems block it with the same list Save shows. While it goes,
+    GET /api/run?since=n brings the new events and the server's view of each page every
+    second; the panel stays editable (edits do not change the run in progress).
+  */
+  let runTimer = 0, runPlanTimer = 0, runPlanSeq = 0;
+  function applyRun(data) {
+    if (!data) return;
+    const before = S.run;
+    if (data.number !== before.number) { S.runEvents = []; S.previewImages = {}; }
+    if (Array.isArray(data.events) && data.since === S.runEvents.length) S.runEvents.push(...data.events);
+    S.runSince = S.runEvents.length;
+    S.run = data;
+    if (data.pageResults) S.pageResults = data.pageResults;
+    const wasActive = RUN_ACTIVE.includes(before.state);
+    if (wasActive && !RUN_ACTIVE.includes(data.state) && data.number === before.number) {
+      announce(data.message || runStateText());
+      poll(true);
+      refreshRunPlan();
     }
+    else if (before.state !== 'waitingForUser' && data.state === 'waitingForUser') announce('The run is waiting for you in the Vouch window over the browser.');
+    if (data.preview && data.preview.images && data.preview.images.length) loadPreviews();
+  }
+  async function showRunProblems(list, kind) {
+    const body = [(list.length === 1 ? 'There is 1 problem' : 'There are ' + list.length + ' problems') + ' to fix before ' + (kind === 'page' ? 'the page can be tested:' : 'the configuration can run:'),
+      h('ul', { class: 'plain-list' }, list.slice(0, 12).map(p => h('li', {}, h('strong', { text: labelFor(p.path) + ': ' }), p.text)))];
+    const go = await ask({ title: kind === 'page' ? 'Not tested' : 'Not run', body: body, buttons: [{ label: 'Show the first one', value: true, primary: true }, { label: 'Close', value: false }], cancelValue: false });
+    if (go && list.length) jumpTo(list[0].path);
+  }
+  async function startRun(kind) {
+    if (runActive()) return false;
     const page = pageAt(S.page);
+    if (kind === 'page' && !page) { toast('Select the page to test first.'); return false; }
+    runClientChecks();
+    const pr = problems();
+    if (pr.errors.length) { await showRunProblems(pr.errors, kind); return false; }
+    S.runStarting = true;
+    S.tab = 'run';
+    keepFocus(renderAll);
+    let started = false;
     try {
-      const result = await api('POST', '/api/run', { path: S.path, kind: kind, only: kind === 'page' && page ? [pageId(page, S.page)] : [] });
-      S.run = Object.assign({ events: [] }, result);
-      S.tab = 'run';
-      renderAll();
-      pollRun();
-    } catch (e) { showError(e); }
+      const data = await api('POST', '/api/run', { config: S.config, path: S.path, kind: kind === 'page' ? 'page' : 'full', pageId: kind === 'page' ? pageId(page, S.page) : '' });
+      S.runStarting = false;
+      applyRun(data);
+      started = true;
+      announce(kind === 'page' ? 'Testing the page. Progress is shown in the Run tab.' : 'The run has started. Progress is shown in the Run tab.');
+    } catch (e) {
+      S.runStarting = false;
+      if (e.status === 422 && e.data && e.data.errors) {
+        S.check.errors = e.data.errors; S.check.stale = false;
+        keepFocus(renderAll);
+        await showRunProblems(problems().errors, kind);
+      }
+      else await showError(e, kind === 'page' ? 'The page was not tested.' : 'The run did not start.');
+    }
+    keepFocus(renderAll);
+    if (started) { poll(true); runTimer = setTimeout(pollRun, 500); }
+    return started;
   }
   async function pollRun() {
     clearTimeout(runTimer);
+    if (S.closed) return;
     try {
-      const state = await api('GET', '/api/run');
-      S.run = Object.assign({ events: [] }, state);
-      if (state.pageResults) S.pageResults = state.pageResults;
+      const data = await api('GET', '/api/run?since=' + S.runSince);
+      if (data.number !== S.run.number && data.since > 0) { S.runSince = 0; S.runEvents = []; runTimer = setTimeout(pollRun, 0); return; }
+      applyRun(data);
       if (S.tab === 'run') keepFocus(renderRun); else lightRender();
-      if (['starting', 'running', 'waiting', 'stopping'].includes(state.state)) runTimer = setTimeout(pollRun, 1000);
-    } catch (e) { if (e.status !== 501) showError(e); }
+      if (RUN_ACTIVE.includes(data.state)) runTimer = setTimeout(pollRun, 1000);
+    } catch (e) {
+      if (RUN_ACTIVE.includes(S.run.state)) runTimer = setTimeout(pollRun, 2000);
+    }
   }
-  async function stopRun() {
-    try { await api('POST', '/api/run/stop', {}); pollRun(); } catch (e) { showError(e); }
+  async function stopRun(force) {
+    try {
+      const data = await api('POST', '/api/run/stop', { force: !!force });
+      applyRun(data);
+      if (S.tab === 'run') keepFocus(renderRun);
+      announce(force ? 'The run was ended.' : 'Stopping the run after its current step.');
+      pollRun();
+    } catch (e) { showError(e); }
   }
   async function openTarget(what) {
     try { await api('POST', '/api/open', { what: what }); } catch (e) { showError(e); }
   }
-  Object.assign(window.VouchDesigner, { goToUrl, addPageFromCurrentTab, startPick, cancelPick, chooseCandidate, applyPick, testAction, testKey, renderBrowser, retryBrowser, tidyWindows, zoomOff, holdOpen, startRun, pollRun, stopRun, openTarget });
+  /* Preview images need the token, which an <img> cannot send: fetched here, shown as data: URLs. */
+  async function loadPreviews() {
+    const images = S.run.preview && Array.isArray(S.run.preview.images) ? S.run.preview.images : [];
+    const wanted = images.filter(img => !(img.url in S.previewImages));
+    if (!wanted.length) return;
+    for (const img of wanted) S.previewImages[img.url] = '';
+    await Promise.all(wanted.map(async img => {
+      try {
+        const response = await fetch(img.url, { headers: { 'X-Vouch-Token': S.token }, cache: 'no-store', credentials: 'omit' });
+        if (!response.ok) throw new Error(String(response.status));
+        const blob = await response.blob();
+        S.previewImages[img.url] = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result));
+          reader.onerror = () => reject(reader.error);
+          reader.readAsDataURL(blob);
+        });
+      } catch (e) { S.previewImages[img.url] = 'failed'; }
+    }));
+    if (S.tab === 'run') keepFocus(renderRun);
+  }
+  function showPreviewImage(img, caption) {
+    const src = S.previewImages[img.url];
+    if (!src || src === 'failed') { toast('This image is not available.'); return; }
+    ask({ title: caption, body: [h('img', { class: 'preview-large', src: src, alt: 'Screenshot: ' + caption })], buttons: [{ label: 'Close', value: true, primary: true }], cancelValue: true });
+  }
+  function scheduleRunPlan() { clearTimeout(runPlanTimer); runPlanTimer = setTimeout(refreshRunPlan, 700); }
+  async function refreshRunPlan() {
+    if (!S.config || S.closed) return;
+    const seq = ++runPlanSeq;
+    const page = pageAt(S.page);
+    try {
+      const full = api('POST', '/api/run/plan', { config: S.config, path: S.path, kind: 'full' });
+      const pagePlan = page ? api('POST', '/api/run/plan', { config: S.config, path: S.path, kind: 'page', pageId: pageId(page, S.page) }) : Promise.resolve(null);
+      const results = await Promise.all([full, pagePlan]);
+      if (seq !== runPlanSeq) return;
+      S.runPlan = results[0];
+      S.pagePlan = results[1];
+    } catch (e) {
+      if (seq !== runPlanSeq) return;
+      S.runPlan = null;
+    }
+    if (S.tab === 'run' && !runActive()) keepFocus(renderRun);
+  }
+  Object.assign(window.VouchDesigner, { goToUrl, addPageFromCurrentTab, startPick, cancelPick, chooseCandidate, applyPick, testAction, testKey, renderBrowser, retryBrowser, tidyWindows, zoomOff, holdOpen, startRun, pollRun, stopRun, openTarget, refreshRunPlan, loadPreviews, runActive });
 
   // ------------------------------------------------------------------ files
   /*
@@ -1888,10 +2129,17 @@
     toast('Imported ' + incoming.length + ' page(s) from ' + result.name + '.');
   }
   async function closeDesigner() {
+    const running = runActive();
+    if (running) {
+      const ok = await ask({ title: 'A run is going', body: ['Closing the Designer stops the run first: it ends after its current step and still writes its report. Then the Designer closes.'],
+        buttons: [{ label: 'Stop the run and close', value: true, danger: true }, { label: 'Cancel', value: false, primary: true }], cancelValue: false });
+      if (!ok) return;
+    }
     if (!(await confirmDiscard('Closing the Designer loses them.'))) return;
     S.savedJson = JSON.stringify(S.config);
-    try { await api('POST', '/api/shutdown', {}); } catch (e) { /* already gone */ }
-    showClosed('The Vouch Designer has stopped. You can close this window.');
+    clearTimeout(runTimer);
+    try { await api('POST', '/api/shutdown', running ? { stopRun: true } : {}); } catch (e) { /* already gone */ }
+    showClosed(running ? 'The run is being stopped; the Vouch Designer closes as soon as it has. You can close this window.' : 'The Vouch Designer has stopped. You can close this window.');
   }
   function showClosed(text) {
     S.closed = true;
@@ -1914,7 +2162,7 @@
       const said = browserAnnouncement(before, S.browser);
       if (said) announce(said);
     }
-    if (state.run && state.run.state && state.run.state !== S.run.state && S.capabilities.run) pollRun();
+    if (state.run && state.run.state && (state.run.state !== S.run.state || state.run.number !== S.run.number)) pollRun();
     if (changed && S.config) renderAll();
   }
   async function poll(force) {
@@ -1939,7 +2187,7 @@
     else if (key === 'y' || (key === 'z' && ev.shiftKey)) { ev.preventDefault(); redo(); }
   });
   window.addEventListener('beforeunload', ev => {
-    if (!S.closed && isDirty()) { ev.preventDefault(); ev.returnValue = ''; }
+    if (!S.closed && (isDirty() || runActive())) { ev.preventDefault(); ev.returnValue = ''; }
   });
 
   // ------------------------------------------------------------------ start

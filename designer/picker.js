@@ -38,6 +38,12 @@
     marked element. There is no second matcher here.
   - Nothing from the page is trusted by the server: it reads plain values (strings and
     numbers) and short codes, caps their length and builds every sentence itself.
+  - It has a lifetime of its own: the server asks for its status several times a second
+    while the person picks. When nobody has asked for HEARTBEAT_MS (the Designer closed,
+    crashed, or gave up on a tab that stopped answering without calling stop()), it
+    removes itself, so a page is never left swallowing every click until it is reloaded.
+    While the server checks a click it already has (phase "picked"), the limit is
+    BUSY_MS: the engine's checks of the proposals take up to ten seconds.
   - stop() removes everything: listeners, timers, the observer, the injected nodes, the
     mark and the single namespaced global window.__vouchPicker.
   - A page that reloads or moves on by itself during a pick takes all this with it. For
@@ -68,6 +74,12 @@
   var attached = [];   // { target, type, fn }: every listener added, on windows and on open shadow roots
   var handlers = typeof WeakMap === 'function' ? new WeakMap() : null;   // window -> its listener functions (stable, so adding again is a no-op)
   var timer = 0;
+  // The server polls status() every 200 ms while picking (its loop can be held up for a
+  // few seconds by a slow request); 5 s without a poll means nobody is coming back.
+  var HEARTBEAT_MS = 5000;
+  var BUSY_MS = 20000;
+  var lastBeat = Date.now();
+  function beat() { lastBeat = Date.now(); }
   var observer = null;
   var pointer = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
 
@@ -1055,6 +1067,7 @@
     }
   }
   function refresh() {
+    if (Date.now() - lastBeat > (state.phase === 'picking' ? HEARTBEAT_MS : BUSY_MS)) { stop(); return; }
     scan(false);
     listenAll();
     refreshOverlays();
@@ -1177,12 +1190,13 @@
   }
   var api = {
     status: function () {
+      beat();
       return { phase: state.phase, code: state.code, note: state.note, mode: mode, url: String(location.href).substring(0, 2000) };
     },
-    info: info,
-    proposals: proposals,
-    restore: restore,
-    element: function () { var p = state.picked; return p ? (mode === 'scroll' ? (p.scroll && p.scroll.node) || null : p.el) : null; },
+    info: function () { beat(); return info(); },
+    proposals: function () { beat(); return proposals(); },
+    restore: function () { beat(); return restore(); },
+    element: function () { beat(); var p = state.picked; return p ? (mode === 'scroll' ? (p.scroll && p.scroll.node) || null : p.el) : null; },
     stop: stop,
   };
   Object.defineProperty(window, NS, { value: api, configurable: true, enumerable: false, writable: true });
