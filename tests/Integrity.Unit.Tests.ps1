@@ -37,11 +37,12 @@ BeforeAll {
         finally { $bitmap.Dispose() }
     }
 
-    function New-TestReport([string]$Folder, [switch]$SaveImages, [switch]$Linked, [switch]$Full, [string]$Classification = 'Confidential') {
+    function New-TestReport([string]$Folder, [switch]$SaveImages, [switch]$Linked, [switch]$Full, [string]$Classification = 'Confidential', [string]$Name = 'report') {
         if ($Linked) { $SaveImages = [switch]$true }
-        $name = 'report'
+        # -Name: the report's file name without .html, as Get-ReportFileName gives it.
+        $name = $Name
         $imagesDir = Join-Path $Folder "images\$name"
-        [void](New-Item -ItemType Directory -Path $imagesDir -Force)
+        [void][System.IO.Directory]::CreateDirectory($imagesDir)
         $captures = [System.Collections.Generic.List[object]]::new()
         foreach ($segment in 1, 2) {
             $metadata = New-TestMetadata -Segment $segment
@@ -75,11 +76,13 @@ BeforeAll {
             ManifestSha256 = Get-Sha256Hex -Bytes ([System.Text.Encoding]::UTF8.GetBytes($manifest))
         }
         $path = Join-Path $Folder "$name.html"
-        $options = if ($Linked) { New-ReportOptions -EmbedImages $false -ImageFolder "images/$name" } else { $null }
+        # The images folder as a capture run passes it: relative to the report, as Windows spells it.
+        $imageFolder = [System.IO.Path]::GetRelativePath($Folder, $imagesDir)
+        $options = if ($Linked) { New-ReportOptions -EmbedImages $false -ImageFolder $imageFolder } else { $null }
         if ($Full) {
             # Everything 2.0 can add: logo, company, classification (print CSS), index, run details.
             $evil = 'x <img src=x> <!-- hi --> &period; &nbsp; style="x" url( '' > < & ü 日本'
-            $options = New-ReportOptions -EmbedImages (-not $Linked) -ImageFolder $(if ($Linked) { "images/$name" } else { '' }) -Title "Q3 $evil" `
+            $options = New-ReportOptions -EmbedImages (-not $Linked) -ImageFolder $(if ($Linked) { $imageFolder } else { '' }) -Title "Q3 $evil" `
                 -Classification $Classification -CompanyName "ACME $evil" -CompanyDetails "1 Main St`nSpringfield $evil" -Description "Why $evil" -Origin $evil `
                 -GeneratedBy "Jane $evil" -PeriodFrom '2026-07-01' -PeriodTo '2026-09-30' -PeriodLabel $evil -Account "svc $evil" -CaptureLogName 'report.log' `
                 -LogoDataUri 'data:image/png;base64,iVBORw0KGgo='
@@ -654,7 +657,7 @@ Describe 'What -Verify accepts: only what Vouch writes, in the whole document (f
         @{ Case = 'a second logo'; Old = '<header class="company"><img class="logo"'; New = '<header class="company">@LOGO@<img class="logo"'; Pattern = 'logo is not at the start' }
         @{ Case = 'a logo outside the header'; Old = '<h2>Evidence</h2>'; New = '<h2>Evidence</h2>@LOGO@'; Pattern = 'logo is not at the start' }
         @{ Case = 'a logo that is not stored in the report'; Old = 'src="data:image/png;base64,iVBORw0KGgo="'; New = 'src="logo.png"'; Pattern = 'not an image stored inside the report' }
-        @{ Case = 'a header that is not at the top'; Old = '</body>'; New = '<header class="company"></header></body>'; Pattern = 'header is not at its top|2 headers' }
+        @{ Case = 'a header that is not at the top'; Old = '</body>'; New = '<header class="company"></header></body>'; Pattern = 'parts are not the ones Vouch writes' }
     ) {
         $report = New-TestReport -Folder $folder -Full
         Edit-Report $report {
@@ -698,8 +701,11 @@ Describe 'Report style sheet pins' {
     It 'pins every style sheet this version writes, and keeps the 1.3.0 and 2.0.0 ones' {
         $known = Get-KnownReportCssHash
         $current = Get-CurrentReportCssHash
-        $missing = @($current | Where-Object { -not $known.Contains($_) })
+        $missing = @($current.Keys | Where-Object { -not $known.Contains($_) })
         $missing | Should -BeNullOrEmpty -Because "the report CSS (Get-ReportCss) changed: add these SHA-256 values to Get-KnownReportCssHash and keep the old ones there, or older reports stop verifying: $($missing -join ', ')"
+        # Each sheet is pinned as the kind of report it belongs to: -Verify holds the document to it.
+        @($current.Values) | Should -Be @('plain', 'options', 'Public', 'Internal', 'Private', 'Confidential')
+        foreach ($hash in $current.Keys) { $known[$hash] | Should -BeExactly $current[$hash] -Because "$hash is the style sheet of a '$($current[$hash])' report" }
         # Released style sheets: removing any of these breaks -Verify for reports made by that version.
         foreach ($hash in 'c777d90eb3cf23596ed8e5f857508c5165ce399b7ae03676697aae9dcd251190', 'b159902f6ac1f1e8d0d58f5ef93ebc01c7c5c4d51c33cbd831195b918fd748b4',
             '2b4c494d2f22318be79409d18f969ae47b589600f08e2a4879eea93eec0748b1', '96805324fe4f2c698b02cf5e5032a077aba5d0414c36b3c3c91ae0744f061c17',
@@ -712,5 +718,413 @@ Describe 'Report style sheet pins' {
         $html = [System.IO.File]::ReadAllText((Join-Path -Path $PSScriptRoot -ChildPath '..\examples\live-test-2026-09-24\live-test.html'))
         $start = $html.IndexOf('<style>') + 7
         (Get-KnownReportCssHash).Contains((Get-ReportCssHash -Text $html.Substring($start, $html.IndexOf('</style>') - $start))) | Should -BeTrue
+    }
+}
+
+Describe 'What -Verify accepts: a report of the kind its style sheet belongs to (fix round 4)' {
+    BeforeEach {
+        $folder = Join-Path $TestDrive ([guid]::NewGuid())
+        [void](New-Item -ItemType Directory -Path $folder)
+    }
+    BeforeAll {
+        function Get-FailedCheck([string]$Path) { @(Test-ReportIntegrity -Path $Path | Where-Object { -not $_.Ok }) }
+        function Get-MarkupProblem([string]$Path) { @((Get-FailedCheck $Path) | Where-Object { $_.Check -in 'Report markup', 'Report styles' }) }
+        function Edit-TestReport([string]$Path, [object[]]$Edits, [string]$Sheet) {
+            <#
+                Applies a test case to a genuine report: -Sheet swaps in another of Vouch's
+                own style sheets; each edit replaces a pattern with literal text, in which
+                @H1@, @FOOTER@, @LOGO@, @SHOT@, @FIGURE@, @SECTION@ stand for those parts of
+                the genuine report and @BIGLOGO@ for a 1280x3000 SVG logo.
+            #>
+            $html = [System.IO.File]::ReadAllText($Path)
+            $svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="3000"><rect width="1280" height="3000" fill="#e00"/></svg>'
+            $parts = @{
+                '@H1@' = [regex]::Match($html, '<h1>[^<]*</h1>').Value
+                '@FOOTER@' = [regex]::Match($html, '<footer>[^<]*</footer>').Value
+                '@LOGO@' = [regex]::Match($html, '<img class="logo"[^>]*>').Value
+                '@SHOT@' = [regex]::Match($html, '<img alt="[^"]*" data-file="003_Admin_users_seg01\.jpg"[^>]*>').Value
+                '@FIGURE@' = [regex]::Match($html, '(?s)<figure[^>]*>.*?</figure>').Value
+                '@SECTION@' = [regex]::Match($html, '(?s)<section.*?</section>').Value
+                '@BIGLOGO@' = '<img class="logo" data-vouch-logo="true" alt="Company logo" src="data:image/svg+xml;base64,' + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($svg)) + '">'
+            }
+            if ($Sheet) {
+                $options = switch ($Sheet) { 'plain' { $null } 'options' { New-ReportOptions } default { New-ReportOptions -Classification $Sheet } }
+                $css = "`r`n" + (Get-ReportCss -Options $options) + "`r`n"
+                $html = [regex]::Replace($html, '(?s)<style>.*?</style>', { "<style>$css</style>" })
+            }
+            foreach ($edit in @($Edits | Where-Object { $_ })) {
+                $with = [string]$edit.With
+                foreach ($key in $parts.Keys) { $with = $with.Replace($key, $parts[$key]) }
+                $changed = ([regex]$edit.Regex).Replace($html, { $with }, 1)
+                if ($changed -ceq $html) { throw "The test's edit '$($edit.Regex)' changed nothing." }
+                $html = $changed
+            }
+            [System.IO.File]::WriteAllText($Path, $html, [System.Text.UTF8Encoding]::new($false))
+        }
+        function New-BareReport([string]$Path, [object[]]$Items, [AllowNull()][object]$Options) {
+            $run = [pscustomobject]@{
+                StartTime = 's'; EndTime = 'e'; TimeZone = 'tz'; Computer = 'PC01'; User = 'CORP\auditor'; OperatingSystem = 'os'
+                EdgeVersion = 'Edg'; BrowserInstance = 'b'; CaptureDesktop = 'd'; ToolVersion = 'test'; CsvPath = 'c'; ImageFormat = 'jpeg'
+                ImageDescription = 'JPEG'; ScreenResolution = '1280x800'; Total = @($Items).Count; OkCount = 0; WarnCount = 0; FailCount = @($Items).Count
+                CaptureCount = 0; RunId = 'r'; ManifestSha256 = Get-Sha256Hex -Bytes ([byte[]]@())
+            }
+            [System.IO.File]::WriteAllText($Path, (New-HtmlReport -Items @($Items) -Run $run -Options $Options), [System.Text.UTF8Encoding]::new($false))
+        }
+    }
+
+    It 'names the kind of a genuine report: <Kind>' -ForEach @(
+        @{ Kind = 'plain'; Full = $false; Classification = '' }, @{ Kind = 'options'; Full = $true; Classification = '' }
+        @{ Kind = 'Public'; Full = $true; Classification = 'Public' }, @{ Kind = 'Internal'; Full = $true; Classification = 'Internal' }
+        @{ Kind = 'Private'; Full = $true; Classification = 'Private' }, @{ Kind = 'Confidential'; Full = $true; Classification = 'Confidential' }
+    ) {
+        $report = New-TestReport -Folder $folder -Full:$Full -Classification $Classification
+        $scan = Test-ReportMarkup -Html ([System.IO.File]::ReadAllText($report))
+        $scan.Problems | Should -BeNullOrEmpty
+        $scan.Kind | Should -BeExactly $Kind
+        $scan.Manifest | Should -Match '^[0-9a-f]{64}$'
+        Get-FailedCheck $report | Should -BeNullOrEmpty
+    }
+
+    It 'still accepts a genuine report whose line ends a tool changed to LF' {
+        $report = New-TestReport -Folder $folder -Full
+        $html = [System.IO.File]::ReadAllText($report)
+        $html | Should -Match "`r`n"
+        [System.IO.File]::WriteAllText($report, $html.Replace("`r`n", "`n"), [System.Text.UTF8Encoding]::new($false))
+        Get-FailedCheck $report | Should -BeNullOrEmpty
+    }
+
+    It 'accepts the markup of genuine reports with no page, a failed page without images, and the least of each option (<Case>)' -ForEach @(
+        @{ Case = 'no options'; Options = @{}; Plain = $true }
+        @{ Case = 'options, nothing set'; Options = @{}; Plain = $false }
+        @{ Case = 'only a company name, no index'; Options = @{ CompanyName = 'ACME'; ShowIndex = $false }; Plain = $false }
+        @{ Case = 'only a logo, classified'; Options = @{ LogoDataUri = 'data:image/gif;base64,R0lGODlhAQABAAAAACw='; Classification = 'Internal' }; Plain = $false }
+        @{ Case = 'linked, classified'; Options = @{ EmbedImages = $false; ImageFolder = 'images\r'; Classification = 'Public' }; Plain = $false }
+    ) {
+        $failed = [pscustomobject]@{
+            Index = 7; Name = 'Payroll <b>'; Url = 'https://a.example/?x=1&y=2'; FinalUrl = ''; Notes = 'n'; StepsText = 'click:#go > a'; ScrollFullPage = $false
+            Status = 'FAILED'; HttpStatus = 0; Account = 'x@example.com'
+            Details = [System.Collections.Generic.List[string]]@('one', 'two & three'); StepLog = [System.Collections.Generic.List[object]]::new()
+            Captures = [System.Collections.Generic.List[object]]::new()
+        }
+        $stepped = $failed.PSObject.Copy()
+        $stepped.Index = 8
+        $stepped.StepLog = [System.Collections.Generic.List[object]]@(
+            [pscustomobject]@{ Text = 'click:a'; Ok = $true; Message = '' }, [pscustomobject]@{ Text = 'wait:1'; Ok = $true; Message = 'done' }, [pscustomobject]@{ Text = 'click:b'; Ok = $false; Message = 'gone' })
+        foreach ($set in 'none', 'two') {
+            $items = if ($set -eq 'none') { @() } else { @($failed, $stepped) }
+            $path = Join-Path $folder "bare-$set.html"
+            $settings = $Options
+            New-BareReport -Path $path -Items @($items) -Options $(if ($Plain) { $null } else { New-ReportOptions @settings })
+            (Test-ReportMarkup -Html ([System.IO.File]::ReadAllText($path))).Problems | Should -BeNullOrEmpty
+        }
+    }
+
+    It 'fails <Case>' -ForEach @(
+        @{ Case = 'a company header with a huge logo added to a report without report options (no rule limits a logo there)'
+            Edits = @(@{ Regex = '<body>'; With = "<body>`r`n<header class=""company"">@BIGLOGO@</header>" }); Pattern = 'parts are not the ones Vouch writes' }
+        @{ Case = 'a full report given the style sheet without the logo limit, a huge logo, and its title moved to the end'; Full = $true; Sheet = 'plain'
+            Edits = @(@{ Regex = '<img class="logo"[^>]*>'; With = '@BIGLOGO@' }, @{ Regex = '<h1>[^<]*</h1>'; With = '' }, @{ Regex = '</body>'; With = '@H1@</body>' })
+            Pattern = 'only a report with report options has|parts are not the ones Vouch writes' }
+        @{ Case = 'an unclassified full report given the style sheet without the logo limit'; Full = $true; Classification = ''; Sheet = 'plain'; Pattern = 'only a report with report options has' }
+        @{ Case = 'a linked report given the style sheet of a report without report options'; Linked = $true; Sheet = 'plain'; Pattern = 'links its screenshots' }
+        @{ Case = 'a report without report options given the style sheet of one with them'; Sheet = 'options'; Pattern = 'parts are not the ones Vouch writes' }
+        @{ Case = 'a Confidential report given the Public style sheet'; Full = $true; Sheet = 'Public'; Pattern = 'those of a report classified Public' }
+        @{ Case = 'a Confidential report given the unclassified style sheet'; Full = $true; Sheet = 'options'; Pattern = 'report options and no classification' }
+        @{ Case = 'an unclassified report given the Confidential style sheet'; Full = $true; Classification = ''; Sheet = 'Confidential'; Pattern = 'those of a report classified Confidential' }
+        @{ Case = 'a banner whose class says another level'; Full = $true; Edits = @(@{ Regex = 'top cls-confidential'; With = 'top cls-public' }); Pattern = 'banner does not read PUBLIC' }
+        @{ Case = 'a banner whose text says another level'; Full = $true; Edits = @(@{ Regex = 'role="note">CONFIDENTIAL</div>'; With = 'role="note">PUBLIC</div>' }); Pattern = 'banner does not read CONFIDENTIAL' }
+        @{ Case = 'a banner holding more than its text'; Full = $true; Edits = @(@{ Regex = 'role="note">CONFIDENTIAL</div>'; With = 'role="note">CONFIDENTIAL<strong>x</strong></div>' }); Pattern = 'banner holds more than its text' }
+        @{ Case = 'the top banner removed'; Full = $true; Edits = @(@{ Regex = '<div class="classification top[^>]*>[^<]*</div>'; With = '' }); Pattern = 'parts are not the ones Vouch writes' }
+        @{ Case = 'the bottom banner removed'; Full = $true; Edits = @(@{ Regex = '<div class="classification bottom[^>]*>[^<]*</div>'; With = '' }); Pattern = 'parts are not the ones Vouch writes' }
+        @{ Case = 'a banner added to an unclassified report'; Full = $true; Classification = ''
+            Edits = @(@{ Regex = '<body>'; With = '<body><div class="classification top cls-public" role="note">PUBLIC</div>' }); Pattern = 'parts are not the ones Vouch writes' }
+        @{ Case = 'a banner inside a table cell'; Full = $true
+            Edits = @(@{ Regex = '<td class="k">Run started</td><td>'; With = '<td class="k">Run started</td><td><div class="classification top cls-confidential" role="note">CONFIDENTIAL</div>' }); Pattern = '<div> directly inside a <td>' }
+        @{ Case = 'the title moved to the end'; Edits = @(@{ Regex = '<h1>[^<]*</h1>'; With = '' }, @{ Regex = '</body>'; With = '@H1@</body>' }); Pattern = 'parts are not the ones Vouch writes' }
+        @{ Case = 'the title moved above the company header'; Full = $true; Edits = @(@{ Regex = '<h1>[^<]*</h1>'; With = '' }, @{ Regex = '<header'; With = '@H1@<header' }); Pattern = 'parts are not the ones Vouch writes' }
+        @{ Case = 'the footer moved above the evidence'; Edits = @(@{ Regex = '<footer>[^<]*</footer>'; With = '' }, @{ Regex = '<h2>Evidence</h2>'; With = '@FOOTER@<h2>Evidence</h2>' }); Pattern = 'parts are not the ones Vouch writes' }
+        @{ Case = 'a page section moved above the summary'; Edits = @(@{ Regex = '(?s)<section.*?</section>'; With = '' }, @{ Regex = '<h2>Summary</h2>'; With = '@SECTION@<h2>Summary</h2>' }); Pattern = 'parts are not the ones Vouch writes' }
+        @{ Case = 'the note saying which form the report has removed'; Full = $true; Edits = @(@{ Regex = '<p class="integrity-note"><strong>.*?</p>'; With = '' }); Pattern = 'parts are not the ones Vouch writes' }
+        @{ Case = 'a paragraph added between the parts'; Edits = @(@{ Regex = '<h2>Evidence</h2>'; With = '<h2>Evidence</h2><p class="empty">All controls passed.</p>' }); Pattern = 'in a place where Vouch never writes one' }
+        @{ Case = 'text added between the parts'; Edits = @(@{ Regex = '<h2>Evidence</h2>'; With = '<h2>Evidence</h2>All controls passed.' }); Pattern = 'text where Vouch writes none' }
+        @{ Case = 'text added after the document'; Edits = @(@{ Regex = '</html>'; With = '</html>All controls passed.' }); Pattern = 'text where Vouch writes none' }
+        @{ Case = 'the head in another order'; Edits = @(@{ Regex = '<title>[^<]*</title>'; With = '' }, @{ Regex = '</head>'; With = '<title>x</title></head>' }); Pattern = 'not set out the way Vouch writes them' }
+        @{ Case = 'a contents list in a report without report options'
+            Edits = @(@{ Regex = '<h2>Summary</h2>'; With = '<nav class="contents-wrap" aria-label="Contents"><h2 id="contents">Contents</h2></nav><h2>Summary</h2>' }); Pattern = 'parts are not the ones Vouch writes' }
+        @{ Case = 'a capture anchor in a report without report options'; Edits = @(@{ Regex = '<figure>'; With = '<figure id="item-3-c1">' }); Pattern = 'only a report with report options has' }
+        @{ Case = 'a class Vouch does not put on that element'; Full = $true; Edits = @(@{ Regex = '<div class="company-name">'; With = '<div class="company-name logo">' }); Pattern = 'class is not a value Vouch writes' }
+        @{ Case = 'a link to a place Vouch never links to'; Edits = @(@{ Regex = 'href="#item-3"'; With = 'href="#contents"' }); Pattern = 'href is not a value Vouch writes' }
+        @{ Case = 'a screenshot in a figure inside the company header'; Full = $true; Edits = @(@{ Regex = '<div class="company-text">'; With = '<figure>@SHOT@</figure><div class="company-text">' }); Pattern = '<figure> directly inside a <header>' }
+        @{ Case = 'the logo after the company text'; Full = $true; Edits = @(@{ Regex = '<img class="logo"[^>]*>'; With = '' }, @{ Regex = '</header>'; With = '@LOGO@</header>' }); Pattern = 'logo is not at the start' }
+        @{ Case = 'a logo with another description'; Full = $true; Edits = @(@{ Regex = 'alt="Company logo"'; With = 'alt="Screenshot of payroll"' }); Pattern = 'neither a screenshot with its hash nor the company logo' }
+        @{ Case = 'the screenshots under the heading of another page'; Edits = @(@{ Regex = '<section class="item" id="item-3">'; With = '<section class="item" id="item-4">' }); Pattern = 'not in the section of the page it was taken of' }
+        @{ Case = 'a screenshot moved into the section of another page (order kept)'
+            Edits = @(@{ Regex = '(?s)<figure[^>]*>.*?</figure>\r?\n'; With = '' }, @{ Regex = '<section class="item" id="item-3">'; With = "<section class=""item"" id=""item-2"">`r`n<h3>Screenshots</h3>`r`n@FIGURE@`r`n</section>`r`n<section class=""item"" id=""item-3"">" })
+            Pattern = 'not in the section of the page it was taken of' }
+        @{ Case = 'a linked screenshot whose address names another file than the one hashed'; Linked = $true
+            Edits = @(@{ Regex = 'src="images/report/003_Admin_users_seg01.jpg"'; With = 'src="images/report/003_Admin_users_seg02.jpg"' }); Pattern = 'image address is not in the form Vouch writes' }
+        @{ Case = 'linked and stored screenshots mixed'; Linked = $true
+            Edits = @(@{ Regex = 'src="images/report/003_Admin_users_seg02.jpg"'; With = 'src="data:image/jpeg;base64,AAAA"' }); Pattern = 'not all stored the same way' }
+        @{ Case = 'screenshots linked from two folders'; Linked = $true; CopyFolder = 'other'
+            Edits = @(@{ Regex = 'src="images/report/003_Admin_users_seg02.jpg"'; With = 'src="images/other/003_Admin_users_seg02.jpg"' }); Pattern = 'not all in one folder' }
+    ) {
+        $report = New-TestReport -Folder $folder -Full:([bool]$Full) -Linked:([bool]$Linked) -Classification $(if ($null -ne $Classification) { $Classification } else { 'Confidential' })
+        if ($CopyFolder) { Copy-Item -LiteralPath (Join-Path $folder 'images\report') -Destination (Join-Path $folder "images\$CopyFolder") -Recurse }
+        Edit-TestReport -Path $report -Edits @($Edits) -Sheet $Sheet
+        ((Get-MarkupProblem $report).Detail -join ' | ') | Should -Match $Pattern
+    }
+}
+
+Describe 'Linked image addresses: only the spelling the generator writes (fix round 4)' {
+    It 'accepts the folder part <Segment>' -ForEach @(
+        @{ Segment = 'report' }, @{ Segment = 'My%20report' }, @{ Segment = 'Q3%20%231' }, @{ Segment = '100%25' }, @{ Segment = '%C3%9Cbersicht' }
+        @{ Segment = 'a%2520b' }, @{ Segment = '%20Q3' }, @{ Segment = 'R%26D%20%27x%27%20%2B%3B%3D%40%24%2C%21~%5Bx%5D%28y%29' }, @{ Segment = '%F0%9F%98%80' }
+    ) {
+        Test-ReportImageFolderName -Segment $Segment | Should -BeTrue
+    }
+
+    It 'refuses the folder part <Segment> (<Why>)' -ForEach @(
+        @{ Segment = '%FF'; Why = 'not UTF-8: .NET keeps it, Edge reads y-umlaut' }, @{ Segment = 'a%C2'; Why = 'cut-off UTF-8' }, @{ Segment = '%C0%AE%C0%AE'; Why = 'overlong dots' }
+        @{ Segment = '%ED%A0%80'; Why = 'half a character pair' }, @{ Segment = '%2e%2e'; Why = 'escaped dots' }, @{ Segment = '%2E%2E'; Why = 'escaped dots' }
+        @{ Segment = '..'; Why = 'parent folder' }, @{ Segment = '.'; Why = 'this folder' }, @{ Segment = 'x.'; Why = 'Windows drops the dot' }, @{ Segment = 'x%20'; Why = 'Windows drops the space' }
+        @{ Segment = 'a%2Fb'; Why = 'a separator' }, @{ Segment = 'a%5Cb'; Why = 'a separator' }, @{ Segment = 'a%3Ab'; Why = 'a stream or drive' }, @{ Segment = 'a%3Fb'; Why = 'not a file name' }
+        @{ Segment = 'r%65port'; Why = 'a letter needlessly escaped' }, @{ Segment = '%c3%9c'; Why = 'lower-case escape' }, @{ Segment = 'a%00'; Why = 'control character' }
+        @{ Segment = 'a%0Ab'; Why = 'control character' }, @{ Segment = 'a b'; Why = 'raw space' }, @{ Segment = 'a%'; Why = 'bare percent' }, @{ Segment = 'a%zz'; Why = 'bare percent' }
+        @{ Segment = 'a&amp;b'; Why = 'raw &' }, @{ Segment = ''; Why = 'empty' }
+    ) {
+        Test-ReportImageFolderName -Segment $Segment | Should -BeFalse
+    }
+
+    It 'fails a forged report whose folder is %FF, with the genuine images where .NET looks and others where Edge looks' {
+        $folder = Join-Path $TestDrive 'ff'
+        $report = New-TestReport -Folder $folder -Linked
+        Copy-Item -LiteralPath (Join-Path $folder 'images\report') -Destination (Join-Path $folder 'images\%FF') -Recurse
+        Copy-Item -LiteralPath (Join-Path $folder 'images\report') -Destination (Join-Path $folder "images\$([char]0xFF)") -Recurse
+        [System.IO.File]::WriteAllText($report, [System.IO.File]::ReadAllText($report).Replace('src="images/report/', 'src="images/%FF/'), [System.Text.UTF8Encoding]::new($false))
+        $failed = @(Test-ReportIntegrity -Path $report | Where-Object { -not $_.Ok })
+        @($failed | Where-Object Detail -like "A screenshot's image address is not in the form Vouch writes*").Count | Should -Be 2
+        @($failed | Where-Object Check -like 'Image *') | Should -BeNullOrEmpty -Because 'no file is read for a refused address'
+    }
+
+    It 'Resolve-ReportImagePath takes # written as %23 as part of a name, and refuses a raw # or ?' {
+        (Resolve-ReportImagePath -ReportDirectory 'C:\r' -Source 'images/Q3%20%231/001_a_seg01.jpg').Path | Should -Be 'C:\r\images\Q3 #1\001_a_seg01.jpg'
+        (Resolve-ReportImagePath -ReportDirectory 'C:\r' -Source 'images/Q3#1/001_a_seg01.jpg').Problem | Should -BeLike '*not a plain file name*'
+        (Resolve-ReportImagePath -ReportDirectory 'C:\r' -Source 'images/Q3%3F1/001_a_seg01.jpg').Problem | Should -BeLike '*not a plain file name*'
+    }
+}
+
+Describe 'Report names: every report Vouch writes verifies (fix round 4)' {
+    It 'keeps the ordinary name <Name> as it is' -ForEach @(
+        @{ Name = 'e2e.html'; Expected = 'e2e.html' }, @{ Name = 'typed'; Expected = 'typed.html' }, @{ Name = 'Q3 report'; Expected = 'Q3 report.html' }
+        @{ Name = 'Contrôle d''accès 2026'; Expected = 'Contrôle d''accès 2026.html' }, @{ Name = 'Q3 #1 100% R&D (final) [v2]'; Expected = 'Q3 #1 100% R&D (final) [v2].html' }
+        @{ Name = 'old.htm'; Expected = 'old.htm' }, @{ Name = 'LOUD.HTML'; Expected = 'LOUD.HTML' }, @{ Name = 'v1.2 notes'; Expected = 'v1.2 notes.html' }
+    ) {
+        $file = Get-ReportFileName -Name $Name -DefaultStem 'VouchReport_x'
+        $file.Name | Should -BeExactly $Expected
+        $file.Changed | Should -BeFalse
+    }
+
+    It 'gives the default name when none is asked for, and fills tokens' {
+        (Get-ReportFileName -Name '  ' -DefaultStem 'VouchReport_x').Name | Should -Be 'VouchReport_x.html'
+        $file = Get-ReportFileName -Name '{title}: {nope}' -DefaultStem 'VouchReport_x' -Values @{ title = 'Q3/ITGC' }
+        $file.Name | Should -Be 'Q3_ITGC_ {nope}.html'
+        $file.Unknown | Should -Be @('{nope}')
+    }
+
+    It 'makes <Label> a name that Windows keeps and a linked report can be followed and verified by' -ForEach @(
+        @{ Label = 'a leading space'; Name = ' Q3'; Expected = 'Q3.html' }
+        @{ Label = 'a trailing space'; Name = 'Q3 '; Expected = 'Q3.html' }
+        @{ Label = 'a trailing dot'; Name = 'Q3.'; Expected = 'Q3.html' }
+        @{ Label = 'a trailing dot before .html'; Name = 'Q3..html'; Expected = 'Q3.html' }
+        @{ Label = 'a leading dot'; Name = '.Q3'; Expected = 'Q3.html' }
+        @{ Label = 'a no-break space at the end'; Name = "Q3$([char]0xA0)"; Expected = 'Q3.html' }
+        @{ Label = 'only dots'; Name = '...'; Expected = 'VouchReport_x.html' }
+        @{ Label = 'only dots and spaces'; Name = ' . . '; Expected = 'VouchReport_x.html' }
+        @{ Label = 'a #'; Name = 'Q3 #1'; Expected = 'Q3 #1.html' }
+        @{ Label = 'a ?'; Name = 'what?'; Expected = 'what_.html' }
+        @{ Label = 'a %'; Name = '100%'; Expected = '100%.html' }
+        @{ Label = 'a % that looks like an escape'; Name = 'a%20b %FF %zz'; Expected = 'a%20b %FF %zz.html' }
+        @{ Label = 'an &'; Name = 'R&D &amp; more'; Expected = 'R&D &amp; more.html' }
+        @{ Label = 'an apostrophe'; Name = "Jane's"; Expected = "Jane's.html" }
+        @{ Label = 'a +'; Name = 'a+b'; Expected = 'a+b.html' }
+        @{ Label = 'a ;'; Name = 'a;b'; Expected = 'a;b.html' }
+        @{ Label = 'an ='; Name = 'a=b'; Expected = 'a=b.html' }
+        @{ Label = 'an @'; Name = 'a@b'; Expected = 'a@b.html' }
+        @{ Label = 'a $'; Name = 'a$b $(x) ${y}'; Expected = 'a$b $(x) ${y}.html' }
+        @{ Label = 'a comma'; Name = 'a,b'; Expected = 'a,b.html' }
+        @{ Label = 'a !'; Name = 'a!b'; Expected = 'a!b.html' }
+        @{ Label = 'a ~'; Name = '~a~b~1'; Expected = '~a~b~1.html' }
+        @{ Label = 'square brackets'; Name = '[x] [*]'; Expected = '[x] [_].html' }
+        @{ Label = 'round brackets'; Name = '(x)'; Expected = '(x).html' }
+        @{ Label = 'a backtick and a caret'; Name = 'a`b^c'; Expected = 'a`b^c.html' }
+        @{ Label = 'letters of other languages and an emoji'; Name = "Ünïcødé 日本語 $([char]::ConvertFromUtf32(0x1F600))"; Expected = "Ünïcødé 日本語 $([char]::ConvertFromUtf32(0x1F600)).html" }
+        @{ Label = 'half a character pair'; Name = "a$([char]0xD83D)b"; Expected = 'a_b.html' }
+        @{ Label = 'a tab and a line break'; Name = "a`tb`r`nc"; Expected = 'a_b_c.html' }
+        @{ Label = 'characters Windows forbids'; Name = 'a/b\c:d*e"f<g>h|i'; Expected = 'a_b_c_d_e_f_g_h_i.html' }
+        @{ Label = 'a path out of the folder'; Name = '..\..\evil'; Expected = '_.._evil.html' }
+        @{ Label = 'the device name CON'; Name = 'CON'; Expected = '_CON.html' }
+        @{ Label = 'the device name con.html'; Name = 'con.html'; Expected = '_con.html' }
+        @{ Label = 'the device name NUL.txt'; Name = 'NUL.txt'; Expected = '_NUL.txt.html' }
+        @{ Label = 'the device name COM1'; Name = 'COM1'; Expected = '_COM1.html' }
+        @{ Label = 'the device name LPT with a superscript digit'; Name = "LPT$([char]0xB9)"; Expected = "_LPT$([char]0xB9).html" }
+        @{ Label = 'the device name CONIN$'; Name = 'CONIN$'; Expected = '_CONIN$.html' }
+        @{ Label = 'a very long name'; Name = ('Quarter 3 evidence ' * 20); Expected = $null }
+        @{ Label = 'a very long name in another script'; Name = ('日本語' * 120); Expected = $null }
+        @{ Label = 'a long name of emoji (pairs cut at the limit)'; Name = ('x' + ([char]::ConvertFromUtf32(0x1F600) * 100)); Expected = $null }
+        @{ Label = 'a mix of all of it'; Name = ' .Q3 #1 100% & [x] (y) +;=@$,!~ Ü日本''s. '; Expected = 'Q3 #1 100% & [x] (y) +;=@$,!~ Ü日本''s.html' }
+        @{ Label = 'an unknown token'; Name = 'a{nope}b'; Expected = 'a{nope}b.html' }
+        @{ Label = 'two spaces'; Name = 'a  b'; Expected = 'a b.html' }
+    ) {
+        $file = Get-ReportFileName -Name $Name -DefaultStem 'VouchReport_x'
+        if ($null -ne $Expected) { $file.Name | Should -BeExactly $Expected }
+        $stem = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+        $stem.Length | Should -BeLessOrEqual 150
+        $stem | Should -Not -Match '[\x00-\x1f\\/:*?"<>|]'
+        $stem | Should -Not -Match '^[ .]|[ .]$'
+
+        # The folder and files exactly as a capture run makes them, then the linked report.
+        $folder = Join-Path $TestDrive ([guid]::NewGuid())
+        [void](New-Item -ItemType Directory -Path $folder)
+        Assert-ReportLocation -ReportPath (Join-Path $folder $file.Name) -ImagesDir (Join-Path $folder "images\$stem")
+        $report = New-TestReport -Folder $folder -Linked -Name $stem
+        [System.IO.Path]::GetFileName($report) | Should -BeExactly "$stem.html"
+        @(Get-ChildItem -LiteralPath (Join-Path $folder 'images')).Name | Should -BeExactly @($stem) -Because 'Windows must keep the folder name as written'
+
+        $results = @(Test-ReportIntegrity -Path $report)
+        @($results | Where-Object { -not $_.Ok }) | Should -BeNullOrEmpty
+        @($results | Where-Object Check -like 'Image *').Count | Should -Be 2
+        @($results | Where-Object Check -like 'File *').Count | Should -Be 2
+
+        # What a browser does with each address: undo the %XX, look for that file.
+        $sources = @([regex]::Matches([System.IO.File]::ReadAllText($report), ' src="(images/[^"]*)"') | ForEach-Object { [System.Net.WebUtility]::HtmlDecode($_.Groups[1].Value) })
+        $sources.Count | Should -Be 2
+        foreach ($source in $sources) {
+            $source | Should -Match '^images/[A-Za-z0-9._~%-]+/[A-Za-z0-9._-]+$'
+            [System.IO.File]::Exists((Join-Path $folder ([System.Uri]::UnescapeDataString($source).Replace('/', '\')))) | Should -BeTrue -Because "$source must lead to the image"
+        }
+    }
+
+    It 'refuses, before anything is captured, a report that cannot be saved where it is asked for' {
+        $folder = Join-Path $TestDrive 'blocked'
+        [void](New-Item -ItemType Directory -Path $folder)
+        # A file where the images folder must be.
+        Set-Content -LiteralPath (Join-Path $folder 'images') -Value 'x'
+        { Assert-ReportLocation -ReportPath (Join-Path $folder 'r.html') -ImagesDir (Join-Path $folder 'images\r') } |
+            Should -Throw -ExpectedMessage "The report cannot be saved as 'r.html' in '*blocked'*Choose a shorter or simpler report name*"
+        { Assert-ReportLocation -ReportPath (Join-Path $folder 'no-such-folder\r.html') } | Should -Throw -ExpectedMessage 'The report cannot be saved as*'
+        # A name Windows would quietly change is refused rather than written somewhere else.
+        { Assert-ReportLocation -ReportPath (Join-Path $folder 'r.html') -ImagesDir (Join-Path $folder 'pictures\r.') } | Should -Throw -ExpectedMessage '*cannot keep an images folder of that name*'
+        (Join-Path $folder 'r.html') | Should -Not -Exist
+    }
+
+    It 'leaves no trace of its test, and an existing report alone' {
+        $folder = Join-Path $TestDrive 'free'
+        [void](New-Item -ItemType Directory -Path $folder)
+        Assert-ReportLocation -ReportPath (Join-Path $folder 'r.html') -ImagesDir (Join-Path $folder 'images\r')
+        (Join-Path $folder 'r.html') | Should -Not -Exist
+        (Join-Path $folder 'images\r') | Should -Exist
+        Set-Content -LiteralPath (Join-Path $folder 'r.html') -Value 'earlier report'
+        Assert-ReportLocation -ReportPath (Join-Path $folder 'r.html')
+        Get-Content -LiteralPath (Join-Path $folder 'r.html') | Should -Be 'earlier report'
+    }
+}
+
+Describe '-Verify on files that are not reports, and on very many faults (fix round 4)' {
+    BeforeAll {
+        $script:OddFolder = Join-Path $TestDrive 'odd'
+        [void](New-Item -ItemType Directory -Path $script:OddFolder)
+        $script:GenuineHtml = [System.IO.File]::ReadAllText((New-TestReport -Folder $script:OddFolder))
+        $script:Utf8 = [System.Text.UTF8Encoding]::new($false)
+    }
+
+    It 'fails <Case> as a check, without an error (exit code 4)' -ForEach @(
+        @{ Case = 'an empty file'; Bytes = { , [byte[]]@() } }
+        @{ Case = 'only a doctype'; Bytes = { , $script:Utf8.GetBytes('<!DOCTYPE html>') } }
+        @{ Case = 'binary garbage'; Bytes = { , [byte[]](0..255 * 40) } }
+        @{ Case = 'a file of NUL bytes'; Bytes = { , [byte[]]::new(5000) } }
+        @{ Case = 'an empty style sheet'; Bytes = { , $script:Utf8.GetBytes([regex]::Replace($script:GenuineHtml, '(?s)<style>.*?</style>', '<style></style>')) } }
+        @{ Case = 'a second, empty style sheet'; Bytes = { , $script:Utf8.GetBytes($script:GenuineHtml.Replace('</head>', '<style></style></head>')) } }
+        @{ Case = 'a style sheet that never ends'; Bytes = { , $script:Utf8.GetBytes($script:GenuineHtml.Replace('</style>', '')) } }
+        @{ Case = 'a genuine report saved as UTF-16'; Bytes = { , ([System.Text.Encoding]::Unicode.GetPreamble() + [System.Text.Encoding]::Unicode.GetBytes($script:GenuineHtml)) } }
+        @{ Case = 'a genuine report saved as UTF-32'; Bytes = { , ([System.Text.Encoding]::UTF32.GetPreamble() + [System.Text.Encoding]::UTF32.GetBytes($script:GenuineHtml)) } }
+        @{ Case = 'a genuine report with a byte order mark'; Bytes = { , ([byte[]](0xEF, 0xBB, 0xBF) + $script:Utf8.GetBytes($script:GenuineHtml)) } }
+        @{ Case = 'a genuine report with bytes that are not UTF-8 in its text'; Bytes = { , $script:Utf8.GetBytes($script:GenuineHtml.Replace('<footer>', '<footer>@@')) } }
+        @{ Case = 'a document cut off in the middle'; Bytes = { , $script:Utf8.GetBytes($script:GenuineHtml.Substring(0, $script:GenuineHtml.IndexOf('<h2>Evidence'))) } }
+    ) {
+        $path = Join-Path $script:OddFolder "$([guid]::NewGuid()).html"
+        $content = [byte[]](& $Bytes)
+        if ($Case -like '*not UTF-8*') {
+            # 0xC3 0x28: a lead byte followed by a byte that cannot follow it.
+            $at = [System.Text.Encoding]::ASCII.GetString($content).IndexOf('@@')
+            $content[$at] = 0xC3; $content[$at + 1] = 0x28
+        }
+        [System.IO.File]::WriteAllBytes($path, $content)
+        { $script:OddResults = @(Test-ReportIntegrity -Path $path) } | Should -Not -Throw
+        @($script:OddResults | Where-Object { -not $_.Ok }).Count | Should -BeGreaterOrEqual 1
+        Invoke-VerifyReport -Path $path 6>$null | Should -Be 4
+    }
+
+    It 'fails a linked image file of 0 bytes as a check' {
+        $folder = Join-Path $TestDrive 'zero'
+        $report = New-TestReport -Folder $folder -Linked
+        [System.IO.File]::WriteAllBytes((Join-Path $folder 'images\report\003_Admin_users_seg01.jpg'), [byte[]]@())
+        $failed = @(Test-ReportIntegrity -Path $report | Where-Object { -not $_.Ok }).Check
+        $failed | Should -Contain 'Image 003_Admin_users_seg01.jpg'
+        $failed | Should -Contain 'Metadata 003_Admin_users_seg01.jpg'
+    }
+
+    It 'stops reading a SHA256SUMS that lists one file again and again' {
+        $folder = Join-Path $TestDrive 'sums'
+        $report = New-TestReport -Folder $folder -Linked
+        $sums = Join-Path $folder 'images\report\SHA256SUMS'
+        $line = @(Get-Content -LiteralPath $sums)[0]
+        [System.IO.File]::WriteAllText($sums, ("$line`n" * 50000))
+        $results = @(Test-ReportIntegrity -Path $report)
+        @($results | Where-Object Check -like 'File *').Count | Should -Be 2
+        ($results | Where-Object Detail -like 'listed more than once*').Ok | Should -BeFalse
+    }
+
+    It 'lists the first 25 problems and says it stopped' {
+        $html = $script:GenuineHtml.Replace('<footer>', ('<x>' * 500) + '<footer>')
+        $scan = Test-ReportMarkup -Html $html
+        $scan.Problems.Count | Should -Be 26
+        $scan.Problems[0] | Should -BeLike 'The report contains a <x> element*'
+        $scan.Problems[25] | Should -Be 'The check stopped here: only the first 25 problems are listed.'
+    }
+
+    It 'names the line of each problem' {
+        $lines = $script:GenuineHtml -split "`r`n"
+        $evidence = [array]::IndexOf($lines, '<h2>Evidence</h2>')
+        $lines[$evidence] = '<h2>Evidence</h2><marquee>'
+        $lines[3] = '<meta charset="utf-8"><base>'
+        $problems = (Test-ReportMarkup -Html ($lines -join "`r`n")).Problems
+        $problems[0] | Should -BeLike "The report contains a <base> element*(line 4, at '<base>*"
+        $problems[1] | Should -BeLike "The report contains a <marquee> element*(line $($evidence + 1), at '<marquee>*"
+    }
+
+    It 'takes seconds, not minutes, over <Case>' -ForEach @(
+        @{ Case = '32,000 unknown elements in a small report'; Insert = { '<x>' * 32000 }; Base = 'small' }
+        @{ Case = '2,000 unknown elements in the 5 MB example'; Insert = { '<x>' * 2000 }; Base = 'example' }
+        @{ Case = '100,000 broken references and paragraphs in the 5 MB example'; Insert = { '<p>&</p>' * 100000 }; Base = 'example' }
+        @{ Case = '20 MB of line breaks before a fault'; Insert = { ("`n" * 20MB) + '<x>' }; Base = 'small' }
+        @{ Case = '20 MB of <'; Insert = { '<' * 20MB }; Base = 'small' }
+        @{ Case = 'one tag with 300,000 unknown attributes'; Insert = { '<p' + (' x="1"' * 300000) + '>' }; Base = 'small' }
+        @{ Case = '50,000 valid elements more (a large genuine report)'; Insert = { '<section class="item" id="item-9"><h3>x</h3>' + ('<ul class="detail-list"><li>x</li></ul>' * 25000) + '</section>' }; Base = 'small'; Valid = $true }
+    ) {
+        $html = if ($Base -eq 'example') { [System.IO.File]::ReadAllText((Join-Path -Path $PSScriptRoot -ChildPath '..\examples\live-test-2026-09-24\live-test.html')) } else { $script:GenuineHtml }
+        $html = $html.Insert($html.LastIndexOf('<footer>'), (& $Insert))
+        $path = Join-Path $script:OddFolder "$([guid]::NewGuid()).html"
+        [System.IO.File]::WriteAllText($path, $html, $script:Utf8)
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $results = @(Test-ReportIntegrity -Path $path)
+        $watch.Stop()
+        # Generous: each takes about a second on a desktop PC; before the fix they took from 20 seconds to many minutes.
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 30
+        $markup = @($results | Where-Object Check -eq 'Report markup')
+        if ($Valid) { $markup | Should -BeNullOrEmpty }
+        else {
+            $markup.Count | Should -BeGreaterOrEqual 1
+            $markup.Count | Should -BeLessOrEqual 26
+        }
     }
 }

@@ -36,6 +36,8 @@
     File name of the report (.html is added when missing). Default:
     VouchReport_<date>_<time>.html. May contain the tokens {report} (the default name),
     {title}, {date} (yyyy-MM-dd), {time} (HHmmss), {period} and {classification}.
+    Only the name, not a path: characters Windows forbids in a file name become "_",
+    and spaces and dots at its beginning and end are dropped (the run says so).
     A report of the same name in the output folder is replaced.
 
 .PARAMETER EdgeProfileDir
@@ -2857,7 +2859,8 @@ function Get-ImageMetadata {
 }
 
 function Get-Sha256Hex {
-    param([Parameter(Mandatory)][byte[]]$Bytes)
+    # Empty input is allowed: a 0-byte image file or an empty <style> has a hash too.
+    param([Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes)
     return [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant()
 }
 
@@ -5135,7 +5138,9 @@ function Get-ReportImageSource {
     <#
         The src of one image: the image itself (base64) in a self-contained report, or
         the path of its file next to the report in a linked one (images/<report>/<file>,
-        each part URL-escaped so spaces and # in a report name still resolve from disk).
+        each part URL-escaped so spaces, #, % and letters of any language in a report
+        name still resolve from disk). -Verify accepts exactly this spelling and no other
+        (Test-ReportImageFolderName), so do not change the escaping without it.
     #>
     param(
         [Parameter(Mandatory)][object]$Capture,
@@ -5780,14 +5785,19 @@ function Get-KnownReportCssHash {
         between <style> and </style>, line ends made LF). -Verify accepts a report only
         with one of these, or with one the current Get-ReportCss makes. Never remove an
         entry: reports made by that version would stop verifying.
+        The value is the KIND of report the sheet belongs to, which -Verify holds the
+        document to (Test-ReportMarkup): 'plain' (no report options: no company header,
+        logo, contents or banner - and no rule that limits a logo's size), 'options'
+        (report options, no classification) or the classification level, whose banner
+        the document must then carry.
     #>
     return [ordered]@{
-        'c777d90eb3cf23596ed8e5f857508c5165ce399b7ae03676697aae9dcd251190' = '1.3.0 (and 2.0.0 without report options)'
-        'b159902f6ac1f1e8d0d58f5ef93ebc01c7c5c4d51c33cbd831195b918fd748b4' = '2.0.0, no classification'
-        '2b4c494d2f22318be79409d18f969ae47b589600f08e2a4879eea93eec0748b1' = '2.0.0, Public'
-        '96805324fe4f2c698b02cf5e5032a077aba5d0414c36b3c3c91ae0744f061c17' = '2.0.0, Internal'
-        '550b8033a6dc5924662ff306df27e3168166bf87aa51de75392ddaf5a83d3350' = '2.0.0, Private'
-        '584a9b4957c6ba72dfa3eebea97fe71e93182fdf5564f5ace1b71255930bebf0' = '2.0.0, Confidential'
+        'c777d90eb3cf23596ed8e5f857508c5165ce399b7ae03676697aae9dcd251190' = 'plain'         # 1.3.0, and 2.0.0 without report options
+        'b159902f6ac1f1e8d0d58f5ef93ebc01c7c5c4d51c33cbd831195b918fd748b4' = 'options'       # 2.0.0
+        '2b4c494d2f22318be79409d18f969ae47b589600f08e2a4879eea93eec0748b1' = 'Public'        # 2.0.0
+        '96805324fe4f2c698b02cf5e5032a077aba5d0414c36b3c3c91ae0744f061c17' = 'Internal'      # 2.0.0
+        '550b8033a6dc5924662ff306df27e3168166bf87aa51de75392ddaf5a83d3350' = 'Private'       # 2.0.0
+        '584a9b4957c6ba72dfa3eebea97fe71e93182fdf5564f5ace1b71255930bebf0' = 'Confidential'  # 2.0.0
     }
 }
 
@@ -5799,42 +5809,106 @@ function Get-ReportCssHash {
 }
 
 function Get-CurrentReportCssHash {
-    # The style sheets this version writes: without options, and with each classification.
-    $hashes = [System.Collections.Generic.List[string]]::new()
+    # The style sheets this version writes, hash -> kind (see Get-KnownReportCssHash):
+    # without options, with options, and with each classification.
+    $hashes = [ordered]@{}
     foreach ($level in @($null, '', 'Public', 'Internal', 'Private', 'Confidential')) {
         $options = if ($null -eq $level) { $null } else { New-ReportOptions -Classification $level }
+        $kind = if ($null -eq $level) { 'plain' } elseif ($level -eq '') { 'options' } else { $level }
         # New-HtmlReport writes the sheet on lines of its own between <style> and </style>.
-        $hashes.Add((Get-ReportCssHash -Text ("`n" + (Get-ReportCss -Options $options) + "`n")))
+        $hashes[(Get-ReportCssHash -Text ("`n" + (Get-ReportCss -Options $options) + "`n"))] = $kind
     }
-    return , $hashes
+    return $hashes
 }
 
 function Get-ReportMarkupRule {
     <#
         The markup New-HtmlReport writes (Vouch 1.3 and 2.0; 1.3's is a subset, so one
-        table serves both): each element and, for each, the attributes it may carry with
-        the pattern their raw value must match. Anything not listed is not Vouch's.
+        table serves both). Anything not listed is not Vouch's.
+        Attributes: per element, the attributes it may carry with the pattern their raw
+        value must match (class values are the exact ones written, not any mix).
+        Required: attributes the generator always writes on that element.
+        Children: which elements are written directly inside which.
+        Placement: for the elements whose class decides where they belong (Placed),
+        "element.class" -> the parents ("element.class") they are written in.
+        TextIn: the elements that hold text; anywhere else only line breaks are written.
     #>
     $text = '^[^"<>]*$'
-    $class = '^(?:subtitle|meta|k|summary|hashes|contents|badge|ok|warn|fail|counts|item|item-head|notes|steps|bad|detail-list|hash|manifest|integrity-note|empty|company|logo|company-text|company-name|company-details|multiline|classification|top|bottom|cls-public|cls-internal|cls-private|cls-confidential|contents-wrap)(?: (?:subtitle|meta|k|summary|hashes|contents|badge|ok|warn|fail|counts|item|item-head|notes|steps|bad|detail-list|hash|manifest|integrity-note|empty|company|logo|company-text|company-name|company-details|multiline|classification|top|bottom|cls-public|cls-internal|cls-private|cls-confidential|contents-wrap))*$'
     $none = @{}
-    return @{
+    $attributes = @{
         html = @{ lang = '^en$' }; head = $none; body = $none; title = $none; style = $none
         meta = @{ charset = '^utf-8$'; name = '^viewport$'; content = '^width=device-width, initial-scale=1$' }
         h1 = $none; h2 = @{ id = '^contents$' }; h3 = $none
-        p = @{ class = $class; 'data-manifest-sha256' = '^(?:[0-9a-f]{64})?$' }
-        div = @{ class = $class; role = '^note$' }
-        table = @{ class = $class }; thead = $none; tbody = $none; tr = $none; th = $none; td = @{ class = $class }
-        a = @{ href = '^#(?:contents|item-[0-9]+(?:-c[0-9]+)?)$' }
-        span = @{ class = $class }; strong = $none; code = $none; br = $none
-        ul = @{ class = $class }; li = @{ class = $class }
+        p = @{ class = '^(?:subtitle|counts|integrity-note|manifest|empty)$'; 'data-manifest-sha256' = '^(?:[0-9a-f]{64})?$' }
+        div = @{ class = '^(?:meta|item-head|notes|company-text|company-name|company-details|classification (?:top|bottom) cls-(?:public|internal|private|confidential))$'; role = '^note$' }
+        table = @{ class = '^summary(?: contents| hashes)?$' }; thead = $none; tbody = $none; tr = $none; th = $none
+        td = @{ class = '^(?:k|multiline)$' }
+        a = @{ href = '^#item-[0-9]+(?:-c[0-9]+)?$' }
+        span = @{ class = '^(?:badge (?:ok|warn|fail)|hash)$' }; strong = $none; code = $none; br = $none
+        ul = @{ class = '^(?:detail-list|steps)$' }; li = @{ class = '^bad$' }
         dl = $none; dt = $none; dd = $none
         section = @{ class = '^item$'; id = '^item-[0-9]+$' }
         figure = @{ id = '^item-[0-9]+-c[0-9]+$' }; figcaption = $none
-        img = @{ alt = $text; 'data-file' = '^[A-Za-z0-9._-]*$'; 'data-sha256' = '^[0-9a-f]{64}$'; 'data-captured' = $text; 'data-url' = $text
-            src = $text; class = '^logo$'; 'data-vouch-logo' = '^true$' }
+        # data-file: Get-CaptureFileName's form, 001_Name_seg01.jpg.
+        img = @{ alt = $text; 'data-file' = '^[0-9]{3,}_[A-Za-z0-9._-]+_seg[0-9]{2,}\.(?:jpg|png)$'; 'data-sha256' = '^[0-9a-f]{64}$'
+            'data-captured' = $text; 'data-url' = $text; src = $text; class = '^logo$'; 'data-vouch-logo' = '^true$' }
         footer = $none; header = @{ class = '^company$' }; nav = @{ class = '^contents-wrap$'; 'aria-label' = '^Contents$' }
     }
+    $required = @{
+        html = @('lang'); section = @('class', 'id'); header = @('class'); nav = @('class', 'aria-label'); a = @('href')
+    }
+    $children = @{
+        html = @('head', 'body'); head = @('meta', 'title', 'style')
+        body = @('div', 'header', 'h1', 'p', 'nav', 'h2', 'table', 'section', 'footer')
+        header = @('img', 'div'); nav = @('h2', 'table'); div = @('table', 'h2', 'span', 'strong', 'div')
+        table = @('thead', 'tbody', 'tr'); thead = @('tr'); tbody = @('tr'); tr = @('th', 'td')
+        td = @('a', 'span', 'br', 'ul', 'code'); ul = @('li'); li = @('a', 'code')
+        p = @('span', 'strong', 'code', 'br'); span = @('strong', 'span')
+        section = @('div', 'dl', 'h3', 'ul', 'p', 'figure'); dl = @('dt', 'dd')
+        figure = @('img', 'figcaption'); figcaption = @('strong', 'br', 'span')
+    }
+    $placement = @{
+        'div.meta' = @('body.'); 'div.item-head' = @('section.item'); 'div.notes' = @('section.item')
+        'div.company-text' = @('header.company'); 'div.company-name' = @('div.company-text'); 'div.company-details' = @('div.company-text')
+        'p.subtitle' = @('body.'); 'p.counts' = @('body.'); 'p.integrity-note' = @('body.'); 'p.manifest' = @('body.'); 'p.empty' = @('section.item')
+        'table.' = @('div.meta'); 'table.summary' = @('body.'); 'table.summary hashes' = @('body.'); 'table.summary contents' = @('nav.contents-wrap')
+        'ul.' = @('td.'); 'ul.detail-list' = @('section.item'); 'ul.steps' = @('section.item')
+        'h2.' = @('body.', 'div.item-head', 'nav.contents-wrap')
+        'span.' = @('p.counts'); 'span.hash' = @('figcaption.')
+    }
+    foreach ($badge in 'ok', 'warn', 'fail') { $placement["span.badge $badge"] = @('td.', 'span.', 'div.item-head') }
+    foreach ($level in 'public', 'internal', 'private', 'confidential') {
+        $placement["div.classification top cls-$level"] = @('body.')
+        $placement["div.classification bottom cls-$level"] = @('body.')
+    }
+    $textIn = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($name in 'title', 'h1', 'h2', 'h3', 'p', 'div', 'td', 'th', 'a', 'span', 'strong', 'code', 'li', 'dt', 'dd', 'figcaption', 'footer') { [void]$textIn.Add($name) }
+    return [pscustomobject]@{
+        Attributes = $attributes; Required = $required; Children = $children
+        Placed = @{ div = 1; p = 1; table = 1; ul = 1; h2 = 1; span = 1 }; Placement = $placement; TextIn = $textIn
+    }
+}
+
+function Test-ReportImageFolderName {
+    <#
+        Whether the folder part of a linked image's address is exactly what the generator
+        writes: EscapeDataString of a folder name Windows holds as written. Only that one
+        spelling is accepted, because for any other a browser and .NET may not mean the
+        same folder: %FF (not UTF-8) stays the three characters "%FF" for .NET but is the
+        letter y-umlaut for Edge; %2e%2e is ".." for both, yet never what Vouch wrote.
+        Round-tripping through the generator's own encoder leaves exactly the valid,
+        upper-case UTF-8 escapes of a real name.
+    #>
+    param([AllowEmptyString()][string]$Segment = '')
+    if ($Segment -cnotmatch '^[A-Za-z0-9._~%-]+$') { return $false }
+    try {
+        $name = [System.Uri]::UnescapeDataString($Segment)
+        if ([System.Uri]::EscapeDataString($name) -cne $Segment) { return $false }
+    }
+    catch { return $false }
+    if ($name -match '[\x00-\x1f\\/:*?"<>|]') { return $false }
+    # Windows drops dots and spaces at the end of a name: "x." and "x" would be one folder.
+    return -not ($name.EndsWith('.') -or $name.EndsWith(' '))
 }
 
 function Test-ReportMarkup {
@@ -5843,166 +5917,313 @@ function Test-ReportMarkup {
         whitelist over the whole document, not by reading it the way a browser would. The
         raw text is cut into tokens of the generator's strict grammar: the exact
         <!DOCTYPE html>, start tags <name( attr="value")*>, end tags </name>, and text
-        without < or >. Element and attribute names and values must be in
-        Get-ReportMarkupRule; character references only those Encode-Html (and the
-        generator's own text) writes; the one <style> must be a style sheet Vouch writes
-        (Get-KnownReportCssHash / Get-ReportCss). Then the structure: one html, head,
-        body, title, h1; every <img> is either a screenshot inside <section class="item">
-        <figure> (exact screenshot attributes, generator-form src) or the one logo, the
-        first thing in <header class="company"> at the top of <body>.
-        Returns { Images (each { Attributes (decoded); Position; Kind }); Problems }.
+        without < or >. Element and attribute names, values, nesting and places must be
+        in Get-ReportMarkupRule; character references only those Encode-Html (and the
+        generator's own text) writes. The one <style> must be a style sheet Vouch writes
+        (Get-KnownReportCssHash / Get-ReportCss), and the document must be the KIND of
+        report that sheet belongs to: the parts of <body> in the generator's order, the
+        company header, logo, contents and linked images only with the sheet of a report
+        with options (the one that limits the logo's size), and the classification
+        banners exactly with the sheet of that level. Every <img> is either a screenshot
+        inside the <section class="item"> of its page, in a <figure> (exact attributes,
+        generator-form src), or the one logo, first thing in <header class="company">.
+        Never throws and never takes long: it stops listing after a few problems, and
+        naming their places costs one pass over the text.
+        Returns { Images (each { Attributes (decoded); Position; Kind }); Problems;
+        Kind (of the style sheet); Manifest (the manifest hash the report states) }.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Html)
     $images = [System.Collections.Generic.List[object]]::new()
     $problems = [System.Collections.Generic.List[string]]::new()
+    $result = [pscustomobject]@{ Images = $images; Problems = $problems; Kind = ''; Manifest = '' }
+    if (-not $Html.StartsWith('<!DOCTYPE html>', [System.StringComparison]::Ordinal)) {
+        $problems.Add('The report does not start the way Vouch writes it (<!DOCTYPE html>).')
+        return $result
+    }
+    # A hostile file can hold any number of faults; the first ones say enough.
+    $limit = 25
+    $seen = @{ At = 0; Line = 1 }
     $where = {
         param([int]$Index)
-        $line = 1 + ([regex]::Matches($Html.Substring(0, [Math]::Min($Index, $Html.Length)), "`n")).Count
+        # Lines are counted on from the last place named, not from the top each time.
+        $Index = [Math]::Max(0, [Math]::Min($Index, $Html.Length))
+        if ($Index -lt $seen.At) { $seen.At = 0; $seen.Line = 1 }
+        $between = $Html.Substring($seen.At, $Index - $seen.At)
+        $seen.Line += $between.Length - $between.Replace("`n", '').Length
+        $seen.At = $Index
         $snippet = $Html.Substring($Index, [Math]::Min(70, $Html.Length - $Index)) -replace '\s+', ' '
-        "line $line, at '$snippet'"
+        "line $($seen.Line), at '$snippet'"
     }
-    $rules = Get-ReportMarkupRule
-    $void = @('meta', 'br', 'img')
+    $rule = Get-ReportMarkupRule
+    # Plain variables for what the loop reads at every tag: the loop is the whole cost
+    # of checking a large report.
+    $ruleAttributes = $rule.Attributes; $ruleRequired = $rule.Required; $ruleChildren = $rule.Children
+    $rulePlaced = $rule.Placed; $rulePlacement = $rule.Placement; $textIn = $rule.TextIn
+    $special = @{ div = 1; p = 1; h2 = 1; style = 1; img = 1; meta = 1; figure = 1; td = 1; a = 1; section = 1; header = 1 }
+    $noAttributes = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
+    $noRaw = @{}
+    $void = @{ meta = 1; br = 1; img = 1 }
     $badReference = [regex]'&(?!(?:amp|lt|gt|quot|#39|mdash|middot);)'
     $tokens = [regex]::new('(?<doctype><!DOCTYPE html>)|</(?<end>[a-z][a-z0-9]*)>|<(?<start>[a-z][a-z0-9]*)(?<attributes>(?: [a-z][a-z0-9-]*="[^"<>]*")*)>|(?<text>[^<>]+)')
     $attributePattern = [regex]' ([a-z][a-z0-9-]*)="([^"<>]*)"'
-    $screenshotNames = @('alt', 'data-captured', 'data-file', 'data-sha256', 'data-url', 'src')
-    $logoNames = @('alt', 'class', 'data-vouch-logo', 'src')
     $counts = @{}
-    $stack = [System.Collections.Generic.List[object]]::new()
-    $bodyChildren = 0
-    $firstBodyChild = ''
+    # The open elements: the name and "name.class" of each.
+    $names = [System.Collections.Generic.List[string]]::new()
+    $keys = [System.Collections.Generic.List[string]]::new()
+    $sectionId = ''
+    $headerChildren = 0
+    $htmlParts = [System.Collections.Generic.List[string]]::new()
+    $headParts = [System.Collections.Generic.List[string]]::new()
+    $bodyParts = [System.Collections.Generic.List[string]]::new()
+    $kind = ''
+    $currentSheets = $null
+    $sourceForm = $null
+    $banner = 0
+    $bannerText = ''
     $position = 0
     $styleEnd = -1
+    $stopped = $false
 
     foreach ($token in $tokens.Matches($Html)) {
         if ($token.Index -lt $styleEnd) { continue }
+        if ($problems.Count -ge $limit) { $stopped = $true; break }
         if ($token.Index -ne $position) {
             $problems.Add("The report contains markup Vouch never writes ($(& $where $position)).")
+            $stopped = $true
             break
         }
         $position = $token.Index + $token.Length
+        $depth = $names.Count
+        $isText = $Html[$token.Index] -cne '<'
+        $isEnd = -not $isText -and $Html[$token.Index + 1] -ceq '/'
 
-        if ($token.Groups['doctype'].Success) {
-            if ($token.Index -ne 0) { $problems.Add("The report has a second document type ($(& $where $token.Index)).") }
+        # A classification banner holds its level's text and nothing else.
+        if ($banner -eq 1) {
+            $banner = 2
+            if (-not $isText -or $token.Value -cne $bannerText) { $problems.Add("A classification banner does not read $bannerText, as its style does ($(& $where $token.Index)).") }
+        }
+        elseif ($banner -eq 2) {
+            $banner = 0
+            if (-not $isEnd) { $problems.Add("A classification banner holds more than its text ($(& $where $token.Index)).") }
+        }
+
+        if ($isText) {
+            $value = $token.Value
+            if ($value.IndexOf('&') -ge 0) {
+                $bad = $badReference.Match($value)
+                if ($bad.Success) { $problems.Add("The report contains a character reference or & that Vouch never writes ($(& $where ($token.Index + $bad.Index))).") }
+            }
+            if (($depth -eq 0 -or -not $textIn.Contains($names[$depth - 1])) -and $value.Trim().Length -gt 0) {
+                $problems.Add("The report has text where Vouch writes none ($(& $where $token.Index)).")
+            }
             continue
         }
-        if ($token.Groups['text'].Success) {
-            $bad = $badReference.Match($token.Value)
-            if ($bad.Success) { $problems.Add("The report contains a character reference or & that Vouch never writes ($(& $where ($token.Index + $bad.Index)))."); }
-            continue
-        }
-        if ($token.Groups['end'].Success) {
+        if ($isEnd) {
             $name = $token.Groups['end'].Value
-            if ($stack.Count -eq 0 -or $stack[$stack.Count - 1].Name -ne $name) {
+            if ($depth -eq 0 -or $names[$depth - 1] -cne $name) {
                 $problems.Add("The report's elements are not nested the way Vouch writes them (</$name>; $(& $where $token.Index)).")
+                $stopped = $true
                 break
             }
-            $stack.RemoveAt($stack.Count - 1)
+            $names.RemoveAt($depth - 1); $keys.RemoveAt($depth - 1)
+            continue
+        }
+        if ($Html[$token.Index + 1] -ceq '!') {
+            if ($token.Index -ne 0) { $problems.Add("The report has a second document type ($(& $where $token.Index)).") }
             continue
         }
 
         # A start tag.
         $name = $token.Groups['start'].Value
-        if (-not $rules.ContainsKey($name)) {
+        $allowed = $ruleAttributes[$name]
+        if ($null -eq $allowed) {
             $problems.Add("The report contains a <$name> element, which Vouch never writes ($(& $where $token.Index)).")
             continue
         }
         $counts[$name] = 1 + [int]$counts[$name]
-        $attributes = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
-        $raw = @{}
-        foreach ($match in $attributePattern.Matches($token.Groups['attributes'].Value)) {
-            $attribute = $match.Groups[1].Value
-            $value = $match.Groups[2].Value
-            if ($attributes.ContainsKey($attribute)) { $problems.Add("The report has a <$name> with the attribute $attribute twice ($(& $where $token.Index))."); continue }
-            if (-not $rules[$name].ContainsKey($attribute)) { $problems.Add("The report has a <$name> with the attribute $attribute, which Vouch never writes ($(& $where $token.Index))."); continue }
-            if ($value -cnotmatch $rules[$name][$attribute]) { $problems.Add("The report has a <$name> whose $attribute is not a value Vouch writes ($(& $where $token.Index))."); continue }
-            $bad = $badReference.Match($value)
-            if ($bad.Success) { $problems.Add("The report contains a character reference or & that Vouch never writes ($(& $where $token.Index))."); continue }
-            $raw[$attribute] = $value
-            $attributes[$attribute] = [System.Net.WebUtility]::HtmlDecode($value)
+        $attributes = $noAttributes
+        $raw = $noRaw
+        if ($token.Groups['attributes'].Length -gt 0) {
+            $attributes = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
+            $raw = @{}
+            $attributeText = $token.Groups['attributes'].Value
+            foreach ($match in $attributePattern.Matches($attributeText)) {
+                if ($problems.Count -ge $limit) { break }
+                $attribute = $match.Groups[1].Value
+                $value = $match.Groups[2].Value
+                if ($attributes.ContainsKey($attribute)) { $problems.Add("The report has a <$name> with the attribute $attribute twice ($(& $where $token.Index))."); continue }
+                if (-not $allowed.ContainsKey($attribute)) { $problems.Add("The report has a <$name> with the attribute $attribute, which Vouch never writes ($(& $where $token.Index))."); continue }
+                if ($value -cnotmatch $allowed[$attribute]) { $problems.Add("The report has a <$name> whose $attribute is not a value Vouch writes ($(& $where $token.Index))."); continue }
+                if ($value.IndexOf('&') -ge 0 -and $badReference.IsMatch($value)) { $problems.Add("The report contains a character reference or & that Vouch never writes ($(& $where $token.Index))."); continue }
+                $raw[$attribute] = $value
+                $attributes[$attribute] = if ($value.IndexOf('&') -ge 0) { [System.Net.WebUtility]::HtmlDecode($value) } else { $value }
+            }
         }
-        $parents = if ($name -in 'meta', 'title', 'style', 'img', 'header') { (@($stack.Name) -join '>') } else { '' }
-        $parent = if ($stack.Count -gt 0) { $stack[$stack.Count - 1] } else { $null }
-        if ($null -ne $parent -and $parent.Name -eq 'body') {
-            $bodyChildren++
-            if ($bodyChildren -eq 1) { $firstBodyChild = "$name.$($raw['class'])" }
+        if ($ruleRequired.ContainsKey($name)) {
+            foreach ($attribute in $ruleRequired[$name]) {
+                if (-not $raw.ContainsKey($attribute)) { $problems.Add("The report has a <$name> without the $attribute Vouch always writes ($(& $where $token.Index)).") }
+            }
         }
+        $class = [string]$raw['class']
+        $key = "$name.$class"
+        $parentName = ''
+        $parentKey = ''
+        if ($depth -gt 0) { $parentName = $names[$depth - 1]; $parentKey = $keys[$depth - 1] }
 
-        switch ($name) {
-            'meta' {
-                $set = (@($attributes.Keys | Sort-Object) -join ',')
-                if ($set -notin 'charset', 'content,name' -or $parents -ne 'html>head') { $problems.Add("The report has a <meta> Vouch never writes ($(& $where $token.Index)).") }
+        # Where it is: inside the right kind of element, and for the parts told apart by
+        # their class, inside the very part the generator writes them in.
+        if ($depth -eq 0) {
+            if ($name -cne 'html') { $problems.Add("The report has a <$name> outside its <html> ($(& $where $token.Index)).") }
+        }
+        elseif ($ruleChildren[$parentName] -cnotcontains $name) {
+            $problems.Add("The report has a <$name> directly inside a <$parentName>, where Vouch never writes one ($(& $where $token.Index)).")
+        }
+        elseif ($rulePlaced.ContainsKey($name) -and $rulePlacement[$key] -cnotcontains $parentKey) {
+            $problems.Add("The report has a <$name> (class ""$class"") in a place where Vouch never writes one ($(& $where $token.Index)).")
+        }
+        if ($depth -le 2) {
+            if ($parentName -ceq 'body') { $bodyParts.Add($key) }
+            elseif ($parentName -ceq 'html') { $htmlParts.Add($name) }
+            elseif ($parentName -ceq 'head') { $headParts.Add($(if ($name -ceq 'meta') { 'meta:' + (@($raw.Keys | Sort-Object) -join ',') } else { $name })) }
+        }
+        if ($parentName -ceq 'header') { $headerChildren++ }
+
+        if (-not $special.ContainsKey($name)) { }
+        elseif ($name -ceq 'figure' -or $name -ceq 'td' -or $name -ceq 'a') {
+            # A report without report options has none of what the options add.
+            if ($kind -ceq 'plain' -and (($name -ceq 'figure' -and $raw.ContainsKey('id')) -or $key -ceq 'td.multiline' -or ($name -ceq 'a' -and $parentName -ceq 'li'))) {
+                $problems.Add("The report has a part only a report with report options has, but its styles are those of a report without them ($(& $where $token.Index)).")
             }
-            { $_ -in 'title', 'style' } {
-                if ($parents -ne 'html>head') { $problems.Add("The report's <$name> is not in its <head> ($(& $where $token.Index)).") }
+        }
+        elseif ($name -ceq 'section') { $sectionId = [string]$raw['id'] }
+        elseif ($name -ceq 'header') { $headerChildren = 0 }
+        elseif ($name -ceq 'div') {
+            $isBanner = $key.StartsWith('div.classification ', [System.StringComparison]::Ordinal)
+            if ($raw.ContainsKey('role') -ne $isBanner) { $problems.Add("The report has a <div> whose role is not as Vouch writes it ($(& $where $token.Index)).") }
+            if ($isBanner) { $banner = 1; $bannerText = ($class -replace '^.*cls-', '').ToUpperInvariant() }
+        }
+        elseif ($name -ceq 'p') {
+            if ($raw.ContainsKey('data-manifest-sha256') -ne ($key -ceq 'p.manifest')) { $problems.Add("The report's manifest hash is not where Vouch writes it ($(& $where $token.Index)).") }
+            elseif ($key -ceq 'p.manifest') { $result.Manifest = $raw['data-manifest-sha256'] }
+        }
+        elseif ($name -ceq 'h2') {
+            if ($raw.ContainsKey('id') -ne ($parentName -ceq 'nav')) { $problems.Add("The report has a heading whose id is not as Vouch writes it ($(& $where $token.Index)).") }
+        }
+        elseif ($name -ceq 'style') {
+            $close = $Html.IndexOf('</style>', $position, [System.StringComparison]::Ordinal)
+            if ($close -lt 0) {
+                $problems.Add("The report's <style> never ends ($(& $where $token.Index)).")
+                $stopped = $true
+                break
             }
-            'style' {
-                $close = $Html.IndexOf('</style>', $position, [System.StringComparison]::Ordinal)
-                if ($close -lt 0) { $problems.Add("The report's <style> never ends ($(& $where $token.Index))."); $position = $Html.Length; $styleEnd = $Html.Length; break }
-                $hash = Get-ReportCssHash -Text $Html.Substring($position, $close - $position)
-                if (-not (Get-KnownReportCssHash).Contains($hash) -and -not (Get-CurrentReportCssHash).Contains($hash)) {
-                    $problems.Add("The report's styles (CSS) are not a style sheet Vouch writes (SHA-256 $hash).")
-                }
-                $position = $close
-                $styleEnd = $close
+            $hash = Get-ReportCssHash -Text $Html.Substring($position, $close - $position)
+            $sheet = (Get-KnownReportCssHash)[$hash]
+            if (-not $sheet) {
+                if ($null -eq $currentSheets) { $currentSheets = Get-CurrentReportCssHash }
+                $sheet = $currentSheets[$hash]
             }
-            'img' {
-                $names = (@($attributes.Keys | Sort-Object) -join ',')
-                if ($names -eq ($screenshotNames -join ',')) {
-                    $source = $raw['src']
-                    $embedded = $source -cmatch '^data:image/(?:jpeg|png);base64,[A-Za-z0-9+/=]+$'
-                    $linked = $source -cmatch '^images/[A-Za-z0-9._~%-]+/[A-Za-z0-9._-]+\.(?:jpg|png)$'
-                    if ($linked) {
-                        # The folder part as the file system sees it: no separators, controls
-                        # or edge spaces may appear once %XX is decoded.
-                        $folder = [System.Uri]::UnescapeDataString($source.Split('/')[1])
-                        if ($folder -match '[\x00-\x1f\\/:]' -or $folder -cne $folder.Trim()) { $linked = $false }
-                    }
-                    if (-not ($embedded -or $linked)) {
-                        $problems.Add("A screenshot's image address is not in the form Vouch writes ($(& $where $token.Index)).")
-                    }
-                    elseif ($parents -notmatch '^html>body>section>figure$' -or $stack[2].Class -ne 'item') {
-                        $problems.Add("A screenshot is not inside the report's evidence section ($(& $where $token.Index)).")
-                    }
-                    else {
-                        $images.Add([pscustomobject]@{ Attributes = $attributes; Position = $token.Index; Kind = 'screenshot' })
-                    }
-                }
-                elseif ($names -eq ($logoNames -join ',')) {
-                    $headerStart = $null -ne $parent -and $parent.Name -eq 'header' -and $parent.Children -eq 0
-                    if (-not $headerStart -or $parents -ne 'html>body>header') {
-                        $problems.Add("The company logo is not at the start of the report's header ($(& $where $token.Index)).")
-                    }
-                    elseif ($raw['src'] -cnotmatch '^data:image/(?:png|jpeg|gif|svg\+xml);base64,[A-Za-z0-9+/=]+$') {
-                        $problems.Add("The company logo is not an image stored inside the report ($(& $where $token.Index)).")
-                    }
-                    else {
-                        $images.Add([pscustomobject]@{ Attributes = $attributes; Position = $token.Index; Kind = 'logo' })
-                    }
+            if (-not $sheet) { $problems.Add("The report's styles (CSS) are not a style sheet Vouch writes (SHA-256 $hash).") }
+            elseif ([int]$counts['style'] -eq 1) { $kind = [string]$sheet }
+            $position = $close
+            $styleEnd = $close
+        }
+        elseif ($name -ceq 'img') {
+            $set = (@($attributes.Keys | Sort-Object) -join ',')
+            $place = $names -join '>'
+            if ($set -ceq 'alt,data-captured,data-file,data-sha256,data-url,src') {
+                # Stored inside the report, or the file images/<report>/<data-file> next to it.
+                $source = $raw['src']
+                $form = ''
+                if ($source.StartsWith('data:', [System.StringComparison]::Ordinal)) {
+                    if ($source -cmatch '^data:image/(?:jpeg|png);base64,[A-Za-z0-9+/=]+$') { $form = 'data:' }
                 }
                 else {
-                    $problems.Add("An image is neither a screenshot with its hash nor the company logo ($(& $where $token.Index)).")
+                    $linked = [regex]::Match($source, '^images/([^/]+)/([^/]+)$')
+                    if ($linked.Success -and $linked.Groups[2].Value -ceq $raw['data-file'] -and (Test-ReportImageFolderName -Segment $linked.Groups[1].Value)) {
+                        $form = $linked.Groups[1].Value
+                    }
+                }
+                if (-not $form) {
+                    $problems.Add("A screenshot's image address is not in the form Vouch writes ($(& $where $token.Index)).")
+                }
+                elseif ($place -cne 'html>body>section>figure' -or $keys[2] -cne 'section.item') {
+                    $problems.Add("A screenshot is not inside the report's evidence section ($(& $where $token.Index)).")
+                }
+                elseif (($raw['data-file'] -replace '_.*$').TrimStart('0') -cne ($sectionId -replace '^item-').TrimStart('0')) {
+                    $problems.Add("A screenshot is not in the section of the page it was taken of ($(& $where $token.Index)).")
+                }
+                elseif ($kind -ceq 'plain' -and $form -cne 'data:') {
+                    $problems.Add("The report links its screenshots, which only a report with report options does, but its styles are those of a report without them ($(& $where $token.Index)).")
+                }
+                elseif ($null -ne $sourceForm -and $sourceForm -cne $form) {
+                    $problems.Add("The report's screenshots are not all stored the same way, or not all in one folder ($(& $where $token.Index)).")
+                }
+                else {
+                    $sourceForm = $form
+                    $images.Add([pscustomobject]@{ Attributes = $attributes; Position = $token.Index; Kind = 'screenshot' })
                 }
             }
-            'header' {
-                # The header (and with it the logo) is the first thing in <body>, or the second
-                # after the top classification banner.
-                $atTop = $parents -eq 'html>body' -and ($bodyChildren -eq 1 -or ($bodyChildren -eq 2 -and $firstBodyChild -like 'div.classification top *'))
-                if (-not $atTop) { $problems.Add("The report's header is not at its top ($(& $where $token.Index)).") }
+            elseif ($set -ceq 'alt,class,data-vouch-logo,src' -and $raw['alt'] -ceq 'Company logo') {
+                # $headerChildren counts this image too: 1 means nothing is before it.
+                if ($place -cne 'html>body>header' -or $parentKey -cne 'header.company' -or $headerChildren -ne 1) {
+                    $problems.Add("The company logo is not at the start of the report's header ($(& $where $token.Index)).")
+                }
+                elseif ($raw['src'] -cnotmatch '^data:image/(?:png|jpeg|gif|svg\+xml);base64,[A-Za-z0-9+/=]+$') {
+                    $problems.Add("The company logo is not an image stored inside the report ($(& $where $token.Index)).")
+                }
+                else {
+                    $images.Add([pscustomobject]@{ Attributes = $attributes; Position = $token.Index; Kind = 'logo' })
+                }
+            }
+            else {
+                $problems.Add("An image is neither a screenshot with its hash nor the company logo ($(& $where $token.Index)).")
             }
         }
-        if ($null -ne $parent) { $parent.Children++ }
-        if ($name -notin $void) { $stack.Add([pscustomobject]@{ Name = $name; Class = [string]$raw['class']; Children = 0 }) }
+        elseif ($name -ceq 'meta') {
+            if ((@($raw.Keys | Sort-Object) -join ',') -notin 'charset', 'content,name') { $problems.Add("The report has a <meta> Vouch never writes ($(& $where $token.Index)).") }
+        }
+
+        if (-not $void.ContainsKey($name)) { $names.Add($name); $keys.Add($key) }
     }
-    if ($problems.Count -eq 0 -and $position -ne $Html.Length) { $problems.Add("The report contains markup Vouch never writes ($(& $where $position)).") }
-    if ($problems.Count -eq 0 -and $stack.Count -gt 0) { $problems.Add("The report's <$($stack[$stack.Count - 1].Name)> is never closed.") }
-    if (-not $Html.StartsWith('<!DOCTYPE html>', [System.StringComparison]::Ordinal)) { $problems.Add('The report does not start the way Vouch writes it (<!DOCTYPE html>).') }
-    foreach ($name in 'html', 'head', 'body', 'title', 'style', 'h1') {
-        if ([int]$counts[$name] -ne 1) { $problems.Add("The report has $([int]$counts[$name]) <$name> element(s); Vouch writes exactly one.") }
+
+    if ($problems.Count -ge $limit) { $stopped = $true }
+    if (-not $stopped) {
+        if ($position -ne $Html.Length) { $problems.Add("The report contains markup Vouch never writes ($(& $where $position))."); $stopped = $true }
+        elseif ($names.Count -gt 0) { $problems.Add("The report's <$($names[$names.Count - 1])> is never closed."); $stopped = $true }
     }
-    if ([int]$counts['header'] -gt 1) { $problems.Add("The report has $($counts['header']) headers; Vouch writes at most one.") }
-    return [pscustomobject]@{ Images = $images; Problems = $problems }
+    if (-not $stopped) {
+        # The whole document was read: is it built the way the generator builds one?
+        foreach ($name in 'html', 'head', 'body', 'title', 'style', 'h1') {
+            if ([int]$counts[$name] -ne 1) { $problems.Add("The report has $([int]$counts[$name]) <$name> element(s); Vouch writes exactly one.") }
+        }
+        if (($htmlParts -join ' ') -cne 'head body' -or ($headParts -join ' ') -cne 'meta:charset meta:content,name title style') {
+            $problems.Add("The report's <head> and <body> are not set out the way Vouch writes them.")
+        }
+        if ($kind) {
+            # New-HtmlReport's order, for the kind of report the style sheet belongs to.
+            $level = if ($kind -cin 'plain', 'options') { '' } else { $kind.ToLowerInvariant() }
+            $withOptions = $kind -cne 'plain'
+            $pattern = '\A' +
+                $(if ($level) { "div\.classification top cls-$level\n" }) +
+                $(if ($withOptions) { '(?:header\.company\n)?' }) +
+                'h1\.\np\.subtitle\ndiv\.meta\n' +
+                $(if ($withOptions) { '(?:nav\.contents-wrap\n)?' }) +
+                'h2\.\np\.counts\ntable\.summary\nh2\.\np\.integrity-note\n' +
+                $(if ($withOptions) { 'p\.integrity-note\n' }) +
+                'p\.manifest\ntable\.summary hashes\nh2\.\n(?:section\.item\n)*footer\.\n' +
+                $(if ($level) { "div\.classification bottom cls-$level\n" }) + '\z'
+            if ((($bodyParts -join "`n") + "`n") -cnotmatch $pattern) {
+                $what = if ($level) { "a report classified $kind" } elseif ($withOptions) { 'a report with report options and no classification' } else { 'a report without report options' }
+                $problems.Add("The report's parts are not the ones Vouch writes, in its order, for the styles it has (those of $what): classification banner, company header, title, run details, contents, summary, integrity, evidence, footer, banner.")
+            }
+        }
+    }
+    if ($problems.Count -ge $limit) {
+        if ($problems.Count -gt $limit) { $problems.RemoveRange($limit, $problems.Count - $limit) }
+        $problems.Add("The check stopped here: only the first $limit problems are listed.")
+    }
+    $result.Kind = $kind
+    return $result
 }
 
 function Resolve-ReportImagePath {
@@ -6028,12 +6249,15 @@ function Resolve-ReportImagePath {
     catch { return (& $refuse "its image address '$Source' cannot be read") }
     if ($relative -cne $relative.Trim()) { return (& $refuse "its image address '$Source' starts or ends with a space") }
 
+    # A raw # starts a fragment for a browser; written as %23 it is part of a folder's
+    # name (a report called "Q3 #1"), which is how the generator writes it.
+    if ($Source.Contains('#')) { return (& $refuse "its image '$Source' is not a plain file name (it has a ? or #)") }
     foreach ($text in @($Source, $relative)) {
         if ($text -match '^[A-Za-z]:') { return (& $refuse "its image '$Source' is on a drive of this computer, not next to the report; only images in the report's own folder are checked") }
         if ($text -match '^[A-Za-z][A-Za-z0-9+\-]*:') { return (& $refuse "its image '$Source' is a web or other address, not a file next to the report; only images in the report's own folder are checked") }
         if ($text -match '^[\\/]') { return (& $refuse "its image '$Source' is not inside the report's folder (a rooted or network path); only images in the report's own folder are checked") }
         if ($text.Contains(':')) { return (& $refuse "its image '$Source' is not a plain file name") }
-        if ($text -match '[?#]') { return (& $refuse "its image '$Source' is not a plain file name (it has a ? or #)") }
+        if ($text.Contains('?')) { return (& $refuse "its image '$Source' is not a plain file name (it has a ? or #)") }
         if ($text -match '[\x00-\x1f]') { return (& $refuse "its image '$Source' contains control characters") }
     }
     try {
@@ -6065,107 +6289,128 @@ function Test-ReportIntegrity {
     param([Parameter(Mandatory)][string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Report not found: $Path" }
-    $Path = (Resolve-Path -LiteralPath $Path).ProviderPath
-    $reportDirectory = Split-Path -Path $Path -Parent
-    $html = [System.IO.File]::ReadAllText($Path)
     $results = [System.Collections.Generic.List[object]]::new()
     $add = { param($Check, $Ok, $Detail) $results.Add([pscustomobject]@{ Check = $Check; Ok = [bool]$Ok; Detail = $Detail }) }
 
-    # Whitelist: the report may contain only markup and styles Vouch writes, so every
-    # picture it can show is a screenshot checked below or the one header logo.
-    $scan = Test-ReportMarkup -Html $html
-    foreach ($problem in $scan.Problems) {
-        $check = if ($problem -like "The report's styles*") { 'Report styles' } else { 'Report markup' }
-        & $add $check $false $problem
-    }
-    $images = @($scan.Images | Where-Object Kind -eq 'screenshot')
-    if ($images.Count -eq 0) { & $add 'Report' $false 'No hashed screenshots found - not a Vouch 1.2+ report, or it has no captures.' }
-
-    $manifestLines = [System.Collections.Generic.List[string]]::new()
-    $number = 0
-    foreach ($image in $images) {
-        $number++
-        $attributes = $image.Attributes
-        $read = { param($Name) if ($attributes.ContainsKey($Name)) { [string]$attributes[$Name] } else { '' } }
-        $file = & $read 'data-file'
-        $listed = & $read 'data-sha256'
-        $label = if ($file) { $file } else { "#$number" }
-        $manifestLines.Add("$listed  $file")
-        if ($listed -cnotmatch '^[0-9a-f]{64}$') {
-            & $add "Image $label" $false 'the report lists no valid SHA-256 hash for it'
-            continue
+    # Whatever the file holds, the answer is a list of checks: a file that cannot be read
+    # as a report fails a check; -Verify never ends with an error over a file's contents.
+    try {
+        $Path = (Resolve-Path -LiteralPath $Path).ProviderPath
+        $reportDirectory = Split-Path -Path $Path -Parent
+        # Vouch writes UTF-8 without a byte order mark, and the report says so itself
+        # (<meta charset>). Read exactly as that, and refuse anything else: with another
+        # mark or with bytes that are not UTF-8, .NET and a browser can read two
+        # different documents out of one file.
+        try { $html = [System.Text.UTF8Encoding]::new($false, $true).GetString([System.IO.File]::ReadAllBytes($Path)) }
+        catch [System.ArgumentException] { $html = $null }
+        if ($null -eq $html -or ($html.Length -gt 0 -and $html[0] -eq [char]0xFEFF)) {
+            & $add 'Report markup' $false 'The report is not plain UTF-8 text without a byte order mark, which is how Vouch writes it.'
+            return $results
         }
 
+        # Whitelist: the report may contain only markup and styles Vouch writes, so every
+        # picture it can show is a screenshot checked below or the one header logo.
+        $scan = Test-ReportMarkup -Html $html
+        foreach ($problem in $scan.Problems) {
+            $check = if ($problem -like "The report's styles*") { 'Report styles' } else { 'Report markup' }
+            & $add $check $false $problem
+        }
+        $images = @($scan.Images | Where-Object Kind -eq 'screenshot')
+        if ($images.Count -eq 0) { & $add 'Report' $false 'No hashed screenshots found - not a Vouch 1.2+ report, or it has no captures.' }
 
-        $bytes = $null
-        $source = & $read 'src'
-        try {
-            if ($source -match '^\s*data:') {
-                $embedded = [regex]::Match($source, '^\s*data:image/(?:jpeg|png);base64,([A-Za-z0-9+/=\s]+)$')
-                if (-not $embedded.Success) { & $add "Image $label" $false 'it is not an embedded JPEG or PNG image'; continue }
-                $bytes = [System.Convert]::FromBase64String($embedded.Groups[1].Value)
+        $manifestLines = [System.Collections.Generic.List[string]]::new()
+        $number = 0
+        foreach ($image in $images) {
+            $number++
+            $attributes = $image.Attributes
+            $read = { param($Name) if ($attributes.ContainsKey($Name)) { [string]$attributes[$Name] } else { '' } }
+            $file = & $read 'data-file'
+            $listed = & $read 'data-sha256'
+            $label = if ($file) { $file } else { "#$number" }
+            $manifestLines.Add("$listed  $file")
+            if ($listed -cnotmatch '^[0-9a-f]{64}$') {
+                & $add "Image $label" $false 'the report lists no valid SHA-256 hash for it'
+                continue
+            }
+
+
+            $bytes = $null
+            $source = & $read 'src'
+            try {
+                if ($source -match '^\s*data:') {
+                    $embedded = [regex]::Match($source, '^\s*data:image/(?:jpeg|png);base64,([A-Za-z0-9+/=\s]+)$')
+                    if (-not $embedded.Success) { & $add "Image $label" $false 'it is not an embedded JPEG or PNG image'; continue }
+                    $bytes = [System.Convert]::FromBase64String($embedded.Groups[1].Value)
+                }
+                else {
+                    $located = Resolve-ReportImagePath -ReportDirectory $reportDirectory -Source $source
+                    if ($located.Problem) { & $add "Image $label" $false "not checked: $($located.Problem)"; continue }
+                    if (-not (Test-Path -LiteralPath $located.Path -PathType Leaf)) {
+                        & $add "Image $label" $false "the image file '$source' is missing (a linked report needs its images folder next to it)"
+                        continue
+                    }
+                    $bytes = [System.IO.File]::ReadAllBytes($located.Path)
+                }
+            }
+            catch {
+                & $add "Image $label" $false "the image could not be read: $($_.Exception.Message)"
+                continue
+            }
+
+            $actual = Get-Sha256Hex -Bytes $bytes
+            & $add "Image $label" ($actual -eq $listed) $(if ($actual -eq $listed) { "SHA-256 $actual" } else { "hash is $actual, report lists $listed" })
+
+            $metadata = $null
+            try { $metadata = Get-ImageMetadata -Bytes $bytes }
+            catch { Write-Verbose "No metadata readable in $label`: $($_.Exception.Message)" }
+            if ($null -eq $metadata) {
+                & $add "Metadata $label" $false 'no embedded metadata'
             }
             else {
-                $located = Resolve-ReportImagePath -ReportDirectory $reportDirectory -Source $source
-                if ($located.Problem) { & $add "Image $label" $false "not checked: $($located.Problem)"; continue }
-                if (-not (Test-Path -LiteralPath $located.Path -PathType Leaf)) {
-                    & $add "Image $label" $false "the image file '$source' is missing (a linked report needs its images folder next to it)"
-                    continue
-                }
-                $bytes = [System.IO.File]::ReadAllBytes($located.Path)
+                $problems = @()
+                if ([string]$metadata.CapturedAt -ne (& $read 'data-captured')) { $problems += "capture time $($metadata.CapturedAt) differs from the report" }
+                if ([string]$metadata.PageUrl -ne (& $read 'data-url')) { $problems += "page URL $($metadata.PageUrl) differs from the report" }
+                & $add "Metadata $label" ($problems.Count -eq 0) $(if ($problems.Count -eq 0) { "$($metadata.ItemName) | $($metadata.CapturedAt) | $($metadata.PageUrl)" } else { $problems -join '; ' })
             }
         }
-        catch {
-            & $add "Image $label" $false "the image could not be read: $($_.Exception.Message)"
-            continue
+
+        # The manifest hash the report states, read from the one place Vouch writes it.
+        $stated = [string]$scan.Manifest
+        if ($images.Count -gt 0) {
+            $recomputed = Get-Sha256Hex -Bytes ([System.Text.Encoding]::UTF8.GetBytes((@($manifestLines) -join "`n") + "`n"))
+            if (-not $stated) { & $add 'Manifest' $false 'the report states no manifest hash' }
+            else {
+                $ok = $recomputed -eq $stated
+                & $add 'Manifest' $ok $(if ($ok) { "SHA-256 $recomputed" } else { "recomputed $recomputed, report states $stated" })
+            }
         }
 
-        $actual = Get-Sha256Hex -Bytes $bytes
-        & $add "Image $label" ($actual -eq $listed) $(if ($actual -eq $listed) { "SHA-256 $actual" } else { "hash is $actual, report lists $listed" })
-
-        $metadata = $null
-        try { $metadata = Get-ImageMetadata -Bytes $bytes }
-        catch { Write-Verbose "No metadata readable in $label`: $($_.Exception.Message)" }
-        if ($null -eq $metadata) {
-            & $add "Metadata $label" $false 'no embedded metadata'
-        }
-        else {
-            $problems = @()
-            if ([string]$metadata.CapturedAt -ne (& $read 'data-captured')) { $problems += "capture time $($metadata.CapturedAt) differs from the report" }
-            if ([string]$metadata.PageUrl -ne (& $read 'data-url')) { $problems += "page URL $($metadata.PageUrl) differs from the report" }
-            & $add "Metadata $label" ($problems.Count -eq 0) $(if ($problems.Count -eq 0) { "$($metadata.ItemName) | $($metadata.CapturedAt) | $($metadata.PageUrl)" } else { $problems -join '; ' })
+        # Saved image files, when the run used -SaveImages (or a linked report).
+        $imagesDir = Join-Path -Path $reportDirectory -ChildPath (Join-Path 'images' ([System.IO.Path]::GetFileNameWithoutExtension($Path)))
+        $sums = Join-Path -Path $imagesDir -ChildPath 'SHA256SUMS'
+        if (Test-Path -LiteralPath $sums -PathType Leaf) {
+            $sumsText = [System.IO.File]::ReadAllText($sums)
+            $sumsHash = Get-Sha256Hex -Bytes ([System.Text.Encoding]::UTF8.GetBytes($sumsText))
+            & $add 'SHA256SUMS' ($stated -and $sumsHash -eq $stated) "file hashes to $sumsHash"
+            $listedNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($line in ($sumsText -split "`n" | Where-Object { $_ -match '^([0-9a-f]{64})  (.+)$' })) {
+                $null = $line -match '^([0-9a-f]{64})  (.+)$'
+                $expected = $Matches[1]
+                $name = $Matches[2]
+                # Vouch lists each file once; a list that repeats one is not read on and on.
+                if (-not $listedNames.Add($name)) { & $add "File $name" $false 'listed more than once in SHA256SUMS; the rest of the list was not checked'; break }
+                # A name from the file is checked like a linked src: it must stay in the folder.
+                $located = Resolve-ReportImagePath -ReportDirectory $imagesDir -Source ([System.Uri]::EscapeDataString($name))
+                if ($located.Problem) { & $add "File $name" $false "not checked: $($located.Problem)"; continue }
+                $filePath = $located.Path
+                if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) { & $add "File $name" $false 'missing'; continue }
+                $actual = Get-Sha256Hex -Bytes ([System.IO.File]::ReadAllBytes($filePath))
+                & $add "File $name" ($actual -eq $expected) $(if ($actual -eq $expected) { 'matches' } else { "hash is $actual, expected $expected" })
+            }
         }
     }
-
-    $stated = [regex]::Match($html, 'data-manifest-sha256="([0-9a-f]{64})"')
-    if ($images.Count -gt 0) {
-        $recomputed = Get-Sha256Hex -Bytes ([System.Text.Encoding]::UTF8.GetBytes((@($manifestLines) -join "`n") + "`n"))
-        if (-not $stated.Success) { & $add 'Manifest' $false 'the report states no manifest hash' }
-        else {
-            $ok = $recomputed -eq $stated.Groups[1].Value
-            & $add 'Manifest' $ok $(if ($ok) { "SHA-256 $recomputed" } else { "recomputed $recomputed, report states $($stated.Groups[1].Value)" })
-        }
-    }
-
-    # Saved image files, when the run used -SaveImages (or a linked report).
-    $imagesDir = Join-Path -Path $reportDirectory -ChildPath (Join-Path 'images' ([System.IO.Path]::GetFileNameWithoutExtension($Path)))
-    $sums = Join-Path -Path $imagesDir -ChildPath 'SHA256SUMS'
-    if (Test-Path -LiteralPath $sums -PathType Leaf) {
-        $sumsText = [System.IO.File]::ReadAllText($sums)
-        $sumsHash = Get-Sha256Hex -Bytes ([System.Text.Encoding]::UTF8.GetBytes($sumsText))
-        & $add 'SHA256SUMS' ($stated.Success -and $sumsHash -eq $stated.Groups[1].Value) "file hashes to $sumsHash"
-        foreach ($line in ($sumsText -split "`n" | Where-Object { $_ -match '^([0-9a-f]{64})  (.+)$' })) {
-            $null = $line -match '^([0-9a-f]{64})  (.+)$'
-            $expected = $Matches[1]
-            $name = $Matches[2]
-            # A name from the file is checked like a linked src: it must stay in the folder.
-            $located = Resolve-ReportImagePath -ReportDirectory $imagesDir -Source ([System.Uri]::EscapeDataString($name))
-            if ($located.Problem) { & $add "File $name" $false "not checked: $($located.Problem)"; continue }
-            $filePath = $located.Path
-            if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) { & $add "File $name" $false 'missing'; continue }
-            $actual = Get-Sha256Hex -Bytes ([System.IO.File]::ReadAllBytes($filePath))
-            & $add "File $name" ($actual -eq $expected) $(if ($actual -eq $expected) { 'matches' } else { "hash is $actual, expected $expected" })
-        }
+    catch {
+        & $add 'Report' $false "This file could not be checked as a Vouch report: $($_.Exception.Message)"
     }
     return $results
 }
@@ -6230,15 +6475,82 @@ function ConvertTo-SafeOutputName {
         [string]$Fallback = 'VouchEvidence'
     )
     $Extension = '.' + $Extension.TrimStart('.')
-    $safe = $Name -replace '[\x00-\x1f\\/:*?"<>|]+', '_'
+    $safe = $Name -replace '[\x00-\x1f\x7f\\/:*?"<>|]+', '_'
     $safe = ($safe -replace '\s+', ' ').Trim(' ', '.')
     if ($safe.EndsWith($Extension, [System.StringComparison]::OrdinalIgnoreCase)) {
         $safe = $safe.Substring(0, $safe.Length - $Extension.Length).Trim(' ', '.')
     }
+    if ($safe.Length -gt 150) { $safe = $safe.Substring(0, 150) }
+    # Half of a character pair (cut in two just above, or typed that way) cannot be
+    # written into a link: a linked report's images folder carries this name.
+    $safe = ($safe -replace '[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]', '_').Trim(' ', '.')
     if ([string]::IsNullOrWhiteSpace($safe) -or $safe -match '^_+$') { $safe = $Fallback }
-    if ($safe -match '^(?i)(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\..*)?$') { $safe = "_$safe" }
-    if ($safe.Length -gt 150) { $safe = $safe.Substring(0, 150).Trim(' ', '.') }
+    if ($safe -match '^(?i)(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|CLOCK\$|COM[0-9¹²³]|LPT[0-9¹²³])(\..*)?$') { $safe = "_$safe" }
     return "$safe$Extension"
+}
+
+function Get-ReportFileName {
+    <#
+        The report's file name from what the user asked for (-ReportName or
+        output.reportName, tokens allowed). The images folder of the report carries the
+        same name and a linked report's HTML points into it, so the name must be one
+        that Windows keeps exactly as written and a browser can follow: every name goes
+        through ConvertTo-SafeOutputName - also one typed without tokens, which used to
+        be taken as it was (" Q3" or "Q3." then gave a report -Verify could not follow).
+        Ordinary names come out unchanged. Returns { Name; Unknown (tokens); Changed }.
+    #>
+    param(
+        [AllowEmptyString()][string]$Name = '',
+        [Parameter(Mandatory)][string]$DefaultStem,
+        [System.Collections.IDictionary]$Values = @{}
+    )
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return [pscustomobject]@{ Name = "$DefaultStem.html"; Unknown = [string[]]@(); Changed = $false }
+    }
+    $text = $Name
+    $unknown = [string[]]@()
+    if ($text -match '\{[^{}]*\}') {
+        $expanded = Expand-NameTemplate -Template $text -Values $Values
+        $text = $expanded.Text
+        $unknown = $expanded.Unknown
+    }
+    # The ending as typed (.html, .htm, .HTML) is kept; .html is added when there is none.
+    $extension = if ($text.TrimEnd(' ', '.') -match '(?i)\.(html?)$') { $Matches[1] } else { 'html' }
+    $safe = ConvertTo-SafeOutputName -Name $text -Extension $extension -Fallback $DefaultStem
+    return [pscustomobject]@{ Name = $safe; Unknown = $unknown; Changed = ($safe -cne $text -and $safe -cne "$text.$extension") }
+}
+
+function Assert-ReportLocation {
+    <#
+        Makes the images folder and proves the report file can be made, before anything
+        is captured: a name or folder Windows cannot hold (too long, no permission, a
+        file in the way) must stop the run at its start with a plain message - not at
+        the end, after all the pages, or with a report whose images are somewhere else.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ReportPath,
+        [AllowEmptyString()][string]$ImagesDir = ''
+    )
+    try {
+        if ($ImagesDir) {
+            [void][System.IO.Directory]::CreateDirectory($ImagesDir)
+            # Windows may quietly store another name than the one asked for.
+            $made = [System.IO.DirectoryInfo]::new($ImagesDir)
+            if (-not $made.Exists -or $made.Name -cne [System.IO.Path]::GetFileName($ImagesDir)) { throw 'Windows cannot keep an images folder of that name.' }
+        }
+        if ([System.IO.Directory]::Exists($ReportPath)) { throw 'A folder of that name is in the way.' }
+        if (-not [System.IO.File]::Exists($ReportPath)) {
+            [System.IO.File]::WriteAllText($ReportPath, '', [System.Text.UTF8Encoding]::new($false))
+            $made = [System.IO.FileInfo]::new($ReportPath)
+            $kept = $made.Exists -and $made.Name -ceq [System.IO.Path]::GetFileName($ReportPath)
+            [System.IO.File]::Delete($ReportPath)
+            if (-not $kept) { throw 'Windows cannot keep a file of that name.' }
+        }
+    }
+    catch {
+        throw ("The report cannot be saved as '$([System.IO.Path]::GetFileName($ReportPath))' in '$(Split-Path -Path $ReportPath -Parent)': $($_.Exception.Message)`n" +
+            'Choose a shorter or simpler report name (-ReportName, or "reportName" in the configuration file) or another output folder.')
+    }
 }
 
 function Get-AvailableFilePath {
@@ -7373,18 +7685,13 @@ function Invoke-CaptureRun {
         PeriodFrom = $settings.PeriodFrom; PeriodTo = $settings.PeriodTo; PeriodLabel = $settings.PeriodLabel
     }
     $defaultReportStem = "VouchReport_$($runStamp.ToString('yyyy-MM-dd_HHmmss'))"
-    $effectiveReportName = $settings.ReportName
-    if ([string]::IsNullOrWhiteSpace($effectiveReportName)) {
-        $effectiveReportName = "$defaultReportStem.html"
+    # {report} in the report's own name is the name it would have had.
+    $reportFile = Get-ReportFileName -Name $settings.ReportName -DefaultStem $defaultReportStem -Values (Get-NameTokenValues @tokenArguments -Report $defaultReportStem)
+    foreach ($token in $reportFile.Unknown) { Write-Host "WARNING: the report name has the token $token, which Vouch does not know; it is left as written." -ForegroundColor Yellow }
+    $effectiveReportName = $reportFile.Name
+    if ($reportFile.Changed) {
+        Write-Host "NOTE: the report is saved as '$effectiveReportName': the name asked for has characters, or a beginning or ending, that Windows does not keep in a file name." -ForegroundColor Yellow
     }
-    elseif ($effectiveReportName -match '\{[^{}]*\}') {
-        # {report} in the report's own name is the name it would have had.
-        $expanded = Expand-NameTemplate -Template $effectiveReportName -Values (Get-NameTokenValues @tokenArguments -Report $defaultReportStem)
-        foreach ($token in $expanded.Unknown) { Write-Host "WARNING: the report name has the token $token, which Vouch does not know; it is left as written." -ForegroundColor Yellow }
-        $extension = if ($expanded.Text -match '(?i)\.htm$') { 'htm' } else { 'html' }
-        $effectiveReportName = ConvertTo-SafeOutputName -Name $expanded.Text -Extension $extension -Fallback $defaultReportStem
-    }
-    if ($effectiveReportName -notmatch '(?i)\.html?$') { $effectiveReportName += '.html' }
     $reportPath = Join-Path -Path $resolvedOutputDir -ChildPath $effectiveReportName
     $reportStem = [System.IO.Path]::GetFileNameWithoutExtension($effectiveReportName)
 
@@ -7397,10 +7704,8 @@ function Invoke-CaptureRun {
     $imagesDir = ''
     if ($settings.SaveImages) {
         $imagesDir = Join-Path -Path $resolvedOutputDir -ChildPath (Join-Path 'images' ([System.IO.Path]::GetFileNameWithoutExtension($effectiveReportName)))
-        if (-not (Test-Path -LiteralPath $imagesDir)) {
-            [void](New-Item -ItemType Directory -Path $imagesDir -Force)
-        }
     }
+    Assert-ReportLocation -ReportPath $reportPath -ImagesDir $imagesDir
 
     $imageExtension = if ($settings.ImageFormat -eq 'png') { 'png' } else { 'jpg' }
     $screenBounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds

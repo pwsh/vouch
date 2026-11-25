@@ -2394,6 +2394,85 @@ Describe 'Report form, zip and opening the report (headless Edge, page capture a
         @(Test-ReportIntegrity -Path $report | Where-Object { -not $_.Ok }) | Should -BeNullOrEmpty
         (Join-Path $out 'csv-Internal.zip') | Should -Exist
     }
+
+    It 'writes a linked report that verifies and shows its images in Edge, however awkward the report name' {
+        Mock Test-InteractiveRun { $false }
+        $csv = Join-Path -Path $TestDrive -ChildPath 'awkward.csv'
+        "Name,Url,Steps,ScrollFullPage,Notes`r`nPlain,$Web/ok,,N,`r`nTall,$Web/tall?px=2500,,Y," | Set-Content -LiteralPath $csv -Encoding utf8
+        $out = Join-Path -Path $TestDrive -ChildPath 'awkward-out'
+        # Edge spaces and dots, #, %, a % that looks like an escape, &, quotes, brackets, other scripts.
+        $asked = ' .Q3 #1 100% & [x] (y) +;=@$,!~ Ü日本''s %41. '
+        $stem = 'Q3 #1 100% & [x] (y) +;=@$,!~ Ü日本''s %41'
+        $bound = @{
+            CsvPath = $csv; OutputDir = $out; ReportName = $asked; EdgeProfileDir = $script:ProfileDir; DebugPort = $script:CdpPort
+            NavigationTimeoutSec = 10; SettleSeconds = [double]0.1; ScrollSettleSeconds = [double]0.1; MaxScrollSegments = 5; ImageFormat = 'jpeg'
+            JpegQuality = 80; CaptureArea = 'page'; ZoomPercent = 100; LinkImages = [switch]$true
+        }
+        $output = Invoke-Main -BoundParameters $bound 6>&1 | Out-String
+        $script:ExitCode | Should -Be 0 -Because $output
+        $output | Should -Match ([regex]::Escape("NOTE: the report is saved as '$stem.html'"))
+        $report = Join-Path $out "$stem.html"
+        [System.IO.File]::Exists($report) | Should -BeTrue
+        @(Get-ChildItem -LiteralPath (Join-Path $out 'images')).Name | Should -BeExactly @($stem)
+
+        $results = @(Test-ReportIntegrity -Path $report)
+        @($results | Where-Object { -not $_.Ok }) | Should -BeNullOrEmpty
+        $shots = @($results | Where-Object Check -like 'Image *').Count
+        $shots | Should -BeGreaterOrEqual 2
+        $verify = Invoke-VouchVerify $report
+        $verify.ExitCode | Should -Be 0 -Because $verify.Output
+
+        # Edge itself, reading the report from disk: every screenshot must load.
+        Connect-TestPage
+        try {
+            # Not [System.Uri]: it turns the name's "%41" into "A". Each part escaped, as for the images.
+            $address = 'file:///' + (($report -split '\\' | ForEach-Object { [System.Uri]::EscapeDataString($_) }) -join '/').Replace('%3A', ':')
+            [void](Open-TestPage $address)
+            $loaded = Invoke-CdpEval -Expression 'JSON.stringify(Array.from(document.images).map(function (i) { return i.complete && i.naturalWidth > 0; }))'
+            $seen = Invoke-CdpEval -Expression 'location.href + " | " + Array.from(document.images).map(function (i) { return i.getAttribute("src").slice(0, 60); }).join(" , ")'
+            $loaded | Should -Be ('[' + ((@('true') * $shots) -join ',') + ']') -Because $seen
+        }
+        finally { Close-CdpSocket }
+    }
+
+    It 'shows even a huge logo no larger than 220 x 64 in Edge (the one picture -Verify does not hash)' {
+        $svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="3000"><rect width="1280" height="3000" fill="#e00"/></svg>'
+        $wide = '<svg xmlns="http://www.w3.org/2000/svg" width="5000" height="40"><rect width="5000" height="40" fill="#e00"/></svg>'
+        $run = [pscustomobject]@{
+            StartTime = 's'; EndTime = 'e'; TimeZone = 'tz'; Computer = 'PC01'; User = 'CORP\auditor'; OperatingSystem = 'os'
+            EdgeVersion = 'Edg'; BrowserInstance = 'b'; CaptureDesktop = 'd'; ToolVersion = 'test'; CsvPath = 'c'; ImageFormat = 'jpeg'
+            ImageDescription = 'JPEG'; ScreenResolution = '1280x800'; Total = 0; OkCount = 0; WarnCount = 0; FailCount = 0; CaptureCount = 0
+            RunId = 'r'; ManifestSha256 = ('0' * 64)
+        }
+        Connect-TestPage
+        try {
+            foreach ($case in @{ Svg = $svg; Classification = '' }, @{ Svg = $wide; Classification = 'Confidential' }) {
+                $options = New-ReportOptions -Classification $case.Classification -CompanyName 'ACME' `
+                    -LogoDataUri ('data:image/svg+xml;base64,' + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($case.Svg)))
+                $path = Join-Path -Path $TestDrive -ChildPath "logo-$([guid]::NewGuid()).html"
+                [System.IO.File]::WriteAllText($path, (& $script:RealNewHtmlReportForForm -Items @() -Run $run -Options $options), [System.Text.UTF8Encoding]::new($false))
+                (Test-ReportMarkup -Html ([System.IO.File]::ReadAllText($path))).Problems | Should -BeNullOrEmpty
+                [void](Open-TestPage ('file:///' + $path.Replace('\', '/')))
+                $box = Invoke-CdpEval -Expression '(function () { var r = document.querySelector("img.logo").getBoundingClientRect(); return Math.round(r.width) + "x" + Math.round(r.height); })()'
+                $width, $height = $box -split 'x' | ForEach-Object { [int]$_ }
+                $width | Should -BeGreaterThan 0
+                $width | Should -BeLessOrEqual 220 -Because "the logo is shown $box"
+                $height | Should -BeLessOrEqual 64 -Because "the logo is shown $box"
+            }
+        }
+        finally { Close-CdpSocket }
+    }
+
+    It '-Verify exits 4, not with an error, for a file whose style sheet is empty' {
+        # Not named .html: the markup net after each test is for reports the tests did not tamper with.
+        $copy = Join-Path -Path $TestDrive -ChildPath 'empty-style.txt'
+        [System.IO.File]::WriteAllText($copy, [regex]::Replace($script:FormHtml, '(?s)<style>.*?</style>', '<style></style>'), [System.Text.UTF8Encoding]::new($false))
+        $result = Invoke-VouchVerify $copy
+        $result.ExitCode | Should -Be 4
+        $result.Output | Should -Match 'FAIL\s+Report styles'
+        $result.Output | Should -Match 'NOT VERIFIED'
+        $result.Output | Should -Not -Match 'ERROR'
+    }
 }
 
 Describe 'Capture log (headless Edge, page capture area)' -Tag 'Integration' {
