@@ -1876,8 +1876,11 @@ Describe 'Progress events, stop and -TabId (headless Edge, desktop functions moc
             [System.IO.File]::WriteAllText($file, ($config | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
             return $file
         }
-        function Read-RunEvent([string]$Path) {
-            @(Get-Content -LiteralPath $Path -Encoding utf8 | ForEach-Object { $_ | ConvertFrom-Json })
+        function Read-RunEvent([string]$Path, [switch]$All) {
+            # The Task 5 event types; navigation and detail events (added for the capture
+            # log) are left out unless -All, so these tests keep checking the same order.
+            @(Get-Content -LiteralPath $Path -Encoding utf8 | ForEach-Object { $_ | ConvertFrom-Json } |
+                Where-Object { $All -or $_.type -notin 'navigation', 'detail' })
         }
         function New-TestTab([string]$Url) {
             Invoke-RestMethod -Method Put -Uri "http://127.0.0.1:$($script:CdpPort)/json/new?$Url" -NoProxy
@@ -1922,6 +1925,12 @@ Describe 'Progress events, stop and -TabId (headless Edge, desktop functions moc
             $events = Read-RunEvent $log
             @($events.type) | Should -Be @('runStart', 'pageStart', 'prompt', 'promptResult', 'pageEnd', 'pageStart', 'capture', 'action', 'pageEnd', 'runEnd')
             @($events.runId | Sort-Object -Unique).Count | Should -Be 1
+            # Since the capture log: what each page loaded and every detail, as they happened.
+            $all = Read-RunEvent $log -All
+            @($all.type) | Should -Be @('runStart', 'pageStart', 'navigation', 'prompt', 'promptResult', 'detail', 'pageEnd',
+                'pageStart', 'navigation', 'capture', 'action', 'pageEnd', 'runEnd')
+            ($all | Where-Object type -eq 'detail').text | Should -Match 'Skipped by the user'
+            ($all | Where-Object type -eq 'navigation')[1].httpStatus | Should -Be 200
 
             $runStart = $events[0]
             $runStart.toolVersion | Should -Be $script:ToolVersion
@@ -2223,7 +2232,7 @@ Describe 'Report form, zip and opening the report (headless Edge, page capture a
         $stem = [System.IO.Path]::GetFileNameWithoutExtension($script:FormReport)
         $archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
         try { $entries = @($archive.Entries.FullName | Sort-Object) } finally { $archive.Dispose() }
-        $expected = @("$stem.html", "$stem.json", "images/$stem/SHA256SUMS") + @($script:FormItems | ForEach-Object { $_.Captures } | ForEach-Object { "images/$stem/$($_.FileName)" })
+        $expected = @("$stem.html", "$stem.json", "$stem.log", "images/$stem/SHA256SUMS") + @($script:FormItems | ForEach-Object { $_.Captures } | ForEach-Object { "images/$stem/$($_.FileName)" })
         $entries | Should -Be @($expected | Sort-Object)
         $entries | Should -Not -Contain 'events.ndjson'
         $script:FormHtml | Should -Not -Match '\.zip'
@@ -2237,14 +2246,25 @@ Describe 'Report form, zip and opening the report (headless Edge, page capture a
         $summary.Zip.Path | Should -Be $script:FormEnd.zipPath
         $summary.Zip.Sha256 | Should -Be $hash
         $summary.ReportDetails.ImageForm | Should -Be 'linked'
+        $summary.LogPath | Should -Be ([System.IO.Path]::ChangeExtension($script:FormReport, '.log'))
+        $summary.LogComplete | Should -BeTrue
+        $script:FormEnd.logPath | Should -Be $summary.LogPath
+        $script:FormEnd.logComplete | Should -BeTrue
+        $script:FormHtml | Should -Match ([regex]::Escape("<td class=""k"">Capture log</td><td>$([System.IO.Path]::GetFileName($summary.LogPath))</td>"))
         $summary.ReportDetails.Classification | Should -Be 'Confidential'
         $summary.ReportDetails.CaptureWindow.First | Should -Not -BeNullOrEmpty
         ($summary.Items | Where-Object Name -eq 'Tabs').Account | Should -Be 'admin@example.com'
     }
 
-    It 'gives an extracted copy that verifies on its own' {
+    It 'gives an extracted copy that verifies on its own, with the capture log up to the archive line' {
         $copy = Copy-Evidence 'extracted'
         @(Test-ReportIntegrity -Path $copy | Where-Object { -not $_.Ok }) | Should -BeNullOrEmpty
+        $inside = @(Get-Content -LiteralPath ([System.IO.Path]::ChangeExtension($copy, '.log')))
+        $inside[-2] | Should -Match 'Creating archive .*\.zip$'
+        $inside[-1] | Should -Match 'inside the archive ends with this line'
+        $onDisk = @(Get-Content -LiteralPath $script:FormEnd.logPath)
+        $onDisk[0..($inside.Count - 1)] | Should -Be $inside
+        $onDisk[-1] | Should -Match 'End of capture log\.$'
         $summary = Get-Content -LiteralPath ([System.IO.Path]::ChangeExtension($copy, '.json')) -Raw | ConvertFrom-Json
         $summary.Zip.Sha256 | Should -BeNullOrEmpty -Because 'a file inside the zip cannot hold the zip''s own hash'
     }
@@ -2344,5 +2364,175 @@ Describe 'Report form, zip and opening the report (headless Edge, page capture a
         $html | Should -Match 'src="images/csv-Internal/001_Plain_seg01.jpg"'
         @(Test-ReportIntegrity -Path $report | Where-Object { -not $_.Ok }) | Should -BeNullOrEmpty
         (Join-Path $out 'csv-Internal.zip') | Should -Exist
+    }
+}
+
+Describe 'Capture log (headless Edge, page capture area)' -Tag 'Integration' {
+    BeforeAll {
+        Close-CdpSocket
+        Mock Get-ScreenCapture { throw 'the screen must not be captured in a page-area run' }
+        Mock Set-EdgeForeground { throw 'the window must not be brought forward in a page-area run' }
+        $script:RealSetNavigationMarker = ${function:Set-NavigationMarker}
+
+        function New-LogConfig {
+            param([string]$Folder, [object[]]$Pages, [hashtable]$Output = @{})
+            $config = Get-DefaultVouchConfig
+            $config['browser']['profileDir'] = $script:ProfileDir
+            $config['browser']['debugPort'] = $script:CdpPort
+            $config['defaults']['captureArea'] = 'page'
+            $config['defaults']['navigationTimeoutSec'] = 5
+            $config['defaults']['settleSeconds'] = 0.1
+            $config['defaults']['scrollSettleSeconds'] = 0.1
+            $config['output']['dir'] = 'out'
+            $config['output']['reportName'] = 'run.html'
+            $config['output']['jsonSummary'] = $true
+            foreach ($key in $Output.Keys) { $config['output'][$key] = $Output[$key] }
+            foreach ($page in $Pages) { $config['pages'].Add($page) }
+            $path = Join-Path -Path $TestDrive -ChildPath $Folder
+            [void](New-Item -ItemType Directory -Path $path -Force)
+            $file = Join-Path -Path $path -ChildPath 'run.json'
+            [System.IO.File]::WriteAllText($file, ($config | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+            return $file
+        }
+        function Read-SharedText([string]$Path) {
+            # As a person tailing the log would: shared read while the run writes.
+            $stream = [System.IO.FileStream]::new($Path, 'Open', 'Read', 'ReadWrite, Delete')
+            try { return [System.IO.StreamReader]::new($stream).ReadToEnd() } finally { $stream.Dispose() }
+        }
+        function Get-LogBody([string]$Path) {
+            # The entries without their time stamps.
+            @(Get-Content -LiteralPath $Path -Encoding utf8 | ForEach-Object { if ($_ -match '^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} [+-]\d\d:\d\d  (.*)$') { $Matches[1] } else { "+$($_.Trim())" } })
+        }
+
+        $global:VouchLog = @{ Navigations = 0; MidRun = '' }
+        # Before the second page is opened, read what the log already holds.
+        Mock Set-NavigationMarker {
+            $global:VouchLog.Navigations++
+            if ($global:VouchLog.Navigations -eq 2 -and $global:VouchLog.LogPath) { $global:VouchLog.MidRun = Read-SharedText $global:VouchLog.LogPath }
+            & $script:RealSetNavigationMarker
+        }
+        $file = New-LogConfig -Folder 'log2' -Pages @(
+            [ordered]@{ id = 'p1'; name = 'Plain'; url = "$Web/ok" }
+            [ordered]@{ id = 'p2'; name = 'Tabs'; url = "$Web/tabs"; actions = @(
+                    [ordered]@{ type = 'clickText'; text = 'Audit Log' }
+                    [ordered]@{ type = 'capture'; label = "Audit`nlog" }) })
+        $global:VouchLog.LogPath = Join-Path (Split-Path $file) 'out\run.log'
+        Invoke-Main -BoundParameters @{ ConfigPath = $file } 6>$null
+        $script:LogExit = $script:ExitCode
+        $script:LogFile = $global:VouchLog.LogPath
+        $script:LogSummary = Get-Content -LiteralPath ([System.IO.Path]::ChangeExtension($script:LogFile, '.json')) -Raw | ConvertFrom-Json -DateKind String
+    }
+
+    AfterAll { Remove-Variable -Name VouchLog -Scope Global -ErrorAction SilentlyContinue }
+
+    It 'writes the log of a run without -EventLogPath, entries in the order they happened' {
+        $script:LogExit | Should -Be 0
+        $script:LogFile | Should -Exist
+        $body = Get-LogBody $script:LogFile
+        $body[0] | Should -Match '^Vouch 2\.0\.0 capture log - run [0-9a-f-]{36}$'
+        $order = @($body | ForEach-Object {
+                switch -Regex ($_) {
+                    '^Page \d of 2: ' { 'pageStart' } '^  Opened: ' { 'navigation' } '^  Action ' { 'action' } '^  Image ' { 'image' }
+                    '^Page \d of 2 done' { 'pageEnd' } '^Run finished' { 'runEnd' } '^End of capture log' { 'end' }
+                } })
+        $order | Should -Be @('pageStart', 'navigation', 'image', 'action', 'pageEnd', 'pageStart', 'navigation', 'action', 'image', 'action', 'pageEnd', 'runEnd', 'end')
+        $body | Should -Contain '  Action 1 clicktext:Audit Log: ok'
+        $body | Should -Contain "Report: $([System.IO.Path]::ChangeExtension($script:LogFile, '.html'))"
+        $body | Should -Contain 'Exit code: 0'
+        $body | Should -Contain "Manifest SHA-256: $($script:LogSummary.Run.ManifestSha256)"
+        [System.IO.File]::ReadAllBytes($script:LogFile)[0] | Should -Not -Be 0xEF
+    }
+
+    It 'names the same files with the same SHA-256 values as the JSON summary' {
+        # An entry with continuation lines (the two-line label) is joined back into one.
+        $entries = [System.Collections.Generic.List[string]]::new()
+        foreach ($line in (Get-LogBody $script:LogFile)) { if ($line.StartsWith('+')) { $entries[$entries.Count - 1] += " $($line.Substring(1))" } else { $entries.Add($line) } }
+        $logged = @($entries | Where-Object { $_ -match '^  Image (\S+): .*SHA-256 ([0-9a-f]{64})$' } | ForEach-Object { "$($Matches[1]) $($Matches[2])" })
+        $summary = @($script:LogSummary.Items | ForEach-Object { $_.Captures } | ForEach-Object { "$($_.FileName) $($_.Sha256)" })
+        $logged.Count | Should -Be 2
+        $logged | Should -Be $summary
+    }
+
+    It 'keeps a multi-line label in one indented entry' {
+        $body = Get-LogBody $script:LogFile
+        $index = [array]::FindIndex([string[]]$body, [Predicate[string]] { param($l) $l -like '  Image 002_Tabs_seg01.jpg*' })
+        $body[$index] | Should -Match 'capture 1 "Audit$'
+        $body[$index + 1] | Should -Match '^\+log", segment 1 of 1, page content only, zoom 100%, \d+x\d+ px, SHA-256 [0-9a-f]{64}$'
+    }
+
+    It 'already holds the first page while the second page is running' {
+        $global:VouchLog.MidRun | Should -Match 'Page 1 of 2 done: OK, 1 image\(s\)'
+        $global:VouchLog.MidRun | Should -Match 'Page 2 of 2: p2 "Tabs"'
+        $global:VouchLog.MidRun | Should -Not -Match 'Opened: .*/tabs'
+        $global:VouchLog.MidRun | Should -Not -Match 'Run finished'
+    }
+
+    It 'closes the log of a run that was stopped' {
+        $file = New-LogConfig -Folder 'logstop' -Pages @([ordered]@{ id = 'a'; name = 'A'; url = "$Web/ok" }, [ordered]@{ id = 'b'; name = 'B'; url = "$Web/ok" }, [ordered]@{ id = 'c'; name = 'C'; url = "$Web/ok" })
+        $events = Join-Path (Split-Path $file) 'events.ndjson'
+        $global:VouchLog.Navigations = 0
+        # The person presses Stop as the second page is opened.
+        Mock Set-NavigationMarker {
+            $global:VouchLog.Navigations++
+            if ($global:VouchLog.Navigations -eq 2) { [System.IO.File]::WriteAllText("$($global:VouchLog.Events).stop", '') }
+            & $script:RealSetNavigationMarker
+        }
+        $global:VouchLog.Events = $events
+        Invoke-Main -BoundParameters @{ ConfigPath = $file; EventLogPath = $events } 6>$null
+        $body = Get-LogBody (Join-Path (Split-Path $file) 'out\run.log')
+        $body | Should -Contain 'Page 2 of 3 done: WARNING, 0 image(s) - stopped by the user'
+        $body | Should -Contain '  Warning: Stopped by the user: the run ended here, so the rest of this page was not captured.'
+        $body | Should -Not -Contain ('Page 3 of 3: c "C" - ' + "$Web/ok")
+        $body | Should -Contain 'Run finished: 2 of 3 page(s) run - 1 OK, 1 warning(s), 0 failed, 1 not run; 1 image(s)'
+        $body | Should -Contain 'Stopped by the user: yes'
+        $body[-1] | Should -Be 'End of capture log.'
+    }
+
+    It 'closes the log of a run with a failing page, with the problem where it happened' {
+        $file = New-LogConfig -Folder 'logfail' -Pages @([ordered]@{ id = 'bad'; name = 'Unreachable'; url = 'http://localhost:1/' }, [ordered]@{ id = 'ok'; name = 'Fine'; url = "$Web/ok" })
+        Invoke-Main -BoundParameters @{ ConfigPath = $file } 6>$null
+        $script:ExitCode | Should -Be 2
+        $body = Get-LogBody (Join-Path (Split-Path $file) 'out\run.log')
+        $first = [array]::IndexOf([string[]]$body, 'Page 1 of 2 done: FAILED, 0 image(s)')
+        $first | Should -BeGreaterThan 0
+        $body[$first - 1] | Should -Match '^  Problem: The page could not be loaded: net::'
+        $body | Should -Contain 'Page 2 of 2 done: OK, 1 image(s)'
+        $body | Should -Contain 'Exit code: 2'
+        $body[-1] | Should -Be 'End of capture log.'
+    }
+
+    It 'closes the log of a run that ends with an error after it started' {
+        $file = New-LogConfig -Folder 'logcrash' -Pages @([ordered]@{ id = 'a'; name = 'A'; url = "$Web/ok" })
+        Mock Start-EdgeDebug { throw 'Edge could not be started.' }
+        { Invoke-Main -BoundParameters @{ ConfigPath = $file } 6>$null } | Should -Throw '*could not be started*'
+        $body = Get-LogBody (Join-Path (Split-Path $file) 'out\run.log')
+        $body | Should -Contain 'ERROR: Edge could not be started.'
+        $body | Should -Contain 'Run ended with an error; no report was made.'
+        $body[-1] | Should -Be 'End of capture log.'
+        $script:CaptureLogPath | Should -Be '' -Because 'the log ends with the run'
+    }
+
+    It 'writes no log with <Case>' -ForEach @(@{ Case = '-NoCaptureLog'; Switch = $true }, @{ Case = 'output.captureLog false'; Switch = $false }) {
+        $folder = "nolog$Switch"
+        $file = if ($Switch) { New-LogConfig -Folder $folder -Pages @([ordered]@{ id = 'a'; name = 'A'; url = "$Web/ok" }) }
+        else { New-LogConfig -Folder $folder -Pages @([ordered]@{ id = 'a'; name = 'A'; url = "$Web/ok" }) -Output @{ captureLog = $false } }
+        $bound = @{ ConfigPath = $file }
+        if ($Switch) { $bound.NoCaptureLog = [switch]$true }
+        Invoke-Main -BoundParameters $bound 6>$null
+        $script:ExitCode | Should -Be 0
+        @(Get-ChildItem -LiteralPath (Join-Path (Split-Path $file) 'out') -Filter '*.log').Count | Should -Be 0
+        $summary = Get-Content -LiteralPath (Join-Path (Split-Path $file) 'out\run.json') -Raw | ConvertFrom-Json
+        $summary.PSObject.Properties['LogPath'] | Should -BeNullOrEmpty
+        [System.IO.File]::ReadAllText((Join-Path (Split-Path $file) 'out\run.html')) | Should -Not -Match 'Capture log'
+    }
+
+    It 'writes no log for -Verify' {
+        $report = [System.IO.Path]::ChangeExtension($script:LogFile, '.html')
+        $copyFolder = Join-Path $TestDrive 'verifylog'
+        [void](New-Item -ItemType Directory -Path $copyFolder)
+        Copy-Item -LiteralPath $report -Destination $copyFolder
+        Invoke-Main -BoundParameters @{ Verify = (Join-Path $copyFolder 'run.html') } 6>$null
+        $script:ExitCode | Should -Be 0
+        @(Get-ChildItem -LiteralPath $copyFolder -Filter '*.log').Count | Should -Be 0
     }
 }

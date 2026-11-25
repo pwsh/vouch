@@ -342,6 +342,7 @@ Describe 'Resolve-RunSettings' {
             Account = ''; ReportTitle = ''; Classification = ''; LogoPath = ''; CompanyName = ''; CompanyDetails = ''
             Description = ''; Origin = ''; GeneratedBy = ''; PeriodFrom = ''; PeriodTo = ''; PeriodLabel = ''
             NoIndex = [switch]$false; LinkImages = [switch]$false; Zip = [switch]$false; ZipName = ''; OpenReport = [switch]$false
+            NoCaptureLog = [switch]$false
         }
         $config = '{
             "browser":  { "profileDir": "C:\\cfg-profile", "debugPort": 9333, "keepBrowserOpen": true },
@@ -2231,7 +2232,7 @@ Describe 'The report switches on the command line' {
     BeforeAll {
         $script:FileConfig = @{
             defaults = @{ account = 'file-account' }
-            output   = @{ embedImages = $false; openReport = $true; zip = @{ enabled = $true; name = '{title}.zip' } }
+            output   = @{ embedImages = $false; openReport = $true; captureLog = $false; zip = @{ enabled = $true; name = '{title}.zip' } }
             report   = @{
                 title = 'File title'; classification = 'Internal'; logoPath = 'C:\file-logo.png'; showIndex = $false
                 company = @{ name = 'File Co'; details = 'File details' }; description = 'File description'; origin = 'File origin'
@@ -2258,6 +2259,7 @@ Describe 'The report switches on the command line' {
         @{ Name = 'Zip'; FromFile = $true }
         @{ Name = 'ZipName'; FromFile = '{title}.zip' }
         @{ Name = 'OpenReport'; FromFile = $true }
+        @{ Name = 'NoCaptureLog'; FromFile = $true }
     ) {
         (Resolve-RunSettings -BoundParameters @{} -Defaults @{} -Config $script:FileConfig).$Name | Should -Be $FromFile
     }
@@ -2268,7 +2270,7 @@ Describe 'The report switches on the command line' {
         @{ Name = 'Description'; Typed = 'typed' }, @{ Name = 'Origin'; Typed = 'typed' }, @{ Name = 'GeneratedBy'; Typed = 'typed' }
         @{ Name = 'PeriodFrom'; Typed = 'typed' }, @{ Name = 'PeriodTo'; Typed = 'typed' }, @{ Name = 'PeriodLabel'; Typed = 'typed' }
         @{ Name = 'NoIndex'; Typed = $false }, @{ Name = 'LinkImages'; Typed = $false }, @{ Name = 'Zip'; Typed = $false }
-        @{ Name = 'ZipName'; Typed = 'typed.zip' }, @{ Name = 'OpenReport'; Typed = $false }
+        @{ Name = 'ZipName'; Typed = 'typed.zip' }, @{ Name = 'OpenReport'; Typed = $false }, @{ Name = 'NoCaptureLog'; Typed = $false }
     ) {
         $bound = @{ $Name = $(if ($Typed -is [bool]) { [switch]$Typed } else { $Typed }) }
         (Resolve-RunSettings -BoundParameters $bound -Defaults @{} -Config $script:FileConfig).$Name | Should -Be $Typed
@@ -2318,5 +2320,191 @@ Describe 'Which runs write progress events' {
         { Invoke-Main -BoundParameters $bound 6>$null } | Should -Throw -ExpectedMessage $(if ($Mode -eq 'Verify') { 'Report not found*' } else { 'login setup failed' })
         $log | Should -Not -Exist
         $script:EventLogPath | Should -Be ''
+    }
+}
+
+Describe 'Capture log: one entry per event' {
+    BeforeAll {
+        $script:Ts = '2026-11-25T10:15:00.123+01:00'
+        $script:Prefix = '2026-11-25 10:15:00.123 +01:00  '
+        function Format-Test([hashtable]$Fields) {
+            $record = [ordered]@{ ts = $script:Ts; runId = 'run-1' }
+            foreach ($key in $Fields.Keys) { $record[$key] = $Fields[$key] }
+            , (Format-CaptureLogEntry -Record $record)
+        }
+    }
+
+    It 'starts every entry with the local time and its UTC offset' {
+        $lines = Format-Test @{ type = 'pageStart'; index = 1; total = 2; pageId = 'p001'; name = 'Payroll'; url = 'https://a/' }
+        $lines | Should -Be @("$($script:Prefix)Page 1 of 2: p001 ""Payroll"" - https://a/")
+    }
+
+    It 'writes the header of a run' {
+        $lines = Format-Test @{ type = 'runStart'; toolVersion = '2.0.0'; computer = 'PC01'; user = 'CORP\jane'; account = 'svc@example.com'
+            source = 'C:\c.json'; outputDir = 'C:\out'; reportFile = 'r.html'; captureArea = 'page'; zoomPercent = 80; imageFormat = 'JPEG images (quality 85)'
+            classification = ''; interactive = $false; pageCount = 2 }
+        $text = $lines -join "`n"
+        $text | Should -Match 'Vouch 2\.0\.0 capture log - run run-1'
+        foreach ($expected in 'Computer: PC01', 'Windows user: CORP\jane', 'Account: svc@example.com', 'Definition file: C:\c.json', 'Output folder: C:\out',
+            'Report: r.html', 'Capture defaults: page content only, zoom 80%, JPEG images (quality 85)', 'Classification: none', 'Mode: unattended', 'Pages to capture: 2') {
+            $text | Should -Match ([regex]::Escape("$($script:Prefix)$expected"))
+        }
+        (Format-Test @{ type = 'runStart'; account = ''; interactive = $true }) -join "`n" | Should -Not -Match 'Account:'
+    }
+
+    It 'writes <Case>' -ForEach @(
+        @{ Case = 'a navigation'; Fields = @{ type = 'navigation'; finalUrl = 'https://a/x'; httpStatus = 200 }; Expected = '  Opened: https://a/x (HTTP 200)' }
+        @{ Case = 'a navigation without status'; Fields = @{ type = 'navigation'; finalUrl = 'https://a/x'; httpStatus = 0 }; Expected = '  Opened: https://a/x (HTTP status not reported by the browser)' }
+        @{ Case = 'an action that worked'; Fields = @{ type = 'action'; index = 2; text = 'clicktext:Audit'; ok = $true; message = '' }; Expected = '  Action 2 clicktext:Audit: ok' }
+        @{ Case = 'an action with a message'; Fields = @{ type = 'action'; index = 1; text = 'pause:MFA'; ok = $true; message = 'continued by the user' }; Expected = '  Action 1 pause:MFA: ok - continued by the user' }
+        @{ Case = 'an action that failed'; Fields = @{ type = 'action'; index = 3; text = 'click:#x'; ok = $false; message = 'No element' }; Expected = '  Action 3 click:#x: FAILED - No element' }
+        @{ Case = 'an image'; Fields = @{ type = 'capture'; fileName = '001_A_c02_seg01.jpg'; captureNumber = 2; label = 'Lockout'; segment = 1; segmentCount = 3; area = 'window'; zoomPercent = 150; width = 640; height = 480; sha256 = ('a' * 64) }
+           Expected = "  Image 001_A_c02_seg01.jpg: capture 2 ""Lockout"", segment 1 of 3, Edge window only, zoom 150%, 640x480 px, SHA-256 $('a' * 64)" }
+        @{ Case = 'an answer'; Fields = @{ type = 'promptResult'; decision = 'Continue'; shown = $true; timedOut = $false }; Expected = '  Answer: Continue' }
+        @{ Case = 'a wait'; Fields = @{ type = 'promptResult'; decision = 'Wait'; waitSeconds = 30; shown = $true; timedOut = $false }; Expected = '  Answer: Wait 30 seconds more' }
+        @{ Case = 'nobody answering'; Fields = @{ type = 'promptResult'; decision = 'Continue'; shown = $true; timedOut = $true }; Expected = '  Nobody answered in time, so Vouch went on with: Continue' }
+        @{ Case = 'a dialog that could not be shown'; Fields = @{ type = 'promptResult'; decision = 'Skip'; shown = $false; timedOut = $false }; Expected = '  The Vouch dialog could not be shown; nobody answered, so Vouch went on with: Skip this page' }
+        @{ Case = 'a note'; Fields = @{ type = 'detail'; status = 'OK'; text = 'single means segments here' }; Expected = '  Note: single means segments here' }
+        @{ Case = 'a warning'; Fields = @{ type = 'detail'; status = 'WARNING'; text = 'Redirected' }; Expected = '  Warning: Redirected' }
+        @{ Case = 'a problem'; Fields = @{ type = 'detail'; status = 'FAILED'; text = 'HTTP 404' }; Expected = '  Problem: HTTP 404' }
+        @{ Case = 'a page end'; Fields = @{ type = 'pageEnd'; index = 2; total = 2; status = 'WARNING'; captureCount = 1; stopped = $true }; Expected = 'Page 2 of 2 done: WARNING, 1 image(s) - stopped by the user' }
+        @{ Case = 'an error'; Fields = @{ type = 'error'; message = 'Edge is not reachable.' }; Expected = 'ERROR: Edge is not reachable.' }
+    ) {
+        $lines = Format-Test $Fields
+        $lines[0] | Should -BeExactly "$($script:Prefix)$Expected"
+    }
+
+    It 'keeps multi-line and non-ASCII text in one entry, continuation lines indented without a time' {
+        $lines = Format-Test @{ type = 'detail'; status = 'WARNING'; text = "Erste Zeile – Zugriff verweigert`r`nzweite Zeile`n日本語" }
+        $lines.Count | Should -Be 3
+        $lines[0] | Should -BeExactly "$($script:Prefix)  Warning: Erste Zeile – Zugriff verweigert"
+        $indent = ' ' * ($script:Prefix.Length + 2 + 4)
+        $lines[1] | Should -BeExactly "${indent}zweite Zeile"
+        $lines[2] | Should -BeExactly "${indent}日本語"
+    }
+
+    It 'writes a question with its message and what happens without an answer' {
+        $lines = Format-Test @{ type = 'prompt'; kind = 'pause'; title = 'Paused'; message = "Sign in`nthen continue"; defaultDecision = 'Continue'; timeoutSec = 300 }
+        $lines[0] | Should -BeExactly "$($script:Prefix)  Question in the Vouch dialog (pause): Paused"
+        $lines[1] | Should -BeExactly "$($script:Prefix)    Sign in"
+        $lines[2] | Should -BeExactly "$(' ' * ($script:Prefix.Length + 4 + 4))then continue"
+        $lines[3] | Should -BeExactly "$($script:Prefix)    If nobody answers within 300 seconds: Continue"
+    }
+
+    It 'says where the copy inside the zip ends' {
+        $lines = Format-Test @{ type = 'archive'; zipPath = 'C:\out\r.zip' }
+        $lines[0] | Should -BeExactly "$($script:Prefix)Creating archive C:\out\r.zip"
+        $lines[1] | Should -Match 'inside the archive ends with this line'
+    }
+
+    It 'writes the footer of a finished run' {
+        $lines = Format-Test @{ type = 'runEnd'; exitCode = 3; reportPath = 'C:\out\r.html'; jsonSummaryPath = ''; stopped = $false; manifestSha256 = ('b' * 64)
+            zipPath = 'C:\out\r.zip'; zipSha256 = ('c' * 64); elapsedSec = 75.4
+            counts = [ordered]@{ pages = 3; run = 3; ok = 1; warning = 2; failed = 0; notRun = 0; captures = 5 } }
+        $text = ($lines | ForEach-Object { $_.Substring($script:Prefix.Length) }) -join "`n"
+        $text | Should -BeExactly (@(
+            'Run finished: 3 of 3 page(s) run - 1 OK, 2 warning(s), 0 failed, 0 not run; 5 image(s)'
+            'Stopped by the user: no'
+            "Manifest SHA-256: $('b' * 64)"
+            'Report: C:\out\r.html'
+            'JSON summary: not written'
+            "Zip: C:\out\r.zip (SHA-256 $('c' * 64))"
+            'Exit code: 3'
+            'Elapsed: 00:01:15'
+            'End of capture log.') -join "`n")
+    }
+
+    It 'closes the log of a run that failed' {
+        $lines = Format-Test @{ type = 'runEnd'; exitCode = 1; reportPath = ''; jsonSummaryPath = ''; counts = $null; stopped = $false }
+        ($lines -join "`n") | Should -Match 'Run ended with an error; no report was made\.(.|\n)*Exit code: 1(.|\n)*End of capture log\.'
+        ($lines -join "`n") | Should -Not -Match 'JSON summary'
+    }
+
+    It 'never writes JSON' {
+        $lines = Format-Test @{ type = 'capture'; fileName = 'x.jpg'; captureNumber = 1; label = ''; segment = 1; segmentCount = 1; area = 'screen'; zoomPercent = 100; width = 0; sha256 = 'x' }
+        $lines[0] | Should -Not -Match '[{}]'
+        $lines[0] | Should -Not -Match ' px'
+    }
+}
+
+Describe 'Capture log: the second sink of the progress events' {
+    BeforeEach {
+        $script:EventLogPath = ''
+        $script:CaptureLogPath = ''
+        $script:EventItem = $null
+        $script:EventRunId = 'run-1'
+    }
+    AfterEach {
+        $script:EventLogPath = ''
+        $script:CaptureLogPath = ''
+        $script:EventItem = $null
+        $script:CaptureLogComplete = $true
+        $script:CaptureLogWarned = $false
+    }
+
+    It 'writes the log without an event file, and only the log' {
+        $log = Join-Path $TestDrive 'only.log'
+        Start-CaptureLog -Path $log
+        Write-RunEvent -Type 'pageStart' -Data ([ordered]@{ index = 1; total = 1; pageId = 'p001'; name = 'A'; url = 'https://a/' })
+        $text = [System.IO.File]::ReadAllText($log)
+        $text | Should -Match 'Page 1 of 1: p001 "A" - https://a/\r\n$'
+        [System.IO.File]::ReadAllBytes($log)[0] | Should -Not -Be 0xEF -Because 'UTF-8 without BOM'
+        @(Get-ChildItem -LiteralPath $TestDrive -Filter '*.ndjson').Count | Should -Be 0
+    }
+
+    It 'does nothing at all without an event file or a log' {
+        Mock Format-CaptureLogEntry { throw 'not called' }
+        Mock Add-RunFileText { throw 'not called' }
+        Write-RunEvent -Type 'pageStart' -Data ([ordered]@{ index = 1 })
+        Should -Invoke Format-CaptureLogEntry -Times 0 -Exactly
+        Should -Invoke Add-RunFileText -Times 0 -Exactly
+        Test-RunEventSink | Should -BeFalse
+    }
+
+    It 'gives both sinks the same event' {
+        $log = Join-Path $TestDrive 'both.log'
+        $events = Join-Path $TestDrive 'both.ndjson'
+        $script:EventLogPath = $events
+        Start-CaptureLog -Path $log
+        Write-RunEvent -Type 'navigation' -Data ([ordered]@{ pageId = 'p001'; finalUrl = 'https://a/'; httpStatus = 200 })
+        $event = Get-Content -LiteralPath $events | ConvertFrom-Json -DateKind String
+        $when = [System.DateTimeOffset]::ParseExact($event.ts, 'yyyy-MM-ddTHH:mm:ss.fffzzz', [System.Globalization.CultureInfo]::InvariantCulture)
+        [System.IO.File]::ReadAllText($log) | Should -BeExactly ("$($when.ToString('yyyy-MM-dd HH:mm:ss.fff zzz', [System.Globalization.CultureInfo]::InvariantCulture))    Opened: https://a/ (HTTP 200)`r`n")
+    }
+
+    It 'writes the details a page gained before its next event, each once' {
+        $log = Join-Path $TestDrive 'details.log'
+        Start-CaptureLog -Path $log
+        $item = [pscustomobject]@{ Index = 1; Status = 'OK'; Details = [System.Collections.Generic.List[string]]::new() }
+        $script:EventItem = $item
+        $script:EventDetailCount = 0
+        $item.Details.Add('first note')
+        $item.Status = 'WARNING'
+        $item.Details.Add("second`nline")
+        Write-RunEvent -Type 'action' -Data ([ordered]@{ index = 1; text = 'click:#a'; ok = $true; message = '' })
+        Write-RunEvent -Type 'pageEnd' -Data ([ordered]@{ index = 1; total = 1; status = 'WARNING'; captureCount = 0; stopped = $false })
+        $lines = @(Get-Content -LiteralPath $log | ForEach-Object { $_.Substring(32) })
+        $lines | Should -Be @('  Warning: first note', '  Warning: second', '      line', '  Action 1 click:#a: ok', 'Page 1 of 1 done: WARNING, 0 image(s)')
+    }
+
+    It 'never fails the run when the log cannot be written: one warning, then quiet, and marked incomplete' {
+        $log = Join-Path $TestDrive 'no-such-folder\x.log'
+        $output = & { Start-CaptureLog -Path $log; Register-CaptureLogFailure -Message 'again' -Path $log } 6>&1 | Out-String
+        ([regex]::Matches($output, 'WARNING: the capture log')).Count | Should -Be 1
+        $output | Should -Match 'will be incomplete'
+        $script:CaptureLogComplete | Should -BeFalse
+        $script:CaptureLogPath | Should -Be ''
+    }
+
+    It 'keeps writing events when the log file disappears, and marks the log incomplete' {
+        $log = Join-Path $TestDrive 'gone\x.log'
+        [void](New-Item -ItemType Directory -Path (Split-Path $log))
+        $events = Join-Path $TestDrive 'gone.ndjson'
+        $script:EventLogPath = $events
+        Start-CaptureLog -Path $log
+        Remove-Item -LiteralPath (Split-Path $log) -Recurse -Force
+        { Write-RunEvent -Type 'error' -Data ([ordered]@{ message = 'x' }) 6>$null } | Should -Not -Throw
+        $script:CaptureLogComplete | Should -BeFalse
+        @(Get-Content -LiteralPath $events).Count | Should -Be 1
     }
 }

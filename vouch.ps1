@@ -178,8 +178,18 @@
     For monitoring and tests; Install-VouchSchedule.ps1 sets it.
 
 .PARAMETER LogDir
-    Write a transcript of the run (vouch_<date>_<time>.log) to this folder. Meant for
-    unattended runs; Install-VouchSchedule.ps1 sets it.
+    Write a raw transcript of the console (everything the window shows, including errors
+    that stop the run before it starts) to vouch_<date>_<time>.log in this folder. Meant
+    for troubleshooting unattended runs; Install-VouchSchedule.ps1 sets it. This is not
+    the capture log (see -NoCaptureLog), which every capture run writes next to its
+    report.
+
+.PARAMETER NoCaptureLog
+    Do not write the capture log. By default every capture run writes <report name>.log
+    next to the report: a readable, time-stamped account of the run written while it
+    happens (each page, action, question and answer, image with its SHA-256, warning,
+    and the result), and it goes into the zip with the report. Not the same as -LogDir,
+    which keeps a raw console transcript.
 
 .PARAMETER LoginSetup
     First-run onboarding: opens Edge with the dedicated audit profile (no debugging
@@ -310,7 +320,9 @@ param(
 
     [string]$ZipName = '',
 
-    [switch]$OpenReport
+    [switch]$OpenReport,
+
+    [switch]$NoCaptureLog
 )
 
 Set-StrictMode -Version Latest
@@ -342,6 +354,14 @@ $script:EventRunId        = ''
 $script:EventPageId       = ''
 # Set once the stop file has been seen (Test-StopRequested); stays set for the run.
 $script:StopRequested     = $false
+# The capture log of the current run ('' = none), whether every line reached it, and
+# whether its write failure was already reported on the console.
+$script:CaptureLogPath     = ''
+$script:CaptureLogComplete = $true
+$script:CaptureLogWarned   = $false
+# The page whose details become "detail" events, and how many of them were written.
+$script:EventItem          = $null
+$script:EventDetailCount   = 0
 
 # DevTools binds to the IPv4 loopback only; "localhost" can resolve to ::1 and fail.
 $script:CdpHost = '127.0.0.1'
@@ -802,6 +822,7 @@ function Get-VouchConfigSchema {
                 logDir        = $text
                 failOnWarning = @{ Type = 'bool'; Default = $false }
                 openReport    = @{ Type = 'bool'; Default = $false }
+                captureLog    = @{ Type = 'bool'; Default = $true }
                 zip           = @{ Type = 'object'; Fields = [ordered]@{
                         enabled = @{ Type = 'bool'; Default = $false }
                         name    = @{ Type = 'string'; Default = '{report}.zip' }
@@ -3067,65 +3088,269 @@ function Get-ImagePixelSize {
 
 #region Progress events, stop and the Vouch dialog -----------------------------
 
+function Test-RunEventSink {
+    # Whether anything receives progress events (an event file or a capture log).
+    return -not ([string]::IsNullOrEmpty($script:EventLogPath) -and [string]::IsNullOrEmpty($script:CaptureLogPath))
+}
+
+function Add-RunFileText {
+    <#
+        Appends text to a file that another program may be reading at the same time: the
+        file is opened, appended, flushed and closed per call, with read/write/delete
+        sharing, so every line is on disk as soon as it is written and a reader that keeps
+        the file open blocks nothing. A reader that opens the file without write sharing
+        (File.ReadAllText does) locks it for a moment; a few short retries keep the text.
+        Throws when the text could not be written.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text
+    )
+    $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($Text)
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            $stream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write,
+                ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+            break
+        }
+        catch {
+            # PowerShell wraps the .NET error; look for the IOException inside.
+            $io = $_.Exception
+            while ($null -ne $io -and $io -isnot [System.IO.IOException]) { $io = $io.InnerException }
+            # 0x80070020 ERROR_SHARING_VIOLATION, 0x80070021 ERROR_LOCK_VIOLATION
+            $sharing = $null -ne $io -and ($io.HResult -band 0xFFFF) -in 0x20, 0x21
+            if (-not $sharing -or $attempt -ge 4) { throw }
+            [System.Threading.Thread]::Sleep(50)
+        }
+    }
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush()
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 function Write-RunEvent {
     <#
-        Appends one progress event to -EventLogPath: one JSON object per line (NDJSON,
-        UTF-8 without BOM, LF), so another process - the Designer - can follow the run by
-        reading new lines. The file is opened, appended and closed per event: every line
-        is on disk for the reader as soon as it is written, and the reader may keep the
-        file open (shared read/write access) without blocking the run. Events are a
-        convenience: a failure to write one is never a reason to fail the run.
-        Without an event log this returns at once.
+        One progress event, built once and handed to every sink that is on:
+        - the event file (-EventLogPath): one JSON object per line (NDJSON, UTF-8
+          without BOM, LF), for the Designer and other programs following the run;
+        - the capture log (Start-CaptureLog): the same event as readable lines.
+        Both are written as the run happens, so they, and the report built from the
+        same items, cannot disagree. Details a page gained since the last event are
+        written first (as "detail" events), so a warning appears where it happened.
+        Events are a convenience: a failure to write one never fails the run. With no
+        sink on this returns at once.
     #>
     param(
         [Parameter(Mandatory)][string]$Type,
         [AllowNull()][System.Collections.IDictionary]$Data = $null
     )
-    $path = $script:EventLogPath
-    if ([string]::IsNullOrEmpty($path)) { return }
-    try {
-        $record = [ordered]@{
-            ts    = [System.DateTimeOffset]::Now.ToString('yyyy-MM-ddTHH:mm:ss.fffzzz', [System.Globalization.CultureInfo]::InvariantCulture)
-            type  = $Type
-            runId = $script:EventRunId
+    $eventPath = $script:EventLogPath
+    $logPath = $script:CaptureLogPath
+    if ([string]::IsNullOrEmpty($eventPath) -and [string]::IsNullOrEmpty($logPath)) { return }
+    if ($Type -in 'navigation', 'action', 'capture', 'prompt', 'promptResult', 'pageEnd') { Write-PendingDetailEvent }
+
+    $record = [ordered]@{
+        ts    = [System.DateTimeOffset]::Now.ToString('yyyy-MM-ddTHH:mm:ss.fffzzz', [System.Globalization.CultureInfo]::InvariantCulture)
+        type  = $Type
+        runId = $script:EventRunId
+    }
+    # ts, type and runId belong to the envelope; a field of the same name cannot replace them.
+    if ($null -ne $Data) {
+        foreach ($key in @($Data.Keys)) {
+            if ([string]$key -notin 'ts', 'type', 'runId') { $record[[string]$key] = $Data[$key] }
         }
-        # ts, type and runId belong to the envelope; a field of the same name cannot replace them.
-        if ($null -ne $Data) {
-            foreach ($key in @($Data.Keys)) {
-                if ([string]$key -notin 'ts', 'type', 'runId') { $record[[string]$key] = $Data[$key] }
-            }
-        }
-        $line = (ConvertTo-Json -InputObject $record -Compress -Depth 8) + "`n"
-        $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($line)
-        # A reader that opens the file without write sharing (File.ReadAllText does)
-        # locks it for a moment; a few short retries keep the event - runEnd above all.
-        for ($attempt = 1; ; $attempt++) {
-            try {
-                $stream = [System.IO.FileStream]::new($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write,
-                    ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
-                break
-            }
-            catch {
-                # PowerShell wraps the .NET error; look for the IOException inside.
-                $io = $_.Exception
-                while ($null -ne $io -and $io -isnot [System.IO.IOException]) { $io = $io.InnerException }
-                # 0x80070020 ERROR_SHARING_VIOLATION, 0x80070021 ERROR_LOCK_VIOLATION
-                $sharing = $null -ne $io -and ($io.HResult -band 0xFFFF) -in 0x20, 0x21
-                if (-not $sharing -or $attempt -ge 4) { throw }
-                [System.Threading.Thread]::Sleep(50)
-            }
-        }
+    }
+
+    if (-not [string]::IsNullOrEmpty($eventPath)) {
+        try { Add-RunFileText -Path $eventPath -Text ((ConvertTo-Json -InputObject $record -Compress -Depth 8) + "`n") }
+        catch { Write-Verbose "Could not write the '$Type' event to '$eventPath': $($_.Exception.Message)" }
+    }
+    if (-not [string]::IsNullOrEmpty($logPath)) {
         try {
-            $stream.Write($bytes, 0, $bytes.Length)
-            $stream.Flush()
+            $lines = Format-CaptureLogEntry -Record $record
+            if ($lines.Count -gt 0) { Add-RunFileText -Path $logPath -Text (($lines -join "`r`n") + "`r`n") }
         }
-        finally {
-            $stream.Dispose()
-        }
+        catch { Register-CaptureLogFailure -Message $_.Exception.Message }
+    }
+}
+
+function Write-PendingDetailEvent {
+    <#
+        The details (warnings, notes) the current page gained since the last event, one
+        "detail" event each. Details are added in many places of the capture code; the
+        event writer collects them before each page event instead, so none is missed and
+        each is logged once, close to when it happened.
+    #>
+    $item = $script:EventItem
+    if ($null -eq $item -or -not $item.PSObject.Properties['Details']) { return }
+    while ($script:EventDetailCount -lt $item.Details.Count) {
+        $text = [string]$item.Details[$script:EventDetailCount]
+        $script:EventDetailCount++
+        Write-RunEvent -Type 'detail' -Data ([ordered]@{
+            pageId = $script:EventPageId; pageIndex = $item.Index; status = [string]$item.Status; text = $text })
+    }
+}
+
+function Start-CaptureLog {
+    <#
+        Starts the capture log of one run: the readable record of what the run did,
+        written next to the report while the run happens (Write-RunEvent), so a crash or
+        a stop still leaves a truthful log up to that point. A log that cannot be
+        created is a warning, never a reason to stop the run. '' switches it off.
+    #>
+    param([AllowEmptyString()][string]$Path = '')
+    $script:CaptureLogPath = ''
+    $script:CaptureLogComplete = $true
+    $script:CaptureLogWarned = $false
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    try {
+        # A new, empty file: a report of the same name replaces the earlier one, and so does its log.
+        [System.IO.File]::WriteAllBytes($Path, [byte[]]@())
+        $script:CaptureLogPath = $Path
     }
     catch {
-        Write-Verbose "Could not write the '$Type' event to '$path': $($_.Exception.Message)"
+        Register-CaptureLogFailure -Message $_.Exception.Message -Path $Path
     }
+}
+
+function Register-CaptureLogFailure {
+    <#
+        A line of the capture log could not be written. The run goes on; the person is
+        told once on the console, and the run's summary says the log is incomplete.
+    #>
+    param(
+        [AllowEmptyString()][string]$Message = '',
+        [AllowEmptyString()][string]$Path = $script:CaptureLogPath
+    )
+    $script:CaptureLogComplete = $false
+    if ($script:CaptureLogWarned) { return }
+    $script:CaptureLogWarned = $true
+    Write-Host "WARNING: the capture log '$Path' could not be written ($Message). The run goes on, but the capture log will be incomplete." -ForegroundColor Yellow
+}
+
+function Format-CaptureLogEntry {
+    <#
+        One event as lines of the capture log: plain text an auditor reads top to
+        bottom. Every entry starts with the local time and its UTC offset; lines of a
+        page are indented under it; text that has line breaks of its own (a message, a
+        note) continues on indented lines without a time, so each entry stays one block.
+        Returns the lines (no line ends).
+    #>
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Record)
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $get = { param($Name) if ($Record.Contains($Name) -and $null -ne $Record[$Name]) { $Record[$Name] } else { '' } }
+    $stamp = [string](& $get 'ts')
+    $when = [System.DateTimeOffset]::MinValue
+    if ([System.DateTimeOffset]::TryParseExact($stamp, 'yyyy-MM-ddTHH:mm:ss.fffzzz', $invariant, [System.Globalization.DateTimeStyles]::None, [ref]$when)) {
+        $stamp = $when.ToString('yyyy-MM-dd HH:mm:ss.fff zzz', $invariant)
+    }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $add = {
+        param([string]$Text, [int]$Indent = 0)
+        $parts = @(([string]$Text) -split "`r`n|`n|`r")
+        $lines.Add("$stamp  $(' ' * $Indent)$($parts[0])")
+        for ($i = 1; $i -lt $parts.Count; $i++) { $lines.Add("$(' ' * ($stamp.Length + 2 + $Indent + 4))$($parts[$i])") }
+    }
+    $areaText = @{ screen = 'full screen'; window = 'Edge window only'; page = 'page content only' }
+
+    switch ([string](& $get 'type')) {
+        'runStart' {
+            & $add "Vouch $(& $get 'toolVersion') capture log - run $(& $get 'runId')"
+            & $add 'This log is written line by line while the run happens; the report is made at the end.'
+            & $add "Computer: $(& $get 'computer')"
+            & $add "Windows user: $(& $get 'user')"
+            if (& $get 'account') { & $add "Account: $(& $get 'account')" }
+            & $add "Definition file: $(& $get 'source')"
+            & $add "Output folder: $(& $get 'outputDir')"
+            & $add "Report: $(& $get 'reportFile')"
+            $area = [string](& $get 'captureArea')
+            $areaName = if ($areaText.ContainsKey($area)) { $areaText[$area] } else { $area }
+            & $add "Capture defaults: $areaName, zoom $(& $get 'zoomPercent')%, $(& $get 'imageFormat')"
+            & $add "Classification: $(if (& $get 'classification') { & $get 'classification' } else { 'none' })"
+            if ([bool](& $get 'interactive')) { & $add 'Mode: interactive - the Vouch dialog may ask for decisions' }
+            else { & $add 'Mode: unattended - nothing is asked; pages that are not ready are captured with a warning' }
+            & $add "Pages to capture: $(& $get 'pageCount')"
+        }
+        'pageStart' {
+            & $add ("Page {0} of {1}: {2} ""{3}"" - {4}" -f (& $get 'index'), (& $get 'total'), (& $get 'pageId'), (& $get 'name'), (& $get 'url'))
+        }
+        'navigation' {
+            $http = if ([int](& $get 'httpStatus') -gt 0) { "HTTP $(& $get 'httpStatus')" } else { 'HTTP status not reported by the browser' }
+            & $add "Opened: $(& $get 'finalUrl') ($http)" 2
+        }
+        'action' {
+            $text = if (& $get 'text') { & $get 'text' } else { & $get 'actionType' }
+            $message = [string](& $get 'message')
+            if ([bool](& $get 'ok')) { & $add ("Action {0} {1}: ok{2}" -f (& $get 'index'), $text, $(if ($message) { " - $message" } else { '' })) 2 }
+            else { & $add ("Action {0} {1}: FAILED - {2}" -f (& $get 'index'), $text, $message) 2 }
+        }
+        'capture' {
+            $label = if (& $get 'label') { " ""$(& $get 'label')""" } else { '' }
+            $area = [string](& $get 'area')
+            $size = if ([int](& $get 'width') -gt 0) { ", $(& $get 'width')x$(& $get 'height') px" } else { '' }
+            & $add ("Image {0}: capture {1}{2}, segment {3} of {4}, {5}, zoom {6}%{7}, SHA-256 {8}" -f (& $get 'fileName'), (& $get 'captureNumber'), $label,
+                (& $get 'segment'), (& $get 'segmentCount'), $(if ($areaText.ContainsKey($area)) { $areaText[$area] } else { $area }), (& $get 'zoomPercent'), $size, (& $get 'sha256')) 2
+        }
+        'prompt' {
+            & $add "Question in the Vouch dialog ($(& $get 'kind')): $(& $get 'title')" 2
+            & $add ([string](& $get 'message')) 4
+            & $add "If nobody answers within $(& $get 'timeoutSec') seconds: $(& $get 'defaultDecision')" 4
+        }
+        'promptResult' {
+            $decision = [string](& $get 'decision')
+            $answer = switch ($decision) {
+                'Wait' { "Wait $(& $get 'waitSeconds') seconds more" }
+                'Skip' { 'Skip this page' }
+                default { $decision }
+            }
+            if (-not [bool](& $get 'shown')) { & $add "The Vouch dialog could not be shown; nobody answered, so Vouch went on with: $answer" 2 }
+            elseif ([bool](& $get 'timedOut')) { & $add "Nobody answered in time, so Vouch went on with: $answer" 2 }
+            else { & $add "Answer: $answer" 2 }
+        }
+        'detail' {
+            $kind = switch ([string](& $get 'status')) { 'OK' { 'Note' } 'WARNING' { 'Warning' } default { 'Problem' } }
+            & $add "${kind}: $(& $get 'text')" 2
+        }
+        'pageEnd' {
+            $stopped = if ([bool](& $get 'stopped')) { ' - stopped by the user' } else { '' }
+            & $add ("Page {0} of {1} done: {2}, {3} image(s){4}" -f (& $get 'index'), (& $get 'total'), (& $get 'status'), (& $get 'captureCount'), $stopped)
+        }
+        'archive' {
+            & $add "Creating archive $(& $get 'zipPath')"
+            & $add 'The copy of this log inside the archive ends with this line; the lines after it are only in the log file next to the report.' 2
+        }
+        'error' {
+            & $add "ERROR: $(& $get 'message')"
+        }
+        'runEnd' {
+            $counts = & $get 'counts'
+            if ($counts -is [System.Collections.IDictionary]) {
+                & $add ("Run finished: {0} of {1} page(s) run - {2} OK, {3} warning(s), {4} failed, {5} not run; {6} image(s)" -f
+                    $counts['run'], $counts['pages'], $counts['ok'], $counts['warning'], $counts['failed'], $counts['notRun'], $counts['captures'])
+            }
+            else { & $add 'Run ended with an error; no report was made.' }
+            & $add "Stopped by the user: $(if ([bool](& $get 'stopped')) { 'yes' } else { 'no' })"
+            if (& $get 'manifestSha256') { & $add "Manifest SHA-256: $(& $get 'manifestSha256')" }
+            if (& $get 'reportPath') { & $add "Report: $(& $get 'reportPath')" }
+            if ($counts -is [System.Collections.IDictionary]) {
+                & $add "JSON summary: $(if (& $get 'jsonSummaryPath') { & $get 'jsonSummaryPath' } else { 'not written' })"
+            }
+            if (& $get 'zipPath') { & $add "Zip: $(& $get 'zipPath') (SHA-256 $(& $get 'zipSha256'))" }
+            & $add "Exit code: $(& $get 'exitCode')"
+            if ($Record.Contains('elapsedSec')) {
+                & $add ("Elapsed: {0}" -f [TimeSpan]::FromSeconds([double](& $get 'elapsedSec')).ToString('hh\:mm\:ss', $invariant))
+            }
+            & $add 'End of capture log.'
+        }
+        default {
+            & $add "Event: $(& $get 'type')"
+        }
+    }
+    return , [string[]]$lines
 }
 
 function Get-StopFilePath {
@@ -4575,10 +4800,17 @@ function Add-ItemCapture {
     $Item.Captures.Add((New-CaptureRecord -Bytes $bytes -Url $PageUrl -SegmentIndex $SegmentIndex -SegmentCount $SegmentCount `
         -FilePath $filePath -FileName $fileName -CapturedAt $capturedAt -CaptureNumber $CaptureNumber -Label $Label `
         -CaptureArea $area -ZoomPercent $ZoomPercent -NoBase64:$linked))
-    Write-RunEvent -Type 'capture' -Data ([ordered]@{
-        pageId = $script:EventPageId; pageIndex = $Item.Index; captureNumber = $CaptureNumber; label = $Label
-        segment = $SegmentIndex; segmentCount = $SegmentCount; fileName = $fileName; area = $area; zoomPercent = $ZoomPercent
-        url = $PageUrl; capturedAt = $Item.Captures[$Item.Captures.Count - 1].CapturedAt })
+    if (Test-RunEventSink) {
+        # The pixel size only when someone receives it: reading it costs a header decode.
+        $record = $Item.Captures[$Item.Captures.Count - 1]
+        $pixels = [pscustomobject]@{ Width = 0; Height = 0 }
+        try { $pixels = Get-ImagePixelSize -Bytes $bytes } catch { Write-Verbose "Image size not read: $($_.Exception.Message)" }
+        Write-RunEvent -Type 'capture' -Data ([ordered]@{
+            pageId = $script:EventPageId; pageIndex = $Item.Index; captureNumber = $CaptureNumber; label = $Label
+            segment = $SegmentIndex; segmentCount = $SegmentCount; fileName = $fileName; area = $area; zoomPercent = $ZoomPercent
+            url = $PageUrl; capturedAt = $record.CapturedAt; width = [int]$pixels.Width; height = [int]$pixels.Height
+            bytes = $record.Bytes; sha256 = $record.Sha256 })
+    }
 }
 
 function Get-PartialWindowDetail {
@@ -4850,7 +5082,9 @@ function New-ReportOptions {
         [AllowEmptyString()][string]$Account = '',
         [bool]$ShowIndex = $true,
         [bool]$EmbedImages = $true,
-        [AllowEmptyString()][string]$ImageFolder = ''
+        [AllowEmptyString()][string]$ImageFolder = '',
+        # The capture log's file name ('' = none written).
+        [AllowEmptyString()][string]$CaptureLogName = ''
     )
     $style = Get-ClassificationStyle -Level $Classification
     return [pscustomobject]@{
@@ -4870,6 +5104,7 @@ function New-ReportOptions {
         ShowIndex      = $ShowIndex
         EmbedImages    = $EmbedImages
         ImageFolder    = $ImageFolder.Trim('/', '\').Replace('\', '/')
+        CaptureLogName = $CaptureLogName
     }
 }
 
@@ -5078,6 +5313,7 @@ table.contents ul { margin: 4px 0 0 0; padding-left: 18px; }
         & $addRow 'Capture window' (Get-CaptureWindow -Items $Items).Text
         & $addRow 'Account used' $Options.Account
         & $addRow 'Report generated by' $(if ($Options.GeneratedBy) { $Options.GeneratedBy } else { [string]$Run.User })
+        if ($Options.PSObject.Properties['CaptureLogName']) { & $addRow 'Capture log' $Options.CaptureLogName }
     }
     foreach ($row in @(
         [pscustomobject]@{ Label = 'Run started';       Text = $Run.StartTime },
@@ -5444,7 +5680,10 @@ function ConvertTo-RunSummaryJson {
         [Parameter(Mandatory)][int]$ExitCode,
         [AllowNull()][object]$Options = $null,
         # { Path; Sha256 } of the zip, or $null when none is made.
-        [AllowNull()][object]$Zip = $null
+        [AllowNull()][object]$Zip = $null,
+        # The capture log ('' = none) and whether every line of it was written.
+        [AllowEmptyString()][string]$LogPath = '',
+        [bool]$LogComplete = $true
     )
 
     $summary = [ordered]@{
@@ -5471,6 +5710,10 @@ function ConvertTo-RunSummaryJson {
         }
     }
     if ($null -ne $Zip) { $summary['Zip'] = [ordered]@{ Path = [string]$Zip.Path; Sha256 = $Zip.Sha256 } }
+    if ($LogPath) {
+        $summary['LogPath'] = $LogPath
+        $summary['LogComplete'] = $LogComplete
+    }
     $summary['Items'] = @(foreach ($item in $Items) {
             [ordered]@{
                 Index          = $item.Index
@@ -5809,10 +6052,11 @@ function Get-NameTokenValues {
 
 function New-EvidenceArchive {
     <#
-        The evidence package: one zip holding the report, its JSON summary and its image
-        folder with SHA256SUMS, at the same relative places, so the extracted copy is a
-        working report whose links and -Verify still work. Only these files go in - not
-        the log, the event file or anything else that happens to be in the output folder.
+        The evidence package: one zip holding the report, its JSON summary, its capture
+        log (as written so far) and its image folder with SHA256SUMS, at the same relative
+        places, so the extracted copy is a working report whose links and -Verify still
+        work. Only these files go in - not the -LogDir transcript, the event file or
+        anything else that happens to be in the output folder.
         The zip is created new (never over an existing file) and removed again if it
         cannot be completed. Returns { Path; Sha256; Entries }.
     #>
@@ -5820,6 +6064,8 @@ function New-EvidenceArchive {
         [Parameter(Mandatory)][string]$ZipPath,
         [Parameter(Mandatory)][string]$ReportPath,
         [AllowEmptyString()][string]$SummaryPath = '',
+        # The capture log, as far as it is written when the zip is made.
+        [AllowEmptyString()][string]$LogPath = '',
         [AllowEmptyString()][string]$ImagesDir = '',
         # The image file names to include (the run's own, from its manifest).
         [AllowEmptyCollection()][string[]]$ImageFiles = @()
@@ -5831,6 +6077,9 @@ function New-EvidenceArchive {
     $files.Add([pscustomobject]@{ Source = $ReportPath; Entry = [System.IO.Path]::GetFileName($ReportPath) })
     if ($SummaryPath -and (Test-Path -LiteralPath $SummaryPath -PathType Leaf)) {
         $files.Add([pscustomobject]@{ Source = $SummaryPath; Entry = [System.IO.Path]::GetFileName($SummaryPath) })
+    }
+    if ($LogPath -and (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
+        $files.Add([pscustomobject]@{ Source = $LogPath; Entry = [System.IO.Path]::GetFileName($LogPath) })
     }
     if ($ImagesDir -and (Test-Path -LiteralPath $ImagesDir -PathType Container)) {
         $folderEntry = [System.IO.Path]::GetRelativePath($reportFolder, $ImagesDir).Replace('\', '/')
@@ -5965,6 +6214,7 @@ function Get-RunSettingDefinition {
         [pscustomobject]@{ Name = 'Zip';                  Type = 'bool';   Section = 'output';   Key = 'zip.enabled' }
         [pscustomobject]@{ Name = 'ZipName';              Type = 'string'; Section = 'output';   Key = 'zip.name' }
         [pscustomobject]@{ Name = 'OpenReport';           Type = 'bool';   Section = 'output';   Key = 'openReport' }
+        [pscustomobject]@{ Name = 'NoCaptureLog';         Type = 'bool';   Section = 'output';   Key = 'captureLog'; Invert = $true }
     )
 }
 
@@ -6603,6 +6853,8 @@ function Invoke-CaptureItem {
             # Edge's error page lives at chrome-error://; the browser stayed on the
             # requested URL, so record that rather than report a redirect.
             $Item.FinalUrl = if ($browserErrorPage) { $Definition.Url } else { Get-CurrentPageUrl }
+            Write-RunEvent -Type 'navigation' -Data ([ordered]@{
+                pageId = $script:EventPageId; pageIndex = $Item.Index; finalUrl = [string]$Item.FinalUrl; httpStatus = [int]$Item.HttpStatus })
         }
         & $readPageState
         $signInDetail = Get-SignInDetail -RequestedUrl $Definition.Url -FinalUrl $Item.FinalUrl -BrowserErrorPage $browserErrorPage
@@ -6771,6 +7023,8 @@ function Invoke-Main {
     finally {
         $script:EventLogPath = ''
         $script:StopRequested = $false
+        $script:CaptureLogPath = ''
+        $script:EventItem = $null
     }
 }
 
@@ -6931,9 +7185,19 @@ function Invoke-CaptureRun {
     $script:InteractiveRun = Test-InteractiveRun -NoPrompt $settings.NoPrompt
     # Kept for the end of the run (opening the report): InteractiveRun is reset before that.
     $interactiveRun = $script:InteractiveRun
+    # The capture log starts now and grows with the run (Write-RunEvent), next to the report.
+    $captureLogPath = if ($settings.NoCaptureLog) { '' } else { [System.IO.Path]::ChangeExtension($reportPath, '.log') }
+    Start-CaptureLog -Path $captureLogPath
+    $imageText = if ($settings.ImageFormat -eq 'png') { 'PNG images' } else { "JPEG images (quality $($settings.JpegQuality))" }
+    $runClassification = Get-ClassificationStyle -Level $settings.Classification
     Write-RunEvent -Type 'runStart' -Data ([ordered]@{
         toolVersion = $script:ToolVersion; pageCount = $definitions.Count; reportPath = $reportPath
-        source = $sourcePath; interactive = $script:InteractiveRun; stopFile = (Get-StopFilePath); processId = $PID })
+        source = $sourcePath; interactive = $script:InteractiveRun; stopFile = (Get-StopFilePath); processId = $PID
+        computer = [string]$env:COMPUTERNAME; user = "$env:USERDOMAIN\$env:USERNAME"; account = ([string]$settings.Account).Trim()
+        outputDir = $resolvedOutputDir; reportFile = $effectiveReportName; captureArea = (Get-PageCaptureMode -Settings $settings).Area
+        zoomPercent = (Get-PageCaptureMode -Settings $settings).ZoomPercent; imageFormat = $imageText
+        classification = $(if ($null -ne $runClassification) { $runClassification.Level } else { '' })
+        logPath = $script:CaptureLogPath })
 
     try {
         if ($settings.UseVirtualDesktop) {
@@ -6982,6 +7246,9 @@ function Invoke-CaptureRun {
             Write-RunEvent -Type 'pageStart' -Data ([ordered]@{
                 pageId = $pageId; pageIndex = $definition.Index; index = $position; total = $definitions.Count
                 name = [string]$definition.Name; url = [string]$definition.Url })
+            # From here the page's details become "detail" events as they are added.
+            $script:EventItem = $item
+            $script:EventDetailCount = 0
             $pageSettings = Get-PageSettings -Settings $settings -Definition $definition -Config $config -BoundNames $boundNames
             [void](Invoke-CaptureItem -Definition $definition -Item $item -ItemCount $definitions.Count `
                 -Settings $pageSettings -CaptureContext $captureContext)
@@ -6989,6 +7256,7 @@ function Invoke-CaptureRun {
                 pageId = $pageId; pageIndex = $item.Index; index = $position; total = $definitions.Count
                 status = $item.Status; details = @($item.Details); captureCount = $item.Captures.Count
                 finalUrl = [string]$item.FinalUrl; stopped = [bool]$script:StopRequested })
+            $script:EventItem = $null
         }
     }
     finally {
@@ -7076,6 +7344,7 @@ function Invoke-CaptureRun {
         -Description $settings.Description -Origin $settings.Origin -GeneratedBy $settings.GeneratedBy `
         -PeriodFrom $settings.PeriodFrom -PeriodTo $settings.PeriodTo -PeriodLabel $settings.PeriodLabel `
         -Account $settings.Account -ShowIndex (-not $settings.NoIndex) -EmbedImages $embedImages `
+        -CaptureLogName $(if ($script:CaptureLogPath) { [System.IO.Path]::GetFileName($script:CaptureLogPath) } else { '' }) `
         -ImageFolder $(if ($imagesDir) { [System.IO.Path]::GetRelativePath($resolvedOutputDir, $imagesDir) } else { '' })
 
     $html = New-HtmlReport -Items @($items) -Run $run -Options $reportOptions
@@ -7098,7 +7367,8 @@ function Invoke-CaptureRun {
     $summaryPath = ''
     $writeSummary = {
         param($Zip)
-        $json = ConvertTo-RunSummaryJson -Items @($items) -Run $run -ReportPath $reportPath -ExitCode $script:ExitCode -Options $reportOptions -Zip $Zip
+        $json = ConvertTo-RunSummaryJson -Items @($items) -Run $run -ReportPath $reportPath -ExitCode $script:ExitCode -Options $reportOptions -Zip $Zip `
+            -LogPath $captureLogPath -LogComplete ([bool]$script:CaptureLogComplete)
         [System.IO.File]::WriteAllText($summaryPath, $json, [System.Text.UTF8Encoding]::new($false))
     }
     if ($settings.JsonSummary) {
@@ -7108,8 +7378,10 @@ function Invoke-CaptureRun {
 
     $archive = $null
     if ($zipPath) {
+        # Said before the zip is made, so the log inside the zip says where it ends.
+        Write-RunEvent -Type 'archive' -Data ([ordered]@{ zipPath = $zipPath })
         try {
-            $archive = New-EvidenceArchive -ZipPath $zipPath -ReportPath $reportPath -SummaryPath $summaryPath -ImagesDir $imagesDir `
+            $archive = New-EvidenceArchive -ZipPath $zipPath -ReportPath $reportPath -SummaryPath $summaryPath -LogPath $script:CaptureLogPath -ImagesDir $imagesDir `
                 -ImageFiles ([string[]]@($items | ForEach-Object { $_.Captures } | ForEach-Object { $_.FileName }))
         }
         catch {
@@ -7130,6 +7402,11 @@ function Invoke-CaptureRun {
     Write-Host "Report: $reportPath ($reportSizeMb MB)" -ForegroundColor Cyan
     if ($summaryPath) { Write-Host "Summary: $summaryPath" }
     if ($null -ne $archive) { Write-Host "Zip: $($archive.Path) (SHA-256 $($archive.Sha256))" -ForegroundColor Cyan }
+    if ($script:CaptureLogPath) {
+        Write-Host "Capture log: $($script:CaptureLogPath)"
+        if (-not $script:CaptureLogComplete) { Write-Host 'WARNING: the capture log is incomplete: some of its lines could not be written.' -ForegroundColor Yellow }
+    }
+    elseif ($captureLogPath) { Write-Host "WARNING: no capture log was written ($captureLogPath could not be created)." -ForegroundColor Yellow }
     Remove-StopFile
     Write-RunEvent -Type 'runEnd' -Data ([ordered]@{
         exitCode = $script:ExitCode; reportPath = $reportPath; jsonSummaryPath = $summaryPath
@@ -7138,7 +7415,9 @@ function Invoke-CaptureRun {
             notRun = $definitions.Count - $items.Count; captures = [int]$captureCount }
         stopped = [bool]$script:StopRequested
         zipPath = $(if ($null -ne $archive) { $archive.Path } else { '' })
-        zipSha256 = $(if ($null -ne $archive) { $archive.Sha256 } else { '' }) })
+        zipSha256 = $(if ($null -ne $archive) { $archive.Sha256 } else { '' })
+        manifestSha256 = $run.ManifestSha256; elapsedSec = [Math]::Round(([System.DateTimeOffset]::Now - $runStart).TotalSeconds, 1)
+        logPath = $script:CaptureLogPath; logComplete = [bool]$script:CaptureLogComplete })
 
     # Last of all, when everything (the zip too) is finished - and only for a person.
     if ($settings.OpenReport) {
@@ -7221,7 +7500,8 @@ function Write-RunFailedEvent {
     Write-RunEvent -Type 'error' -Data ([ordered]@{ message = $Message })
     Remove-StopFile
     Write-RunEvent -Type 'runEnd' -Data ([ordered]@{
-        exitCode = 1; reportPath = ''; jsonSummaryPath = ''; counts = $null; stopped = [bool]$script:StopRequested })
+        exitCode = 1; reportPath = ''; jsonSummaryPath = ''; counts = $null; stopped = [bool]$script:StopRequested
+        logPath = $script:CaptureLogPath; logComplete = [bool]$script:CaptureLogComplete })
 }
 
 $transcribing = Start-RunLog -Directory (Get-RunLogDirectory -BoundParameters $PSBoundParameters -LogDir $LogDir -ConfigPath $ConfigPath)

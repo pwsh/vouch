@@ -30,6 +30,7 @@
     "logDir": "",
     "failOnWarning": false,
     "openReport": false,
+    "captureLog": true,
     "zip": { "enabled": false, "name": "{report}.zip" }
   },
   "report": {
