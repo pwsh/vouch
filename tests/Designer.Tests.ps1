@@ -72,18 +72,21 @@ namespace VouchTest {
         <#
             A real Designer in a child pwsh: functions loaded the way the tests load them,
             -NoPanel (no window), and a ready file that gives the port and the token.
+            Without -AuditPort it never connects to a browser (-NoBrowser); with it, it
+            attaches to the headless Edge listening there and never starts one.
         #>
-        param([string]$ConfigPath = '', [string]$Name = 'server')
+        param([string]$ConfigPath = '', [string]$Name = 'server', [int]$AuditPort = 0, [string]$AuditProfile = '')
         $folder = Join-Path -Path $TestDrive -ChildPath $Name
         [void](New-Item -ItemType Directory -Path $folder -Force)
         $ready = Join-Path -Path $folder -ChildPath 'ready.json'
         $literal = { param($s) "'" + ([string]$s).Replace("'", "''") + "'" }
+        $browser = if ($AuditPort -gt 0) { "-DebugPort $AuditPort -AuditProfileDir $(& $literal $AuditProfile) -NoBrowserLaunch" } else { '-NoBrowser' }
         $hostScript = @"
 `$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . $(& $literal (Join-Path $PSScriptRoot 'TestHelpers.ps1'))
 . ([scriptblock]::Create((Get-VouchFunctionSource -Path $(& $literal $script:VouchPath), $(& $literal $script:DesignerPath))))
-Start-VouchDesigner -ScriptPath $(& $literal $script:VouchPath) -ConfigPath $(& $literal $ConfigPath) -NoPanel -ReadyFile $(& $literal $ready) -Version 'test'
+Start-VouchDesigner -ScriptPath $(& $literal $script:VouchPath) -ConfigPath $(& $literal $ConfigPath) -NoPanel -ReadyFile $(& $literal $ready) -Version 'test' $browser
 "@
         $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($hostScript))
         $pwsh = (Get-Process -Id $PID).Path
@@ -286,8 +289,7 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
     }
 
     It 'answers 501 with a plain message for <_>' -ForEach @(
-        'POST /api/browser/navigate', 'GET /api/browser/current', 'POST /api/pick/start', 'GET /api/pick', 'POST /api/pick/cancel',
-        'POST /api/action/test', 'POST /api/run', 'GET /api/run', 'POST /api/run/stop', 'GET /preview/run1/001.jpg') {
+        'POST /api/run', 'GET /api/run', 'POST /api/run/stop', 'GET /preview/run1/001.jpg') {
         $method, $path = $_ -split ' ', 2
         $r = Invoke-TestRoute $method $path -State $script:State
         $r.Status | Should -Be 501
@@ -893,6 +895,24 @@ Describe 'The real listener (child pwsh, real sockets)' -Tag 'Integration' {
         ($ok.Body | ConvertFrom-Json).config.schemaVersion | Should -Be 1
     }
 
+    It 'stops waiting for a body that never comes (408) and goes on serving' {
+        $client = [System.Net.Sockets.TcpClient]::new('localhost', $script:Live.Port)
+        try {
+            $stream = $client.GetStream()
+            $head = "POST /api/config/validate HTTP/1.1`r`nHost: localhost:$($script:Live.Port)`r`nX-Vouch-Token: $($script:Live.Token)`r`nOrigin: $($script:Live.Base)`r`nContent-Type: application/json`r`nContent-Length: 100`r`n`r`n{"
+            $bytes = [System.Text.Encoding]::ASCII.GetBytes($head)
+            $stream.Write($bytes, 0, $bytes.Length)
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            $stream.ReadTimeout = 20000
+            $reader = [System.IO.StreamReader]::new($stream)
+            $status = $reader.ReadLine()
+            $watch.Elapsed.TotalSeconds | Should -BeLessThan 15
+            $status | Should -Match ' 408 '
+        }
+        finally { $client.Dispose() }
+        (Invoke-RawRequest -Url "$($script:Live.Base)/api/state" -Headers @{ 'X-Vouch-Token' = $script:Live.Token }).Status | Should -Be 200
+    }
+
     It 'stops on /api/shutdown, and the process ends' {
         $own = @{ 'X-Vouch-Token' = $script:Live.Token; Origin = $script:Live.Base }
         (Invoke-RawRequest -Method POST -Url "$($script:Live.Base)/api/shutdown" -Headers $own -Body '{}' -ContentType 'application/json').Status | Should -Be 200
@@ -1303,16 +1323,110 @@ return { start, asClick, back, again, stash };
         $r.stash | Should -BeNullOrEmpty
     }
 
-    It 'shows the later-step buttons as unavailable, with an explanation instead of an action' {
+    It 'shows the browser buttons as unavailable while no browser is connected, with the reason and Retry' {
         $r = Invoke-Panel @'
 D.setTab('pages');
 const pick = Array.from(document.querySelectorAll('button')).find(b => b.dataset.fkey === 'pick-click');
 pick.click();
 await new Promise(r => setTimeout(r, 50));
-return { disabled: pick.getAttribute('aria-disabled'), toast: document.querySelector('#toast').textContent };
+const strip = document.querySelector('#browser-strip');
+return { disabled: pick.getAttribute('aria-disabled'), toast: document.querySelector('#toast').textContent,
+  strip: strip.textContent, off: strip.classList.contains('is-off'),
+  retry: !!Array.from(strip.querySelectorAll('button')).find(b => b.dataset.fkey === 'bs-retry') };
 '@
         $r.disabled | Should -Be 'true'
-        $r.toast | Should -Match 'later step'
+        $r.toast | Should -Match 'audit browser, which is not connected'
+        $r.off | Should -BeTrue
+        $r.strip | Should -Match 'Browser not connected'
+        $r.retry | Should -BeTrue
+    }
+
+    It 'keeps the logo preview with the path it was picked for, through Undo and Redo' {
+        $logo = Join-Path $TestDrive 'logo.png'
+        $r = Invoke-Panel @"
+const realFetch = window.fetch;
+window.fetch = (url, options) => url === '/api/dialog'
+  ? Promise.resolve(new Response(JSON.stringify({ path: $(ConvertTo-Json $logo), value: 'logo.png', logo: { path: $(ConvertTo-Json $logo), dataUri: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=', warning: '' } }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+  : realFetch(url, options);
+try {
+  D.setTab('report');
+  const before = __cfg().report.logoPath || '';
+  Array.from(document.querySelectorAll('button')).find(b => b.dataset.fkey === 'browse:report.logoPath').click();
+  await new Promise(r => setTimeout(r, 100));
+  const picked = { path: __cfg().report.logoPath, img: !!document.querySelector('.logo-thumb') };
+  D.undo();
+  const undone = { path: __cfg().report.logoPath || '', img: !!document.querySelector('.logo-thumb') };
+  D.redo();
+  const redone = { path: __cfg().report.logoPath, img: !!document.querySelector('.logo-thumb') };
+  D.undo();
+  return { before, picked, undone, redone };
+} finally { window.fetch = realFetch; }
+"@
+        $r.picked.path | Should -Be 'logo.png'
+        $r.picked.img | Should -BeTrue
+        $r.undone.path | Should -Be $r.before
+        $r.undone.img | Should -BeFalse
+        $r.redone.path | Should -Be 'logo.png'
+        $r.redone.img | Should -BeTrue
+    }
+
+    It 'keeps the waiting dialogs open while their request is pending, even when Esc closes them' {
+        $r = Invoke-Panel @'
+let release;
+const pending = D.whileServerDialog(() => new Promise(r => { release = r; }));
+await new Promise(r => setTimeout(r, 30));
+const busy = document.querySelector('#busy');
+busy.close();
+await new Promise(r => setTimeout(r, 30));
+const busyAfterClose = busy.open;
+release('x'); await pending;
+const busyAfterAnswer = busy.open;
+const picking = document.querySelector('#picking');
+const free = D.holdOpen(picking);
+picking.close();
+await new Promise(r => setTimeout(r, 30));
+const pickingAfterClose = picking.open;
+free();
+return { busyAfterClose, busyAfterAnswer, pickingAfterClose, pickingAfterRelease: picking.open };
+'@
+        $r.busyAfterClose | Should -BeTrue
+        $r.busyAfterAnswer | Should -BeFalse
+        $r.pickingAfterClose | Should -BeTrue
+        $r.pickingAfterRelease | Should -BeFalse
+    }
+
+    It 'finds a page by its id, not its position, when a cleared value is put back after pages were moved' {
+        $r = Invoke-Panel @'
+D.setTab('pages');
+const ids = __cfg().pages.map(p => p.id);
+// Page 4 (index 3) has "overrides" in the file; page 1 does not. Move page 4 to the top,
+// then clear an override of the page now at the top and of the one now second.
+D.movePage(3, 0, false);
+S.overridesOpen = true; D.selectPage(0);
+const top = JSON.stringify(__cfg().pages[0].overrides);
+for (const key of Object.keys(__cfg().pages[0].overrides || {})) {
+  const reset = Array.from(document.querySelectorAll('button')).find(b => b.dataset.fkey === 'reset:pages[0].overrides.' + key);
+  if (reset) reset.click();
+}
+const afterTop = JSON.stringify(__cfg().pages[0].overrides);
+D.selectPage(1);
+__type('pages[1].overrides.zoomPercent', '90');
+__type('pages[1].overrides.zoomPercent', '');
+const second = 'overrides' in __cfg().pages[1];
+D.undo(); D.undo(); D.undo();
+for (let n = 0; n < 10 && JSON.stringify(__cfg().pages.map(p => p.id)) !== JSON.stringify(ids); n++) D.undo();
+return { top, afterTop, second, back: JSON.stringify(__cfg().pages.map(p => p.id)) === JSON.stringify(ids) };
+'@
+        $saved = ConvertFrom-VouchJson -Text ([System.IO.File]::ReadAllText($script:PanelConfig))
+        $r.top | Should -Not -BeNullOrEmpty
+        # The moved page (p004) had real overrides in the file, so emptying them removes the
+        # key - even though the page that was FIRST in the file (p001) has "overrides": {}.
+        @($saved['pages'][3]['overrides'].Keys).Count | Should -BeGreaterThan 0
+        @($saved['pages'][0]['overrides'].Keys).Count | Should -Be 0
+        $r.afterTop | Should -BeNullOrEmpty
+        # p001, now second, had "overrides": {} in the file: it is put back as it was.
+        $r.second | Should -BeTrue
+        $r.back | Should -BeTrue
     }
 
     It 'does not overflow sideways at <Width> px on any tab' -ForEach @(@{ Width = 380 }, @{ Width = 1100 }) {
@@ -1423,5 +1537,878 @@ Describe 'Designer mode in vouch.ps1 and the panel window' {
         $state.Running | Should -BeFalse
         $state.StopReason | Should -Be 'The Designer window was closed.'
         $script:TickSeen | Should -Be 50999
+    }
+}
+
+Describe 'Browser link and picker: routes and rules without a browser' {
+    BeforeEach { $script:State = New-TestState }
+
+    It 'refuses with 409 and the reason when no browser is connected: <_>' -ForEach @(
+        @('POST', '/api/browser/navigate', @{ url = 'https://example.com/' }),
+        @('POST', '/api/pick/start', @{ mode = 'click' }),
+        @('POST', '/api/action/test', @{ action = @{ type = 'click'; selector = '#x' } }),
+        @('POST', '/api/page/from-current', @{}),
+        @('POST', '/api/browser/zoom-off', @{})) {
+        Mock Update-DesignerBrowser { }
+        $script:State.Browser.Problem = Get-DesignerBrowserProblem -Code 'gone'
+        $r = Invoke-TestRoute $_[0] $_[1] -Body $_[2] -State $script:State
+        $r.Status | Should -Be 409
+        $r.Data.code | Should -Be 'no-browser'
+        $r.Data.error | Should -Be 'The audit browser is not connected.'
+        $r.Data.detail | Should -Be 'The audit Edge window was closed.'
+    }
+
+    It 'opens only web addresses: <_>' -ForEach @('javascript:alert(1)', 'file:///C:/Windows/win.ini', 'edge://settings', '', 'http://', 'ftp://example.com/', 'about:blank') {
+        $script:State.Browser.Connected = $true
+        $r = Invoke-TestRoute POST '/api/browser/navigate' -Body @{ url = $_ } -State $script:State
+        $r.Status | Should -Be 400
+        $r.Data.code | Should -Be 'url'
+    }
+
+    It 'checks the pick mode and the action before anything else' {
+        (Invoke-TestRoute POST '/api/pick/start' -Body @{ mode = 'area' } -State $script:State).Status | Should -Be 400
+        (Invoke-TestRoute POST '/api/pick/start' -Body @{ mode = 'Click' } -State $script:State).Data.code | Should -Be 'mode'
+        (Invoke-TestRoute POST '/api/action/test' -Body @{} -State $script:State).Data.code | Should -Be 'action'
+        (Invoke-TestRoute POST '/api/action/test' -Body @{ action = @{ type = 'jump' } } -State $script:State).Status | Should -Be 400
+        (Invoke-TestRoute POST '/api/action/test' -Body @{ action = @{ type = 'click'; selector = ' ' } } -State $script:State).Status | Should -Be 400
+        foreach ($type in 'capture', 'pause') {
+            $r = Invoke-TestRoute POST '/api/action/test' -Body @{ action = @{ type = $type } } -State $script:State
+            $r.Status | Should -Be 200
+            $r.Data.ok | Should -BeFalse
+            $r.Data.message | Should -Match 'Test this page'
+        }
+    }
+
+    It 'answers the pick routes while nothing is being picked, and 405 for wrong methods' {
+        (Invoke-TestRoute GET '/api/pick' -State $script:State).Data.state | Should -Be 'idle'
+        (Invoke-TestRoute POST '/api/pick/cancel' -State $script:State).Data.state | Should -Be 'idle'
+        (Invoke-TestRoute GET '/api/browser/navigate' -State $script:State).Status | Should -Be 405
+        (Invoke-TestRoute POST '/api/browser/current' -State $script:State).Status | Should -Be 405
+        (Invoke-TestRoute GET '/api/pick/start' -State $script:State).Status | Should -Be 405
+        (Invoke-TestRoute GET '/api/action/test' -State $script:State).Status | Should -Be 405
+        (Invoke-TestRoute GET '/picker.js' -State $script:State).Status | Should -Be 404
+    }
+
+    It 'puts every new route behind the gate (token, Origin, JSON)' {
+        foreach ($path in '/api/browser/connect', '/api/browser/navigate', '/api/browser/layout', '/api/browser/zoom-off', '/api/page/from-current', '/api/pick/start', '/api/pick/cancel', '/api/action/test') {
+            $headers = New-GoodHeaders -State $script:State -Post
+            $headers.Remove('X-Vouch-Token')
+            (Test-DesignerRequest -Request (New-DesignerRequest -Method POST -Path $path -Headers $headers -BodyText '{}') -State $script:State).Status | Should -Be 403
+            $headers = New-GoodHeaders -State $script:State -Post
+            $headers.Remove('Origin')
+            (Test-DesignerRequest -Request (New-DesignerRequest -Method POST -Path $path -Headers $headers -BodyText '{}') -State $script:State).Body | Should -Match 'no-origin'
+            $headers = New-GoodHeaders -State $script:State -Post
+            $headers['Content-Type'] = 'text/plain'
+            (Test-DesignerRequest -Request (New-DesignerRequest -Method POST -Path $path -Headers $headers -BodyText '{}') -State $script:State).Status | Should -Be 415
+            $headers = New-GoodHeaders -State $script:State -Post
+            Test-DesignerRequest -Request (New-DesignerRequest -Method POST -Path $path -Headers $headers -BodyText '{}') -State $script:State | Should -BeNullOrEmpty
+        }
+        foreach ($path in '/api/browser/current', '/api/pick') {
+            (Test-DesignerRequest -Request (New-DesignerRequest -Method GET -Path $path -Headers @{ Host = $script:State.HostHeader }) -State $script:State).Status | Should -Be 403
+        }
+    }
+
+    It 'reports the browser in /api/state and turns the browser buttons on only when connected' {
+        $r = Invoke-TestRoute GET '/api/state' -State $script:State
+        $r.Data.capabilities.browser | Should -BeFalse
+        $r.Data.browser.connected | Should -BeFalse
+        $r.Data.pick.state | Should -Be 'idle'
+        $script:State.Browser.Connected = $true
+        $script:State.Browser.Title = 'Some page'
+        Mock Get-DesignerBrowserSetting { [pscustomobject]@{ Port = 0; ProfileDir = ''; KeepOpen = $false } }
+        $r = Invoke-TestRoute GET '/api/state' -State $script:State
+        $r.Data.capabilities.browser | Should -BeTrue
+        $r.Data.capabilities.pick | Should -BeTrue
+        $r.Data.capabilities.test | Should -BeTrue
+        $r.Data.capabilities.run | Should -BeFalse
+        $r.Data.browser.title | Should -Be 'Some page'
+        $r.Data.browser.settingsChanged | Should -BeFalse
+    }
+
+    It 'tells generated ids from stable ones: <Id> -> <Generated>' -ForEach @(
+        @{ Id = 'save-settings'; Generated = $false }, @{ Id = 'tab-audit'; Generated = $false }, @{ Id = 'reports-a'; Generated = $false }
+        @{ Id = 'item2'; Generated = $false }, @{ Id = 'main'; Generated = $false }, @{ Id = 'user_list_v2'; Generated = $false }
+        @{ Id = 'ember4821'; Generated = $true }, @{ Id = 'row-123456'; Generated = $true }, @{ Id = '3f2a'; Generated = $true }
+        @{ Id = 'a3f9c2d17b'; Generated = $true }, @{ Id = 'x-550e8400-e29b-41d4-a716-446655440000'; Generated = $true }
+        @{ Id = ':r1:'; Generated = $true }, @{ Id = 'mui-12'; Generated = $true }, @{ Id = 'radix-7'; Generated = $true }
+        @{ Id = 'k7Pq2xZ9a'; Generated = $true }, @{ Id = ''; Generated = $true }, @{ Id = ('a' * 70); Generated = $true }) {
+        Test-DesignerGeneratedId -Id $Id | Should -Be $Generated
+    }
+
+    It 'plans the windows: Edge on the left, the panel on the right, full height' {
+        $plan = Get-DesignerLayoutPlan -WorkingArea ([System.Drawing.Rectangle]::new(0, 0, 1920, 1040)) -PanelWidth 0 -DefaultWidth 480
+        $plan.Panel | Should -Be ([System.Drawing.Rectangle]::new(1440, 0, 480, 1040))
+        $plan.Edge | Should -Be ([System.Drawing.Rectangle]::new(0, 0, 1440, 1040))
+        $plan = Get-DesignerLayoutPlan -WorkingArea ([System.Drawing.Rectangle]::new(-1920, 40, 1920, 1000)) -PanelWidth 600
+        $plan.Panel | Should -Be ([System.Drawing.Rectangle]::new(-600, 40, 600, 1000))
+        $plan.Edge.Right | Should -Be $plan.Panel.Left
+        # Never more than half the screen, whatever width the panel had.
+        (Get-DesignerLayoutPlan -WorkingArea ([System.Drawing.Rectangle]::new(0, 0, 640, 432)) -PanelWidth 900).Panel.Width | Should -Be 320
+    }
+
+    It 'leaves the windows alone, quickly, when there are none' {
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $layout = Set-DesignerLayout -State $script:State -Focus panel
+        $watch.ElapsedMilliseconds | Should -BeLessThan 1000
+        $layout.Ok | Should -BeFalse
+        $layout.Message | Should -Match 'left as they are'
+    }
+
+    It 'names a page from the tab''s title' {
+        ConvertTo-DesignerPageName -Title "  Audit`tLog -`n Settings  " -Url 'https://a.example/x' | Should -Be 'Audit Log - Settings'
+        ConvertTo-DesignerPageName -Title '' -Url 'https://payroll.example.com/admin' | Should -Be 'payroll.example.com'
+        $long = ConvertTo-DesignerPageName -Title (('word ' * 30).Trim()) -Url 'https://a.example/'
+        $long.Length | Should -BeLessOrEqual 81
+        $long | Should -BeLike "*$([char]0x2026)"
+    }
+
+    It 'explains a port that never opens in plain words, naming the RemoteDebuggingAllowed policy' {
+        $p = Get-DesignerBrowserProblem -Code 'noport' -Port 9333 -ProfileDir 'C:\P\Audit'
+        $p.message | Should -Match 'port 9333'
+        ($p.causes -join ' ') | Should -Match 'RemoteDebuggingAllowed'
+        ($p.causes -join ' ') | Should -Match 'C:\\P\\Audit'
+        ($p.causes -join ' ') | Should -Match 'Another program may be using port 9333'
+        (Get-DesignerBrowserProblem -Code 'policy').message | Should -Match 'RemoteDebuggingAllowed'
+    }
+
+    Context 'connecting (engine calls mocked)' {
+        BeforeEach {
+            $script:State.Browser.TypedPort = 9555
+            $script:State.Browser.TypedProfileDir = 'C:\Throwaway\AuditProfile'
+            Mock Assert-DesignerProfileSeparate { }
+            Mock Find-EdgeExecutable { 'C:\Edge\msedge.exe' }
+            Mock Get-EdgeDebugPolicy { $null }
+            Mock Test-DesignerPortBusy { $false }
+            Mock Start-EdgeDebug { throw 'should not start Edge' }
+        }
+        It 'says no Edge is listening when it may not start one' {
+            Mock Get-DebugEndpointInfo { $null }
+            $script:State.Browser.AllowLaunch = $false
+            Connect-DesignerBrowser -State $script:State
+            $script:State.Browser.Connected | Should -BeFalse
+            $script:State.Browser.Problem['code'] | Should -Be 'notrunning'
+            Should -Invoke Start-EdgeDebug -Times 0
+        }
+        It 'names the policy for certain when it forbids remote debugging, and starts nothing' {
+            Mock Get-DebugEndpointInfo { $null }
+            Mock Get-EdgeDebugPolicy { $false }
+            Connect-DesignerBrowser -State $script:State
+            $script:State.Browser.Problem['code'] | Should -Be 'policy'
+            Should -Invoke Start-EdgeDebug -Times 0
+        }
+        It 'says another program has the port' {
+            Mock Get-DebugEndpointInfo { $null }
+            Mock Test-DesignerPortBusy { $true }
+            Connect-DesignerBrowser -State $script:State
+            $script:State.Browser.Problem['code'] | Should -Be 'portbusy'
+            $script:State.Browser.Problem['message'] | Should -Match 'port 9555'
+        }
+        It 'tells Edge-already-open apart from a port that never opened' {
+            Mock Get-DebugEndpointInfo { $null }
+            Mock Start-EdgeDebug { throw 'Edge is already running with the audit profile (process 1) but without the DevTools port - typically ...' }
+            Connect-DesignerBrowser -State $script:State
+            $script:State.Browser.Problem['code'] | Should -Be 'profile-open'
+            Mock Start-EdgeDebug { throw 'Edge did not open its DevTools endpoint on port 9555 within 15 seconds.' }
+            Connect-DesignerBrowser -State $script:State
+            $script:State.Browser.Problem['code'] | Should -Be 'noport'
+            Should -Invoke Start-EdgeDebug -ParameterFilter { $Port -eq 9555 -and $ProfileDir -eq 'C:\Throwaway\AuditProfile' }
+        }
+        It 'refuses an audit profile that overlaps the panel''s, before touching Edge' {
+            Mock Assert-DesignerProfileSeparate { throw 'The profiles overlap.' }
+            Mock Get-DebugEndpointInfo { throw 'should not be reached' }
+            Connect-DesignerBrowser -State $script:State
+            $script:State.Browser.Problem['code'] | Should -Be 'profile'
+            $script:State.Browser.Problem['message'] | Should -Be 'The profiles overlap.'
+        }
+        It 'closes at the end only an Edge it started, and not when it should be kept open' {
+            Mock Stop-EdgeProcess { $script:Stopped = $script:LaunchedEdge }
+            Mock Get-Process { [pscustomobject]@{ Id = 4242 } } -ParameterFilter { $Id -eq 4242 }
+            Mock Get-DesignerBrowserSetting { [pscustomobject]@{ Port = 9555; ProfileDir = 'C:\Throwaway\AuditProfile'; KeepOpen = $script:Keep } }
+            foreach ($case in @(@{ Launched = $true; Keep = $false; Closes = 1 }, @{ Launched = $true; Keep = $true; Closes = 0 }, @{ Launched = $false; Keep = $false; Closes = 0 })) {
+                $script:Keep = $case.Keep
+                $script:Stopped = $null
+                $state = New-TestState
+                $state.Browser.LaunchedByDesigner = $case.Launched
+                $state.Browser.LaunchedPid = 4242
+                Close-DesignerBrowser -State $state
+                if ($case.Closes) { $script:Stopped | Should -BeTrue } else { $script:Stopped | Should -BeNullOrEmpty }
+            }
+            $script:LaunchedEdge | Should -BeFalse
+        }
+    }
+
+    It 'puts mode, token and words into the picker only as JavaScript literals' {
+        $script = Get-DesignerPickerScript -State $script:State -Mode click -Token 'x"); alert(1); ("'
+        $script | Should -Match ([regex]::Escape('token: "x\"); alert(1); (\""'))
+        $script | Should -Match ([regex]::Escape('function vouchDocs()'))
+        $script.TrimEnd() | Should -BeLike '*})()'
+    }
+
+    It 'gives up on a request body that stalls, and answers 408' {
+        $pipe = [System.IO.Pipes.AnonymousPipeServerStream]::new([System.IO.Pipes.PipeDirection]::In)
+        try {
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            $body = Read-DesignerRequestBody -Stream $pipe -Limit 1MB -TimeoutMs 400
+            $watch.ElapsedMilliseconds | Should -BeLessThan 3000
+            $body.TimedOut | Should -BeTrue
+            $script:State.BodyTimeoutMs = 300
+            $response = Invoke-DesignerExchange -Method POST -Path '/api/config/validate' -Headers (New-GoodHeaders -State $script:State -Post) -ContentLength 100 -BodyStream $pipe -State $script:State
+            $response.Status | Should -Be 408
+            ($response.Body | ConvertFrom-Json).code | Should -Be 'timeout'
+        }
+        finally { $pipe.Dispose() }
+        $ok = Read-DesignerRequestBody -Stream ([System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes('{"a":1}'))) -Limit 1MB
+        $ok.Text | Should -Be '{"a":1}'
+        $ok.TimedOut | Should -BeFalse
+    }
+}
+
+Describe 'Browser link and picker in headless Edge (functions called directly)' -Tag 'Integration' {
+    BeforeAll {
+        $script:Web1 = Get-FreeTcpPort
+        $script:Web2 = Get-FreeTcpPort
+        $script:PickServer = Start-TestServer -Port $script:Web1, $script:Web2
+        $script:Base = "http://localhost:$($script:Web1)"
+        $script:PickCdp = Get-FreeTcpPort
+        $script:PickProfile = Join-Path ([System.IO.Path]::GetTempPath()) "vouch-designer-audit-$($script:PickCdp)"
+        $script:PickEdge = Start-HeadlessEdge -Port $script:PickCdp -ProfileDir $script:PickProfile
+        Close-CdpSocket
+        $script:B = New-TestState
+        $script:B.Browser.TypedPort = $script:PickCdp
+        $script:B.Browser.TypedProfileDir = $script:PickProfile
+        $script:B.Browser.AllowLaunch = $false
+        Connect-DesignerBrowser -State $script:B
+        $script:Replay = [pscustomobject]@{ NavigationTimeoutSec = 5; SettleSeconds = 0 }
+
+        function Open-TestPage([string]$Path) {
+            Set-NavigationMarker
+            [void](Send-CdpCommand -Method 'Page.navigate' -Params @{ url = "$($script:Base)$Path" })
+            [void](Wait-PageReady -TimeoutSec 15)
+            # Frames finish a moment later.
+            [void](Invoke-CdpEval -TimeoutSec 10 -Expression "new Promise(r => { const ok = () => Array.from(document.querySelectorAll('iframe')).every(f => { try { return !f.contentDocument || f.contentDocument.readyState === 'complete'; } catch (e) { return true; } }); const t = () => ok() ? r(true) : setTimeout(t, 50); t(); })")
+        }
+        function Get-TestPoint([string]$Element) {
+            # The centre of an element in the top window's coordinates (through same-site frames).
+            return Invoke-CdpEval -Expression @"
+(function () {
+  var el = ($Element); el.scrollIntoView({ block: 'nearest' });
+  var r = el.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2, w = el.ownerDocument.defaultView;
+  while (w.frameElement) { var f = w.frameElement.getBoundingClientRect(); x += f.left + w.frameElement.clientLeft; y += f.top + w.frameElement.clientTop; w = w.parent; }
+  return { x: x, y: y };
+})()
+"@
+        }
+        function Send-TestClick([object]$Point) {
+            foreach ($type in 'mouseMoved', 'mousePressed', 'mouseReleased') {
+                $params = @{ type = $type; x = [double]$Point.x; y = [double]$Point.y }
+                if ($type -ne 'mouseMoved') { $params.button = 'left'; $params.clickCount = 1 }
+                [void](Send-CdpCommand -Method 'Input.dispatchMouseEvent' -Params $params)
+            }
+        }
+        function Wait-TestPick {
+            $deadline = (Get-Date).AddSeconds(10)
+            do { Start-Sleep -Milliseconds 100; $r = Get-ElementPickResult -State $script:B } while ($r.state -eq 'picking' -and (Get-Date) -lt $deadline)
+            return $r
+        }
+        function Invoke-TestPick([string]$Mode, [string]$Element) {
+            $point = Get-TestPoint $Element
+            [void](Start-ElementPick -State $script:B -Mode $Mode)
+            $script:During = Invoke-CdpEval -Expression "({ ui: document.querySelectorAll('vouch-picker-ui').length, ns: typeof window.__vouchPicker })"
+            Send-TestClick $point
+            return Wait-TestPick
+        }
+        function Get-PageTrace {
+            # Everything a pick could leave behind: globals, the DOM of the page and its
+            # same-site frames, and the event listeners on their windows and documents.
+            $dom = Invoke-CdpEval -Expression @'
+(function () {
+  function docs(d) { var out = [d]; d.querySelectorAll('iframe,frame').forEach(function (f) { try { if (f.contentDocument) { out = out.concat(docs(f.contentDocument)); } } catch (e) { } }); return out; }
+  return JSON.stringify({ globals: Object.getOwnPropertyNames(window).sort(), dom: docs(document).map(function (d) { return d.documentElement.outerHTML; }) });
+})()
+'@
+            # DevTools does not list listeners on a frame's window whose handler belongs to the
+            # top page (the picker's), so frames are checked by behaviour instead
+            # (Assert-FramesFree): a click inside the frame must reach the site again.
+            $listeners = [System.Collections.Generic.List[string]]::new()
+            $targets = [ordered]@{ top = 'window'; document = 'document' }
+            foreach ($name in $targets.Keys) {
+                $answer = Send-CdpCommand -Method 'Runtime.evaluate' -Params @{ expression = $targets[$name]; returnByValue = $false }
+                if (-not $answer.result.PSObject.Properties['objectId']) { continue }
+                $found = Send-CdpCommand -Method 'DOMDebugger.getEventListeners' -Params @{ objectId = $answer.result.objectId }
+                foreach ($l in @($found.listeners)) { $listeners.Add("${name}:$($l.type):$($l.useCapture)") }
+                [void](Send-CdpCommand -Method 'Runtime.releaseObject' -Params @{ objectId = $answer.result.objectId })
+            }
+            return $dom + '|' + (($listeners | Sort-Object) -join ';')
+        }
+        function Assert-SiteUntouched([string]$Title = 'Pick me') {
+            Invoke-CdpEval -Expression 'JSON.stringify(window.__hits || [])' | Should -Be '[]'
+            Invoke-CdpEval -Expression 'window.__downs || 0' | Should -Be 0
+            Invoke-CdpEval -Expression 'document.title' | Should -Be $Title
+        }
+        function Assert-FramesFree {
+            # After a pick, a click inside the same-site frame reaches the site's handler: the
+            # picker's capture listeners on the frame's window are gone.
+            Invoke-CdpEval -Expression "document.getElementById('sameframe').contentDocument.getElementById('framebtn').click(); JSON.stringify(window.__hits)" | Should -Be '["frame"]'
+        }
+        function Invoke-TestReplay([System.Collections.IDictionary]$Action, [string]$Page) {
+            Open-TestPage $Page
+            $entry = Invoke-PageAction -Action $Action -Settings $script:Replay
+            $entry.Ok | Should -BeTrue -Because "replaying $($Action | ConvertTo-Json -Compress) must work: $($entry.Message)"
+        }
+        function ConvertTo-TestAction([object]$Action) {
+            if ($Action -is [System.Collections.IDictionary]) { return $Action }
+            $copy = [ordered]@{}
+            foreach ($p in $Action.PSObject.Properties) { $copy[$p.Name] = $p.Value }
+            return $copy
+        }
+    }
+    AfterAll {
+        Close-CdpSocket
+        Stop-HeadlessEdge -ProfileDir $script:PickProfile
+        if ($null -ne $script:PickServer) { Stop-Process -Id $script:PickServer.Id -Force -ErrorAction SilentlyContinue }
+        Remove-DirectoryWithRetry -Path $script:PickProfile
+    }
+
+    It 'connects to the tab in front and reports it' {
+        $script:B.Browser.Connected | Should -BeTrue
+        $script:B.Browser.LaunchedByDesigner | Should -BeFalse
+        Open-TestPage '/ok'
+        $r = Invoke-TestRoute GET '/api/browser/current' -State $script:B
+        $r.Data.connected | Should -BeTrue
+        $r.Data.url | Should -Be "$($script:Base)/ok"
+        $r.Data.title | Should -Be 'OK page'
+        $r.Data.tabId | Should -Be $script:B.Browser.TabId
+        @($r.Data.tabs | Where-Object current).Count | Should -Be 1
+        $from = Invoke-TestRoute POST '/api/page/from-current' -State $script:B
+        $from.Data.name | Should -Be 'OK page'
+        $from.Data.url | Should -Be "$($script:Base)/ok"
+    }
+
+    It 'click pick: <Case>' -ForEach @(
+        @{ Case = 'the second of two links with the same words (never offered as words)'; El = "document.querySelectorAll('#navrow a')[1]"; Hit = 'reports-2'; First = 'path'; Values = @('#navrow > a:nth-of-type(2)'); NoKind = 'text' }
+        @{ Case = 'the first of them (the words reach it)'; El = "document.getElementById('reports-a')"; Hit = 'reports-1'; First = 'text'; Values = @('Reports', '#reports-a') }
+        @{ Case = 'an icon inside a button (climbs to the button)'; El = "document.getElementById('favicon')"; Hit = 'fav'; First = 'text'; Values = @("$([char]0x2605) Favourite", '#fav'); Climbed = 'span' }
+        @{ Case = 'a button with a test id'; El = "document.querySelector('[data-testid=save-settings]')"; Hit = 'save'; First = 'text'; Values = @('Save settings', '[data-testid="save-settings"]') }
+        @{ Case = 'a button with a generated-looking id (id not offered)'; El = "document.getElementById('ember4821')"; Hit = 'generated'; First = 'text'; Values = @('Archive now'); NotValue = '#ember4821' }
+        @{ Case = 'a button with only an aria-label (an svg inside)'; El = "document.getElementById('xsvg')"; Hit = 'close'; First = 'attribute'; Values = @('button[aria-label="Close dialog"]'); NoKind = 'text' }
+        @{ Case = 'a deep element only a layout path reaches'; El = "document.querySelector('em')"; Hit = 'deep'; First = 'path'; Values = @('div > div > div > div > em'); NoKind = 'text' }
+        @{ Case = 'a button in a frame from the same site'; El = "document.getElementById('sameframe').contentDocument.getElementById('framebtn')"; Hit = 'frame'; First = 'text'; Values = @('Frame action', '#framebtn') }
+    ) {
+        $page = "/pickme?x=$($script:Web2)"
+        Open-TestPage $page
+        $before = Get-PageTrace
+        $r = Invoke-TestPick 'click' $El
+        $script:During.ui | Should -Be 1
+        $script:During.ns | Should -Be 'object'
+        $r.state | Should -Be 'done' -Because $r['message']
+        Assert-SiteUntouched
+        (Get-PageTrace) | Should -BeExactly $before
+        Assert-FramesFree
+        $candidates = @($r.result.candidates)
+        $candidates.Count | Should -BeGreaterThan 0
+        $candidates.Count | Should -BeLessOrEqual 3
+        $candidates[0].kind | Should -Be $First
+        foreach ($value in $Values) { @($candidates | ForEach-Object { $_.value }) | Should -Contain $value }
+        if ($NoKind) { @($candidates | Where-Object { $_.kind -eq $NoKind }).Count | Should -Be 0 }
+        if ($NotValue) { @($candidates | ForEach-Object { $_.value }) | Should -Not -Contain $NotValue }
+        if ($Climbed) { $r.result.element.climbedFrom | Should -Be $Climbed; $r.result.element.climbedNote | Should -Match 'records the whole button' }
+        foreach ($c in $candidates) {
+            $c.description | Should -Not -BeNullOrEmpty
+            $c.robustness | Should -BeIn 'best', 'good', 'fair', 'fragile'
+            Invoke-TestReplay -Action (ConvertTo-TestAction $c.action) -Page $page
+            Invoke-CdpEval -Expression 'JSON.stringify(window.__hits)' | Should -Be "[`"$Hit`"]" -Because "$($c.kind) '$($c.value)' must click the picked element"
+        }
+    }
+
+    It 'says plainly that <Case> cannot be recorded, and the site never sees the click' -ForEach @(
+        @{ Case = 'a frame from another site'; El = "document.getElementById('otherframe')"; Code = 'crossorigin'; Words = 'frame from another site' }
+        @{ Case = 'a button in shadow DOM'; El = "document.getElementById('shadowhost')"; Code = 'shadow'; Words = 'shadow DOM' }
+    ) {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        $before = Get-PageTrace
+        $r = Invoke-TestPick 'click' $El
+        $r.state | Should -Be 'error'
+        $r.code | Should -Be $Code
+        $r.message | Should -Match 'cannot be recorded'
+        $r.message | Should -Match $Words
+        Assert-SiteUntouched
+        (Get-PageTrace) | Should -BeExactly $before
+        Assert-FramesFree
+    }
+
+    It 'scroll pick: <Case>' -ForEach @(
+        @{ Case = 'a scrolling panel'; Page = '/pickme'; El = "document.querySelector('#leftpanel div:nth-child(3)')"; Kind = 'element'; First = '#leftpanel'; Probe = "document.getElementById('leftpanel').scrollTop" }
+        @{ Case = 'the other scrolling panel'; Page = '/pickme'; El = "document.querySelector('#rightpanel div:nth-child(2)')"; Kind = 'element'; First = '#rightpanel'; Probe = "document.getElementById('rightpanel').scrollTop" }
+        @{ Case = 'a frame whose page scrolls'; Page = '/pickme'; El = "document.getElementById('sameframe').contentDocument.querySelector('div')"; Kind = 'frame'; First = '#sameframe'; Probe = "document.getElementById('sameframe').contentWindow.scrollY" }
+        @{ Case = 'an overflow clip box (the page scrolls instead)'; Page = '/pickme'; El = "document.querySelector('#clipbox div')"; Kind = 'window'; First = ''; Probe = 'window.scrollY' }
+        @{ Case = 'the tall page itself'; Page = '/pickme'; El = "document.getElementById('spacer')"; Kind = 'window'; First = ''; Probe = 'window.scrollY' }
+        @{ Case = 'the inner panel of /innerscroll'; Page = '/innerscroll'; El = "document.querySelector('#main .row:nth-child(2)')"; Kind = 'element'; First = '#main'; Probe = "document.getElementById('main').scrollTop" }
+        @{ Case = 'the right region of /tworegions'; Page = '/tworegions'; El = "document.querySelector('#right div:nth-child(2)')"; Kind = 'element'; First = '#right'; Probe = "document.getElementById('right').scrollTop" }
+        @{ Case = 'the frame of /framepage'; Page = '/framepage'; El = "document.getElementById('content').contentDocument.querySelector('div')"; Kind = 'frame'; First = '#content'; Probe = "document.getElementById('content').contentWindow.scrollY" }
+    ) {
+        $path = if ($Page -eq '/pickme') { "/pickme?x=$($script:Web2)" } else { $Page }
+        Open-TestPage $path
+        $before = Get-PageTrace
+        $r = Invoke-TestPick 'scroll' $El
+        $r.state | Should -Be 'done' -Because $r['message']
+        (Get-PageTrace) | Should -BeExactly $before
+        if ($Page -eq '/pickme') { Assert-FramesFree }
+        $r.result.element.kind | Should -Be $Kind
+        $candidates = @($r.result.candidates)
+        if ($Kind -eq 'window') {
+            $candidates.Count | Should -Be 1
+            $candidates[0].kind | Should -Be 'page'
+            $candidates[0].scroll.mode | Should -Be 'page'
+            $candidates[0].description | Should -Match 'whole page'
+        }
+        else {
+            $candidates[0].value | Should -Be $First
+            foreach ($c in $candidates) {
+                $c.scroll.mode | Should -Be 'area'
+                $c.scroll.selector | Should -Be $c.value
+            }
+        }
+        foreach ($c in $candidates) {
+            # The capture finds exactly this area to scroll, with no fallback, and scrolls it.
+            Open-TestPage $path
+            $mode = if ($c.scroll.mode -eq 'page') { 'page' } else { 'area' }
+            $target = Invoke-CdpEval -Expression (Get-ScrollTargetScript -Mode $mode -Selector ([string]$c.value))
+            $target.fallback | Should -Be ''
+            $target.kind | Should -Be $Kind
+            [void](Invoke-CdpEval -Expression 'window.__vouchTarget.to(100)')
+            Invoke-CdpEval -Expression $Probe | Should -Be 100 -Because "$($c.value) must scroll the picked area"
+        }
+    }
+
+    It 'wait-for pick offers selectors the engine''s wait finds, never words' {
+        $page = "/pickme?x=$($script:Web2)"
+        Open-TestPage $page
+        $before = Get-PageTrace
+        $r = Invoke-TestPick 'waitFor' "document.querySelector('[data-testid=save-settings]')"
+        $r.state | Should -Be 'done'
+        Assert-SiteUntouched
+        (Get-PageTrace) | Should -BeExactly $before
+        Assert-FramesFree
+        $candidates = @($r.result.candidates)
+        $candidates[0].selector | Should -Be '[data-testid="save-settings"]'
+        @($candidates | Where-Object { $_.kind -eq 'text' }).Count | Should -Be 0
+        foreach ($c in $candidates) {
+            Open-TestPage $page
+            (Invoke-PageAction -Action ([ordered]@{ type = 'waitFor'; selector = $c.selector; timeoutSec = 2 }) -Settings $script:Replay).Ok | Should -BeTrue
+            (Invoke-CdpEval -Expression (Get-ClickSelectorScript -Selector $c.selector -FindOnly)).text | Should -Be 'Save settings'
+        }
+    }
+
+    It 'works on the existing fixtures: a tab on /tabs and a button in the frame of /framepage' {
+        Open-TestPage '/tabs'
+        $r = Invoke-TestPick 'click' "document.getElementById('t-audit')"
+        $r.state | Should -Be 'done'
+        Invoke-CdpEval -Expression 'document.title' | Should -Be 'Tabs'
+        $r.result.candidates[0].action.type | Should -Be 'clickText'
+        $r.result.candidates[0].action.text | Should -Be 'Audit Log'
+        $r.result.candidates[0].description | Should -Be "the $([char]0x2018)Audit Log$([char]0x2019) tab"
+        foreach ($c in $r.result.candidates) {
+            Open-TestPage '/tabs'
+            (Invoke-PageAction -Action (ConvertTo-TestAction $c.action) -Settings $script:Replay).Ok | Should -BeTrue
+            Invoke-CdpEval -Expression 'document.title' | Should -Be 'Audit Log'
+        }
+        Open-TestPage '/framepage'
+        $r = Invoke-TestPick 'click' "document.getElementById('content').contentDocument.getElementById('frame-btn')"
+        $r.state | Should -Be 'done'
+        $r.result.element.frame | Should -Match 'framecontent'
+        @($r.result.candidates | ForEach-Object { $_.value }) | Should -Contain '#frame-btn'
+        foreach ($c in $r.result.candidates) {
+            Open-TestPage '/framepage'
+            (Invoke-PageAction -Action (ConvertTo-TestAction $c.action) -Settings $script:Replay).Ok | Should -BeTrue
+            Invoke-CdpEval -Expression 'document.title' | Should -Be 'FRAME CLICKED'
+        }
+    }
+
+    It 'cancels with Esc in the page and with Cancel in the panel, leaving nothing behind' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        $before = Get-PageTrace
+        [void](Start-ElementPick -State $script:B -Mode click)
+        foreach ($type in 'keyDown', 'keyUp') {
+            [void](Send-CdpCommand -Method 'Input.dispatchKeyEvent' -Params @{ type = $type; key = 'Escape'; code = 'Escape'; windowsVirtualKeyCode = 27; nativeVirtualKeyCode = 27 })
+        }
+        $r = Wait-TestPick
+        $r.state | Should -Be 'cancelled'
+        $r.message | Should -Match 'Esc'
+        Invoke-CdpEval -Expression 'window.__keys' | Should -Be 0
+        (Get-PageTrace) | Should -BeExactly $before
+        [void](Start-ElementPick -State $script:B -Mode scroll)
+        # Control: while picking, a click inside the frame is swallowed by the picker.
+        Invoke-CdpEval -Expression "document.getElementById('sameframe').contentDocument.getElementById('framebtn').click(); JSON.stringify(window.__hits)" | Should -Be '[]'
+        (Invoke-TestRoute POST '/api/pick/cancel' -State $script:B).Data.state | Should -Be 'cancelled'
+        Assert-SiteUntouched
+        (Get-PageTrace) | Should -BeExactly $before
+        Assert-FramesFree
+    }
+
+    It 'keeps picking after the page reloads, and the loop is never held up' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        [void](Invoke-CdpEval -Expression 'setTimeout(() => location.reload(), 10); true')
+        Start-Sleep -Milliseconds 800
+        $notice = ''
+        $deadline = (Get-Date).AddSeconds(5)
+        do {
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            $r = Get-ElementPickResult -State $script:B
+            $watch.ElapsedMilliseconds | Should -BeLessThan 1500
+            $r.state | Should -Be 'picking'
+            if ($r['notice']) { $notice = $r['notice'] }
+            Start-Sleep -Milliseconds 250
+        } while (-not $notice -and (Get-Date) -lt $deadline)
+        $notice | Should -Match 'page changed'
+        Invoke-CdpEval -Expression 'typeof window.__vouchPicker' | Should -Be 'object'
+        Send-TestClick (Get-TestPoint "document.querySelector('[data-testid=save-settings]')")
+        $r = Wait-TestPick
+        $r.state | Should -Be 'done'
+        Assert-SiteUntouched
+    }
+
+    It 'tests one action at a time through the engine: <Case>' -ForEach @(
+        @{ Case = 'a click by selector'; Page = '/tabs'; Action = @{ type = 'click'; selector = '#t-logs' }; Ok = $true; Title = 'Logs'; Navigated = $false; Words = 'stayed' }
+        @{ Case = 'a click by words'; Page = '/tabs'; Action = @{ type = 'clickText'; text = 'Audit Log' }; Ok = $true; Title = 'Audit Log'; Navigated = $false; Words = 'Clicked' }
+        @{ Case = 'a click that opens another page'; Page = 'LINKS'; Action = @{ type = 'click'; selector = '#go' }; Ok = $true; Title = 'OK page'; Navigated = $true; Words = '/ok' }
+        @{ Case = 'a click on nothing'; Page = '/tabs'; Action = @{ type = 'click'; selector = '#nope' }; Ok = $false; Title = 'Tabs'; Navigated = $false; Words = 'No element matched' }
+        @{ Case = 'a wait'; Page = '/tabs'; Action = @{ type = 'wait'; seconds = 0.2 }; Ok = $true; Title = 'Tabs'; Navigated = $false; Words = 'Waited 0.2' }
+        @{ Case = 'a wait-for that finds it'; Page = '/tabs'; Action = @{ type = 'waitFor'; selector = '#t-general' }; Ok = $true; Title = 'Tabs'; Navigated = $false; Words = 'visible' }
+        @{ Case = 'a wait-for that does not'; Page = '/tabs'; Action = @{ type = 'waitFor'; selector = '#nope'; timeoutSec = 1 }; Ok = $false; Title = 'Tabs'; Navigated = $false; Words = 'No visible element' }
+    ) {
+        $path = if ($Page -eq 'LINKS') { "/links?to=$([uri]::EscapeDataString("$($script:Base)/ok"))" } else { $Page }
+        Open-TestPage $path
+        $r = Invoke-TestRoute POST '/api/action/test' -Body @{ action = $Action; config = (Get-DefaultVouchConfig); pageIndex = -1 } -State $script:B
+        $r.Status | Should -Be 200
+        $r.Data.ok | Should -Be $Ok
+        $r.Data.navigated | Should -Be $Navigated
+        $r.Data.message | Should -Match ([regex]::Escape($Words))
+        Invoke-CdpEval -Expression 'document.title' | Should -Be $Title
+    }
+
+    It 'opens a page with Go at the zoom the run uses, and takes the zoom off again' {
+        $config = Get-DefaultVouchConfig
+        $config['pages'] = [System.Collections.Generic.List[object]]@(
+            [ordered]@{ id = 'p001'; name = 'Zoomed'; url = "$($script:Base)/ok"; overrides = [ordered]@{ zoomPercent = 50 } },
+            [ordered]@{ id = 'p002'; name = 'Plain'; url = "$($script:Base)/tabs" })
+        Open-TestPage '/ok'
+        $base = [int](Invoke-CdpEval -Expression 'window.innerWidth')
+        $r = Invoke-TestRoute POST '/api/browser/navigate' -Body @{ url = "$($script:Base)/tabs"; config = $config; pageIndex = 0 } -State $script:B
+        $r.Status | Should -Be 200
+        $r.Data.status | Should -Be 'loaded'
+        $r.Data.title | Should -Be 'Tabs'
+        $r.Data.zoom.percent | Should -Be 50
+        $r.Data.zoom.page | Should -Be 'Zoomed'
+        [int](Invoke-CdpEval -Expression 'window.innerWidth') | Should -Be ($base * 2)
+        (Invoke-TestRoute GET '/api/state' -State $script:B).Data.browser.zoom.percent | Should -Be 50
+        $r = Invoke-TestRoute POST '/api/browser/navigate' -Body @{ url = "$($script:Base)/ok"; config = $config; pageIndex = 1 } -State $script:B
+        $r.Data.zoom.percent | Should -Be 100
+        [int](Invoke-CdpEval -Expression 'window.innerWidth') | Should -Be $base
+        [void](Invoke-TestRoute POST '/api/browser/navigate' -Body @{ url = "$($script:Base)/ok"; config = $config; pageIndex = 0 } -State $script:B)
+        [int](Invoke-CdpEval -Expression 'window.innerWidth') | Should -Be ($base * 2)
+        (Invoke-TestRoute POST '/api/browser/zoom-off' -State $script:B).Data.zoom.percent | Should -Be 100
+        [int](Invoke-CdpEval -Expression 'window.innerWidth') | Should -Be $base
+        $script:PageZoomPercent | Should -Be 100
+    }
+
+    It 'follows the tab in front, and never attaches to Edge''s own pages or to the panel' {
+        Open-TestPage '/ok'
+        $first = $script:B.Browser.TabId
+        $second = Invoke-RestMethod -Method Put -Uri "http://127.0.0.1:$($script:PickCdp)/json/new?$($script:Base)/tabs" -NoProxy
+        [void](Invoke-RestMethod -Uri "http://127.0.0.1:$($script:PickCdp)/json/activate/$($second.id)" -NoProxy)
+        Start-Sleep -Milliseconds 500
+        Update-DesignerBrowser -State $script:B -Force
+        $script:B.Browser.TabId | Should -Be $second.id
+        $script:B.Browser.Title | Should -Be 'Tabs'
+        foreach ($url in 'edge://version', "http://localhost:$($script:B.Port)/") {
+            $other = Invoke-RestMethod -Method Put -Uri "http://127.0.0.1:$($script:PickCdp)/json/new?$url" -NoProxy
+            [void](Invoke-RestMethod -Uri "http://127.0.0.1:$($script:PickCdp)/json/activate/$($other.id)" -NoProxy)
+            Start-Sleep -Milliseconds 500
+            Update-DesignerBrowser -State $script:B -Force
+            $script:B.Browser.TabId | Should -Be $second.id -Because "$url must be ignored"
+            @($script:B.Browser.Tabs | ForEach-Object { $_.id }) | Should -Not -Contain $other.id
+            [void](Invoke-RestMethod -Uri "http://127.0.0.1:$($script:PickCdp)/json/close/$($other.id)" -NoProxy)
+        }
+        [void](Invoke-RestMethod -Uri "http://127.0.0.1:$($script:PickCdp)/json/activate/$first" -NoProxy)
+        Start-Sleep -Milliseconds 500
+        Update-DesignerBrowser -State $script:B -Force
+        $script:B.Browser.TabId | Should -Be $first
+        [void](Invoke-RestMethod -Uri "http://127.0.0.1:$($script:PickCdp)/json/close/$($second.id)" -NoProxy)
+    }
+
+    It 'ends a pick plainly when its tab is closed, and moves to the tab that is left' {
+        $extra = Invoke-RestMethod -Method Put -Uri "http://127.0.0.1:$($script:PickCdp)/json/new?$($script:Base)/ok" -NoProxy
+        [void](Invoke-RestMethod -Uri "http://127.0.0.1:$($script:PickCdp)/json/activate/$($script:B.Browser.TabId)" -NoProxy)
+        Start-Sleep -Milliseconds 300
+        Update-DesignerBrowser -State $script:B -Force
+        $picked = $script:B.Browser.TabId
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        [void](Invoke-RestMethod -Uri "http://127.0.0.1:$($script:PickCdp)/json/close/$picked" -NoProxy)
+        $r = Wait-TestPick
+        $r.state | Should -Be 'error'
+        $r.code | Should -Be 'tab'
+        $r.message | Should -Match 'was closed'
+        Update-DesignerBrowser -State $script:B -Force
+        $script:B.Browser.Connected | Should -BeTrue
+        $script:B.Browser.TabId | Should -Be $extra.id
+    }
+
+    It 'says when the browser has gone, and Retry connects again' {
+        Stop-HeadlessEdge -ProfileDir $script:PickProfile
+        Start-Sleep -Milliseconds 800
+        Update-DesignerBrowser -State $script:B -Force
+        $script:B.Browser.Connected | Should -BeFalse
+        $state = (Invoke-TestRoute GET '/api/state' -State $script:B).Data
+        $state.capabilities.pick | Should -BeFalse
+        $state.browser.problem.code | Should -Be 'gone'
+        $state.browser.message | Should -Be 'The audit Edge window was closed.'
+        (Invoke-TestRoute POST '/api/pick/start' -Body @{ mode = 'click' } -State $script:B).Status | Should -Be 409
+        $script:PickEdge = Start-HeadlessEdge -Port $script:PickCdp -ProfileDir $script:PickProfile
+        $r = Invoke-TestRoute POST '/api/browser/connect' -State $script:B
+        $r.Data.connected | Should -BeTrue
+        $r.Data.problem | Should -BeNullOrEmpty
+        Close-DesignerBrowser -State $script:B
+        $script:B.Browser.Connected | Should -BeFalse
+        # A reused Edge is never closed by the Designer.
+        Get-DebugEndpointInfo -Port $script:PickCdp | Should -Not -BeNullOrEmpty
+    }
+}
+
+Describe 'The panel with an audit browser (two headless Edges, real server)' -Tag 'Integration' {
+    BeforeAll {
+        $script:W1 = Get-FreeTcpPort
+        $script:WebBase = "http://localhost:$($script:W1)"
+        $script:UiServer = Start-TestServer -Port $script:W1
+        $script:AuditCdp = Get-FreeTcpPort
+        $script:AuditProfile = Join-Path ([System.IO.Path]::GetTempPath()) "vouch-designer-ui-audit-$($script:AuditCdp)"
+        [void](Start-HeadlessEdge -Port $script:AuditCdp -ProfileDir $script:AuditProfile)
+        $script:Sockets = @{}
+        $script:CurrentCdp = ''
+        function Use-Cdp([string]$Name) {
+            # The test drives two browsers; the engine keeps one socket, so swap them.
+            if ($script:CurrentCdp) { $script:Sockets[$script:CurrentCdp] = @{ Socket = $script:CdpSocket; Url = $script:CdpWebSocketUrl; Id = $script:CdpMessageId } }
+            $saved = $script:Sockets[$Name]
+            $script:CdpSocket = $saved.Socket; $script:CdpWebSocketUrl = $saved.Url; $script:CdpMessageId = $saved.Id
+            $script:CurrentCdp = $Name
+        }
+        function Connect-TestTab([string]$Name, [int]$Port) {
+            if ($script:CurrentCdp) { Use-Cdp $script:CurrentCdp; $script:CdpSocket = $null }
+            $target = Get-CdpPageTarget -Port $Port -WaitSeconds 5 -TabId ''
+            Connect-CdpSocket -WebSocketUrl ([string]$target.webSocketDebuggerUrl)
+            $script:CurrentCdp = $Name
+            $script:Sockets[$Name] = @{ Socket = $script:CdpSocket; Url = $script:CdpWebSocketUrl; Id = $script:CdpMessageId }
+        }
+        $script:CdpPort = 0
+        $script:CurrentCdp = ''
+        $script:CdpSocket = $null
+        Connect-TestTab -Name 'audit' -Port $script:AuditCdp
+        Set-NavigationMarker
+        [void](Send-CdpCommand -Method 'Page.navigate' -Params @{ url = "$($script:WebBase)/tabs" })
+        [void](Wait-PageReady -TimeoutSec 15)
+
+        $script:UiConfig = Copy-Sample 'ui.json'
+        $script:Ui = Start-DesignerTestServer -ConfigPath $script:UiConfig -Name 'ui' -AuditPort $script:AuditCdp -AuditProfile $script:AuditProfile
+        $script:UiPanelCdp = Get-FreeTcpPort
+        $script:UiPanelProfile = Join-Path ([System.IO.Path]::GetTempPath()) "vouch-designer-ui-panel-$($script:UiPanelCdp)"
+        [void](Start-HeadlessEdge -Port $script:UiPanelCdp -ProfileDir $script:UiPanelProfile)
+        Connect-TestTab -Name 'panel' -Port $script:UiPanelCdp
+        $collector = @'
+window.__errs = [];
+window.addEventListener('error', e => window.__errs.push('error: ' + (e.message || e.type) + ' ' + (e.filename || '')), true);
+window.addEventListener('unhandledrejection', e => window.__errs.push('rejection: ' + ((e.reason && e.reason.message) || e.reason)));
+document.addEventListener('securitypolicyviolation', e => window.__errs.push('csp: ' + e.violatedDirective + ' ' + e.blockedURI));
+const vouchConsoleError = console.error;
+console.error = function () { window.__errs.push('console: ' + Array.from(arguments).join(' ')); return vouchConsoleError.apply(console, arguments); };
+'@
+        [void](Send-CdpCommand -Method 'Page.enable')
+        [void](Send-CdpCommand -Method 'Page.addScriptToEvaluateOnNewDocument' -Params @{ source = $collector })
+        [void](Send-CdpCommand -Method 'Emulation.setDeviceMetricsOverride' -Params @{ width = 480; height = 900; deviceScaleFactor = 1; mobile = $false })
+        Set-NavigationMarker
+        [void](Send-CdpCommand -Method 'Page.navigate' -Params @{ url = $script:Ui.Url })
+        [void](Wait-PageReady -TimeoutSec 15)
+        [void](Invoke-CdpEval -Expression 'window.VouchDesigner.ready.then(() => true)' -TimeoutSec 20)
+        function Invoke-UiPanel([string]$Script) {
+            Use-Cdp 'panel'
+            $json = Invoke-CdpEval -TimeoutSec 40 -Expression "(async () => { const D = window.VouchDesigner; const S = D.S; const until = async (f, ms) => { const end = Date.now() + (ms || 10000); while (Date.now() < end) { const v = f(); if (v) return v; await new Promise(r => setTimeout(r, 100)); } return null; }; const btnByKey = k => Array.from(document.querySelectorAll('button')).find(b => b.dataset.fkey === k); const r = await (async () => { $Script })(); return JSON.stringify(r === undefined ? null : r); })()"
+            if ($null -eq $json) { return $null }
+            return $json | ConvertFrom-Json -Depth 64
+        }
+        function Invoke-Audit([string]$Expression) { Use-Cdp 'audit'; try { return Invoke-CdpEval -Expression $Expression } finally { Use-Cdp 'panel' } }
+        function Send-AuditClick([string]$Element) {
+            Use-Cdp 'audit'
+            try {
+                $p = Invoke-CdpEval -Expression "(function () { var r = ($Element).getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()"
+                foreach ($type in 'mouseMoved', 'mousePressed', 'mouseReleased') {
+                    $params = @{ type = $type; x = [double]$p.x; y = [double]$p.y }
+                    if ($type -ne 'mouseMoved') { $params.button = 'left'; $params.clickCount = 1 }
+                    [void](Send-CdpCommand -Method 'Input.dispatchMouseEvent' -Params $params)
+                }
+            }
+            finally { Use-Cdp 'panel' }
+        }
+    }
+    AfterAll {
+        foreach ($name in @($script:Sockets.Keys)) { Use-Cdp $name; Close-CdpSocket }
+        $script:CurrentCdp = ''
+        if ($null -ne $script:Ui) { Stop-Process -Id $script:Ui.Process.Id -Force -ErrorAction SilentlyContinue }
+        Stop-HeadlessEdge -ProfileDir $script:UiPanelProfile
+        Stop-HeadlessEdge -ProfileDir $script:AuditProfile
+        if ($null -ne $script:UiServer) { Stop-Process -Id $script:UiServer.Id -Force -ErrorAction SilentlyContinue }
+        Remove-DirectoryWithRetry -Path $script:UiPanelProfile
+        Remove-DirectoryWithRetry -Path $script:AuditProfile
+    }
+
+    It 'shows the connected browser with the page in front, and turns the browser buttons on' {
+        $r = Invoke-UiPanel @'
+await until(() => S.browser.connected && S.capabilities.pick, 15000);
+D.setTab('pages');
+const strip = document.querySelector('#browser-strip');
+return { connected: S.browser.connected, on: strip.classList.contains('is-on'), text: strip.textContent,
+  tidy: !!btnByKey('bs-tidy'), pickDisabled: btnByKey('pick-click').getAttribute('aria-disabled') };
+'@
+        $r.connected | Should -BeTrue
+        $r.on | Should -BeTrue
+        $r.text | Should -Match 'Browser connected'
+        $r.text | Should -Match 'Tabs'
+        $r.text | Should -Match ([regex]::Escape("$($script:WebBase)/tabs"))
+        $r.tidy | Should -BeTrue
+        $r.pickDisabled | Should -BeNullOrEmpty
+    }
+
+    It 'adds the page in front as a new page, named after its title' {
+        $r = Invoke-UiPanel @'
+const before = S.config.pages.length;
+await D.addPageFromCurrentTab();
+const p = S.config.pages[S.config.pages.length - 1];
+return { added: S.config.pages.length - before, name: p.name, url: p.url, selected: S.page === S.config.pages.length - 1 };
+'@
+        $r.added | Should -Be 1
+        $r.name | Should -Be 'Tabs'
+        $r.url | Should -Be "$($script:WebBase)/tabs"
+        $r.selected | Should -BeTrue
+    }
+
+    It 'opens a page with Go, previews its zoom, and shows it at 100% again on request' {
+        $width = Invoke-Audit 'window.innerWidth'
+        $r = Invoke-UiPanel @"
+const n = S.config.pages.length - 1;
+S.config.pages[n].url = '$($script:WebBase)/ok';
+S.config.pages[n].overrides = { zoomPercent: 50 };
+await D.goToUrl(n);
+await until(() => S.browser.zoom && S.browser.zoom.percent === 50, 6000);
+const zoomText = document.querySelector('#browser-strip').textContent;
+btnByKey('bs-zoomoff').click();
+await until(() => S.browser.zoom.percent === 100, 6000);
+const after = document.querySelector('#browser-strip').textContent;
+delete S.config.pages[n].overrides;
+S.config.pages[n].url = '$($script:WebBase)/tabs';
+await D.goToUrl(n);
+return { zoomText, after };
+"@
+        $r.zoomText | Should -Match 'Zoom preview'
+        $r.zoomText | Should -Match '50%'
+        $r.after | Should -Not -Match 'Zoom preview'
+        Invoke-Audit 'location.pathname' | Should -Be '/tabs'
+        Invoke-Audit 'window.innerWidth' | Should -Be $width
+    }
+
+    It 'records a click by pointing at it: from the panel button to a verified action row' {
+        Invoke-UiPanel @'
+D.setTab('pages'); D.selectPage(S.config.pages.length - 1);
+window.__pick = null;
+btnByKey('pick-click').click();
+return await until(() => document.querySelector('#picking').open, 8000);
+'@ | Should -BeTrue
+        # Esc in the panel (a closed dialog) does not end the wait.
+        Invoke-UiPanel "document.querySelector('#picking').close(); await new Promise(r => setTimeout(r, 50)); return document.querySelector('#picking').open;" | Should -BeTrue
+        Start-Sleep -Milliseconds 300
+        Send-AuditClick "document.getElementById('t-logs')"
+        $r = Invoke-UiPanel @'
+const open = await until(() => document.querySelector('#modal').open && document.querySelector('#modal-title').textContent === 'Record this?', 10000);
+const labels = Array.from(document.querySelectorAll('#modal-body .cand-row label')).map(l => l.textContent);
+const values = Array.from(document.querySelectorAll('#modal-body .cand-value')).map(c => c.textContent);
+const checked = document.querySelector('#modal-body input[type=radio]:checked').value;
+const edit = document.querySelector('#modal-body .cand-edit input').value;
+const count = S.config.pages[S.page].actions.length;
+document.querySelector('#modal-buttons .btn-primary').click();
+await until(() => !document.querySelector('#modal').open && S.config.pages[S.page].actions.length > count, 3000);
+const page = S.config.pages[S.page];
+const added = page.actions[page.actions.length - 1];
+return { open: !!open, labels, values, checked, edit, added, picking: document.querySelector('#picking').open, page: S.page, count: S.config.pages.length, actions: page.actions,
+  row: Array.from(document.querySelectorAll('.action-text')).pop().textContent };
+'@
+        $r.open | Should -BeTrue
+        $r.labels[0] | Should -Be "The $([char]0x2018)Logs$([char]0x2019) tab"
+        $r.values | Should -Contain 'Logs'
+        $r.values | Should -Contain '#t-logs'
+        $r.checked | Should -Be '0'
+        $r.edit | Should -Be 'Logs'
+        $r.added.type | Should -Be 'clickText' -Because "page $($r.page) of $($r.count): $($r.actions | ConvertTo-Json -Compress)"
+        $r.added.text | Should -Be 'Logs'
+        $r.picking | Should -BeFalse
+        $r.row | Should -Match 'Logs'
+        # The site never saw the click.
+        Invoke-Audit 'document.title' | Should -Be 'Tabs'
+    }
+
+    It 'tests the action in the browser and shows the result under it' {
+        $r = Invoke-UiPanel @'
+const page = S.config.pages[S.page];
+const j = page.actions.length - 1;
+const button = btnByKey('action-test:' + j);
+const label = button.textContent, aria = button.getAttribute('aria-label');
+button.click();
+const result = await until(() => document.querySelectorAll('.action-result').length ? document.querySelector('.action-result') : null, 10000);
+return { label, aria, text: result ? result.textContent : '', ok: result ? result.classList.contains('is-ok') : false };
+'@
+        $r.label | Should -Be 'Test (really clicks)'
+        $r.aria | Should -Match 'really clicks'
+        $r.ok | Should -BeTrue
+        $r.text | Should -Match 'Test worked'
+        Invoke-Audit 'document.title' | Should -Be 'Logs'
+    }
+
+    It 'cancels picking from the panel' {
+        $r = Invoke-UiPanel @'
+btnByKey('pick-click').click();
+await until(() => document.querySelector('#picking').open, 8000);
+document.querySelector('#picking-cancel').click();
+const closed = await until(() => !document.querySelector('#picking').open, 8000);
+return { closed: !!closed, toast: document.querySelector('#toast').textContent };
+'@
+        $r.closed | Should -BeTrue
+        $r.toast | Should -Match 'cancelled'
+        Invoke-Audit "typeof window.__vouchPicker + '|' + document.querySelectorAll('vouch-picker-ui').length" | Should -Be 'undefined|0'
+    }
+
+    It 'had no CSP violation, script error or console error' {
+        Use-Cdp 'panel'
+        Invoke-CdpEval -Expression "Array.isArray(window.__errs) ? JSON.stringify(window.__errs) : 'missing'" | Should -Be '[]'
+    }
+
+    It 'says when the browser has gone, with Retry, and Retry connects again' {
+        Use-Cdp 'audit'; Close-CdpSocket; Use-Cdp 'panel'
+        Stop-HeadlessEdge -ProfileDir $script:AuditProfile
+        $r = Invoke-UiPanel @'
+const off = await until(() => document.querySelector('#browser-strip').classList.contains('is-off'), 12000);
+const strip = document.querySelector('#browser-strip');
+return { off: !!off, text: strip.textContent, retry: !!btnByKey('bs-retry'), pick: btnByKey('pick-click') ? btnByKey('pick-click').getAttribute('aria-disabled') : 'gone' };
+'@
+        $r.off | Should -BeTrue
+        $r.text | Should -Match 'Browser not connected'
+        $r.text | Should -Match 'The audit Edge window was closed'
+        $r.retry | Should -BeTrue
+        $r.pick | Should -Be 'true'
+        [void](Start-HeadlessEdge -Port $script:AuditCdp -ProfileDir $script:AuditProfile)
+        $r = Invoke-UiPanel @'
+const retry = btnByKey('bs-retry');
+if (retry) retry.click();
+const on = await until(() => S.browser.connected && document.querySelector('#browser-strip').classList.contains('is-on'), 15000);
+return { on: !!on, text: document.querySelector('#browser-strip').textContent };
+'@
+        $r.on | Should -BeTrue
+        $r.text | Should -Match 'Browser connected'
     }
 }

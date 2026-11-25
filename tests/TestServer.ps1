@@ -166,6 +166,48 @@ while ($listener.IsListening) {
                     "<button id='logsettings' onclick=""document.title='LOG SETTINGS'"">Change log settings</button>"
                 Send-Response $context 200 (Page 'Sign out' $body)
             }
+            '^/pickme$' {
+                # Everything the Designer's picker must get right. ?x=<port> is the port of the
+                # other origin, for the frame from another site. Every element records a hit
+                # when clicked; links would leave the page if a click got through the picker.
+                $other = if ($query['x']) { [int]$query['x'] } else { 1 }
+                $rows = (1..12 | ForEach-Object { "<div>Row $_</div>" }) -join ''
+                $body = @"
+<style>
+body{margin:0;font:15px/1.3 sans-serif} .row{display:flex;gap:10px;align-items:center;padding:4px 8px;min-height:40px}
+.panel{width:280px;height:150px;overflow-y:auto;border:1px solid #888;display:inline-block;vertical-align:top}
+.panel div{height:50px;border-bottom:1px solid #ddd} #clipbox{width:200px;height:100px;overflow-y:clip;border:1px solid #c00;display:inline-block;vertical-align:top}
+iframe{width:260px;height:110px;border:1px solid #888} #spacer{height:2500px;background:linear-gradient(#fff,#ccf)}
+</style>
+<div class="row" id="navrow">
+<a href="/ok" id="reports-a" onclick="return hit('reports-1')">Reports</a>
+<a href="/ok" onclick="return hit('reports-2')">Reports</a>
+<button id="fav" onclick="hit('fav')"><span class="icon" id="favicon">&#9733;</span> Favourite</button>
+<button data-testid="save-settings" onclick="hit('save')">Save settings</button>
+<button id="ember4821" onclick="hit('generated')">Archive now</button>
+<button aria-label="Close dialog" onclick="hit('close')"><svg width="18" height="18" id="xsvg"><path d="M2 2L16 16M16 2L2 16" stroke="black" stroke-width="2"/></svg></button>
+</div>
+<div class="row"><div><div><div><div><div><em onclick="hit('deep')">Deep target</em></div></div></div></div></div></div>
+<div class="row"><iframe id="sameframe" name="sameframe" src="/pickframe"></iframe><iframe id="otherframe" src="http://localhost:$other/pickframe"></iframe><div id="shadowhost"></div></div>
+<div><div class="panel" id="leftpanel">$rows</div> <div class="panel" id="rightpanel">$rows</div> <div id="clipbox"><div style="height:400px">Clipped content</div></div></div>
+<div id="spacer">The rest of a tall page</div>
+<script>
+window.__hits = []; window.__downs = 0; window.__keys = 0;
+function hit(n) { window.__hits.push(n); document.title = 'HIT ' + n; return false; }
+document.addEventListener('mousedown', function () { window.__downs++; });
+document.addEventListener('keydown', function () { window.__keys++; });
+var shadowRoot = document.getElementById('shadowhost').attachShadow({ mode: 'open' });
+var shadowButton = document.createElement('button'); shadowButton.id = 'shadowbtn'; shadowButton.textContent = 'Shadow button';
+shadowButton.onclick = function () { hit('shadow'); }; shadowRoot.appendChild(shadowButton);
+</script>
+"@
+                Send-Response $context 200 (Page 'Pick me' $body)
+            }
+            '^/pickframe$' {
+                $rows = (1..8 | ForEach-Object { "<div style='height:50px'>Frame row $_</div>" }) -join ''
+                $body = "<button id='framebtn' onclick=""try { top.__hits.push('frame'); top.document.title = 'HIT frame'; } catch (e) { document.title = 'HIT other frame'; }"">Frame action</button>$rows"
+                Send-Response $context 200 (Page 'Pick frame' $body)
+            }
             '^/slow$' {
                 $seconds = if ($query['s']) { [int]$query['s'] } else { 10 }
                 Start-Sleep -Seconds $seconds
