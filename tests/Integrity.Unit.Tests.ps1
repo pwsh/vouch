@@ -847,6 +847,7 @@ Describe 'What -Verify accepts: a report of the kind its style sheet belongs to 
         @{ Case = 'the note saying which form the report has removed'; Full = $true; Edits = @(@{ Regex = '<p class="integrity-note"><strong>.*?</p>'; With = '' }); Pattern = 'parts are not the ones Vouch writes' }
         @{ Case = 'a paragraph added between the parts'; Edits = @(@{ Regex = '<h2>Evidence</h2>'; With = '<h2>Evidence</h2><p class="empty">All controls passed.</p>' }); Pattern = 'in a place where Vouch never writes one' }
         @{ Case = 'text added between the parts'; Edits = @(@{ Regex = '<h2>Evidence</h2>'; With = '<h2>Evidence</h2>All controls passed.' }); Pattern = 'text where Vouch writes none' }
+        @{ Case = 'a no-break space between two table rows (text to a browser, which moves it out of the table)'; Edits = @(@{ Regex = '</tr>'; With = "</tr>$([char]0xA0)" }); Pattern = 'text where Vouch writes none' }
         @{ Case = 'text added after the document'; Edits = @(@{ Regex = '</html>'; With = '</html>All controls passed.' }); Pattern = 'text where Vouch writes none' }
         @{ Case = 'the head in another order'; Edits = @(@{ Regex = '<title>[^<]*</title>'; With = '' }, @{ Regex = '</head>'; With = '<title>x</title></head>' }); Pattern = 'not set out the way Vouch writes them' }
         @{ Case = 'a contents list in a report without report options'

@@ -5964,6 +5964,7 @@ function Test-ReportMarkup {
     $noRaw = @{}
     $void = @{ meta = 1; br = 1; img = 1 }
     $badReference = [regex]'&(?!(?:amp|lt|gt|quot|#39|mdash|middot);)'
+    $notBlank = [regex]'[^ \t\r\n]'
     $tokens = [regex]::new('(?<doctype><!DOCTYPE html>)|</(?<end>[a-z][a-z0-9]*)>|<(?<start>[a-z][a-z0-9]*)(?<attributes>(?: [a-z][a-z0-9-]*="[^"<>]*")*)>|(?<text>[^<>]+)')
     $attributePattern = [regex]' ([a-z][a-z0-9-]*)="([^"<>]*)"'
     $counts = @{}
@@ -6013,7 +6014,9 @@ function Test-ReportMarkup {
                 $bad = $badReference.Match($value)
                 if ($bad.Success) { $problems.Add("The report contains a character reference or & that Vouch never writes ($(& $where ($token.Index + $bad.Index))).") }
             }
-            if (($depth -eq 0 -or -not $textIn.Contains($names[$depth - 1])) -and $value.Trim().Length -gt 0) {
+            # Only what HTML itself takes for blank space: a no-break space between two
+            # table rows, say, is text to a browser, which then moves it out of the table.
+            if (($depth -eq 0 -or -not $textIn.Contains($names[$depth - 1])) -and $notBlank.IsMatch($value)) {
                 $problems.Add("The report has text where Vouch writes none ($(& $where $token.Index)).")
             }
             continue
