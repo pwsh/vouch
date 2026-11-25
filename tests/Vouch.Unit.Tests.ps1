@@ -763,7 +763,6 @@ Describe 'Configuration file' {
                 $reparsed = ConvertTo-StepList -StepsText $got.StepsText -LineNumber 1 -Errors $errors
                 $errors.Count | Should -Be 0
                 @($reparsed | ForEach-Object { "$($_.Verb)|$($_.Argument)" }) | Should -Be @($want.Steps | ForEach-Object { "$($_.Verb)|$($_.Argument)" })
-                (Test-LegacyActionList -Actions @($got.Actions)).Supported | Should -BeTrue -Because $because
             }
         }
 
@@ -821,42 +820,6 @@ Describe 'Configuration file' {
             It 'still writes wait:2.5' {
                 ConvertTo-StepText -Actions @(@{ type = 'wait'; seconds = 2.5 }) | Should -Be 'wait:2.5'
             }
-        }
-    }
-
-    Context 'Test-LegacyActionList' {
-        It 'accepts <Case>' -ForEach @(
-            @{ Case = 'steps then one capture'; Actions = @('click', 'clickText', 'wait', 'capture:none') }
-            @{ Case = 'one scrolling capture'; Actions = @('capture:auto') }
-        ) {
-            $list = foreach ($entry in $Actions) {
-                $type, $mode = $entry.Split(':')
-                if ($type -eq 'capture') { [ordered]@{ type = 'capture'; scroll = [ordered]@{ mode = $mode; as = 'segments' } } }
-                else { [ordered]@{ type = $type } }
-            }
-            (Test-LegacyActionList -Actions @($list)).Supported | Should -BeTrue
-        }
-
-        It 'refuses <Case> with a reason' -ForEach @(
-            @{ Case = 'two captures'; Pattern = '*2 captures*'
-               Actions = @(@{ type = 'capture'; scroll = @{ mode = 'none'; as = 'segments' } }, @{ type = 'capture'; scroll = @{ mode = 'none'; as = 'segments' } }) }
-            @{ Case = 'a waitFor'; Pattern = '*"waitFor" action*'
-               Actions = @(@{ type = 'waitFor'; selector = '#a' }, @{ type = 'capture'; scroll = @{ mode = 'none'; as = 'segments' } }) }
-            @{ Case = 'a pause'; Pattern = '*"pause" action*'
-               Actions = @(@{ type = 'pause' }, @{ type = 'capture'; scroll = @{ mode = 'none'; as = 'segments' } }) }
-            @{ Case = 'scrolling a chosen area'; Pattern = '*scroll mode "area"*'
-               Actions = @(@{ type = 'capture'; scroll = @{ mode = 'area'; selector = '#m'; as = 'segments' } }) }
-            @{ Case = 'scroll mode page'; Pattern = '*scroll mode "page"*'
-               Actions = @(@{ type = 'capture'; scroll = @{ mode = 'page'; as = 'segments' } }) }
-            @{ Case = 'one tall image'; Pattern = '*"as": "single"*'
-               Actions = @(@{ type = 'capture'; scroll = @{ mode = 'auto'; as = 'single' } }) }
-            @{ Case = 'a click after the capture'; Pattern = '*actions after the capture*'
-               Actions = @(@{ type = 'capture'; scroll = @{ mode = 'none'; as = 'segments' } }, @{ type = 'click'; selector = '#a' }) }
-        ) {
-            $result = Test-LegacyActionList -Actions $Actions
-            $result.Supported | Should -BeFalse
-            $result.Reason | Should -BeLike $Pattern
-            $result.Reason | Should -BeLike '*cannot run yet*'
         }
     }
 
@@ -970,6 +933,21 @@ Describe 'Configuration file' {
         }
     }
 
+    Context 'Get-InactiveConfigSetting for page actions' {
+        It 'lists pause actions and one-tall-image captures, and no longer lists waitFor' {
+            $config = Get-DefaultVouchConfig
+            $config['defaults']['waitFor'] = '#ready'
+            $config['pages'].Add([ordered]@{ overrides = [ordered]@{ waitFor = '#grid' }; actions = @(
+                    [ordered]@{ type = 'Pause'; message = 'MFA' }
+                    [ordered]@{ type = 'waitFor'; selector = '#x' }
+                    [ordered]@{ type = 'capture'; scroll = [ordered]@{ mode = 'auto'; as = 'single' } }
+                    [ordered]@{ type = 'capture'; scroll = [ordered]@{ mode = 'none'; as = 'single' } }
+                    [ordered]@{ type = 'pause' }) })
+            $inactive = Get-InactiveConfigSetting -Config $config
+            $inactive | Should -Be @('page actions: pause', 'page actions: capture scroll "as": "single"')
+        }
+    }
+
     Context 'Get-RunLogDirectory' {
         BeforeAll {
             $folder = Join-Path -Path $TestDrive -ChildPath 'logcfg'
@@ -1002,6 +980,68 @@ Describe 'Configuration file' {
             $source | Should -Match '\$script:ExtraState = 1'
             $source | Should -Not -Match 'not loaded'
         }
+    }
+}
+
+Describe 'Get-CaptureFileName' {
+    It 'keeps today''s names for a page''s first capture' {
+        Get-CaptureFileName -Index 1 -Name 'Users & roles' -SegmentIndex 2 -Extension 'jpg' | Should -Be '001_Users_roles_seg02.jpg'
+        Get-CaptureFileName -Index 12 -Name 'A' -SegmentIndex 1 -Extension 'png' -CaptureNumber 1 | Should -Be '012_A_seg01.png'
+    }
+
+    It 'adds _c02, _c03 ... for later captures of the same page' {
+        Get-CaptureFileName -Index 3 -Name 'Tabs' -SegmentIndex 1 -Extension 'jpg' -CaptureNumber 2 | Should -Be '003_Tabs_c02_seg01.jpg'
+        Get-CaptureFileName -Index 3 -Name 'Tabs' -SegmentIndex 4 -Extension 'jpg' -CaptureNumber 11 | Should -Be '003_Tabs_c11_seg04.jpg'
+    }
+}
+
+Describe 'Capture sets in the report and the JSON summary' {
+    BeforeAll {
+        $run = [pscustomobject]@{
+            StartTime = '2026-09-23 10:00:00'; EndTime = '2026-09-23 10:05:00'; TimeZone = 'UTC'
+            Computer = 'PC'; User = 'DOM\user'; OperatingSystem = 'Windows'; EdgeVersion = 'Edg/1'
+            BrowserInstance = 'test'; ToolVersion = 'test'; CsvPath = 'c.json'; ImageFormat = 'jpeg'
+            ImageDescription = 'JPEG'; ScreenResolution = '1x1'; Total = 1; OkCount = 1
+            WarnCount = 0; FailCount = 0; CaptureCount = 3
+        }
+        function New-TestItem([object[]]$Captures) {
+            $list = [System.Collections.Generic.List[object]]::new()
+            foreach ($capture in $Captures) { $list.Add($capture) }
+            $stepLog = [System.Collections.Generic.List[object]]::new()
+            $stepLog.Add([pscustomobject]@{ Text = 'pause:Sign in'; Ok = $true; Message = 'skipped: pause is not available yet' })
+            [pscustomobject]@{
+                Index = 1; Name = 'Tabs'; Url = 'https://a/'; FinalUrl = 'https://a/'; Notes = ''; StepsText = ''
+                ScrollFullPage = $false; ScrollArea = ''; Status = 'OK'; HttpStatus = 200
+                Details = [System.Collections.Generic.List[string]]::new(); StepLog = $stepLog; Captures = $list
+            }
+        }
+        $multi = New-TestItem @(
+            (New-CaptureRecord -Bytes ([byte[]](1)) -Url 'https://a/' -SegmentIndex 1 -SegmentCount 1 -FileName '001_Tabs_seg01.jpg' -Label 'General')
+            (New-CaptureRecord -Bytes ([byte[]](2)) -Url 'https://a/' -SegmentIndex 1 -SegmentCount 2 -FileName '001_Tabs_c02_seg01.jpg' -CaptureNumber 2 -Label 'Audit <log>')
+            (New-CaptureRecord -Bytes ([byte[]](3)) -Url 'https://a/' -SegmentIndex 2 -SegmentCount 2 -FileName '001_Tabs_c02_seg02.jpg' -CaptureNumber 2 -Label 'Audit <log>'))
+        $script:MultiHtml = New-HtmlReport -Items @($multi) -Run $run
+        $script:MultiJson = ConvertTo-RunSummaryJson -Items @($multi) -Run $run -ReportPath 'C:\r.html' -ExitCode 0 | ConvertFrom-Json
+        $single = New-TestItem @((New-CaptureRecord -Bytes ([byte[]](1)) -Url 'https://a/' -SegmentIndex 1 -SegmentCount 1 -FileName '001_Tabs_seg01.jpg'))
+        $script:SingleHtml = New-HtmlReport -Items @($single) -Run $run
+    }
+
+    It 'names each capture set, in the order taken, with its label' {
+        $captions = @([regex]::Matches($script:MultiHtml, '<figcaption><strong>([^<]*)</strong>') | ForEach-Object { $_.Groups[1].Value })
+        $captions | Should -Be @('Capture 1: General', 'Capture 2: Audit &lt;log&gt;', 'Capture 2: Audit &lt;log&gt;')
+    }
+
+    It 'leaves a page with one unlabelled capture as it was' {
+        $script:SingleHtml | Should -Not -Match '<figcaption><strong>'
+        $script:SingleHtml | Should -Match 'alt="Tabs screenshot 1 of 1"'
+    }
+
+    It 'shows a note on a step that ran without doing its work' {
+        $script:MultiHtml | Should -Match '<code>pause:Sign in</code> &mdash; skipped: pause is not available yet'
+    }
+
+    It 'carries the capture number and label into the JSON summary' {
+        @($script:MultiJson.Items[0].Captures.CaptureNumber) | Should -Be @(1, 2, 2)
+        $script:MultiJson.Items[0].Captures[1].Label | Should -Be 'Audit <log>'
     }
 }
 

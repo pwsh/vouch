@@ -111,6 +111,37 @@ Describe 'CDP plumbing' -Tag 'Integration' {
             { Invoke-ClickText -Text 'Archive' } | Should -Throw '*Only hidden elements*'
             Invoke-CdpEval -Expression 'document.title' | Should -Be 'Tabs'
         }
+
+        It 'clicktext find-only names the element the click then hits (<Case>)' -ForEach @(
+            @{ Case = 'exact, a hidden twin first'; Text = 'Audit Log'; Id = 't-audit'; Exact = $true; Title = 'Audit Log' }
+            @{ Case = 'partial, never the sign-out link'; Text = 'Log'; Id = 't-logs'; Exact = $false; Title = 'Logs' }
+            @{ Case = 'sign-out when asked for it'; Text = 'log out'; Id = 'signout'; Exact = $true; Title = 'SIGNED OUT' }
+        ) {
+            $found = Invoke-CdpEval -Expression (Get-ClickTextScript -Text $Text -FindOnly)
+            $found.found | Should -BeTrue
+            $found.id | Should -Be $Id
+            $found.exact | Should -Be $Exact
+            $found.frame | Should -Be ''
+            $found.visible | Should -BeTrue
+            Invoke-CdpEval -Expression 'document.title' | Should -Be 'Tabs' -Because 'find-only clicks nothing'
+            Invoke-ClickText -Text $Text
+            Invoke-CdpEval -Expression 'document.title' | Should -Be $Title
+        }
+
+        It 'clicktext find-only says when only hidden elements match' {
+            $found = Invoke-CdpEval -Expression (Get-ClickTextScript -Text 'Archive' -FindOnly)
+            $found.found | Should -BeFalse
+            $found.hidden | Should -BeTrue
+        }
+
+        It 'click find-only names the element a selector would click' {
+            $found = Invoke-CdpEval -Expression (Get-ClickSelectorScript -Selector 'ul > li:nth-child(1) a.item' -FindOnly)
+            $found.found | Should -BeTrue
+            $found.tag | Should -Be 'a'
+            $found.text | Should -Be 'A'
+            Invoke-CdpEval -Expression 'document.title' | Should -Be 'Tabs'
+            (Invoke-CdpEval -Expression (Get-ClickSelectorScript -Selector '#nope' -FindOnly)).found | Should -BeFalse
+        }
     }
 
     Context 'finding what scrolls' {
@@ -174,6 +205,22 @@ Describe 'CDP plumbing' -Tag 'Integration' {
         It 'click: finds a selector inside a same-site frame' {
             Invoke-ClickSelector -Selector '#frame-btn'
             Invoke-CdpEval -Expression 'document.title' | Should -Be 'FRAME CLICKED'
+        }
+
+        It 'find-only names the frame the element is in' {
+            $byText = Invoke-CdpEval -Expression (Get-ClickTextScript -Text 'Frame button' -FindOnly)
+            $bySelector = Invoke-CdpEval -Expression (Get-ClickSelectorScript -Selector '#frame-btn' -FindOnly)
+            foreach ($found in $byText, $bySelector) {
+                $found.id | Should -Be 'frame-btn'
+                $found.frame | Should -BeLike '*framecontent*'
+            }
+            Invoke-CdpEval -Expression 'document.title' | Should -Be 'Frame page'
+        }
+
+        It 'Wait-PageElement finds a visible element inside a same-site frame' {
+            Wait-PageElement -Selector '#frame-btn' -TimeoutSec 5 | Should -BeTrue
+            Wait-PageElement -Selector '#not-there' -TimeoutSec 0.5 | Should -BeFalse
+            { Wait-PageElement -Selector 'div[' -TimeoutSec 5 } | Should -Throw '*not a CSS selector*'
         }
 
         It 'waits for a page loaded inside the frame by a click' {
@@ -420,7 +467,7 @@ Plain page after the slow one,$Web/ok,,N,
 
 Describe 'Invoke-Main with a configuration file (desktop functions mocked)' -Tag 'Integration' {
     # The same pages as the CSV run above, converted to a configuration file, plus a
-    # switched-off page, a page the engine cannot run yet and a page with its own timing.
+    # switched-off page, a page that waits for an element and a page with its own timing.
     BeforeAll {
         Close-CdpSocket
         $script:CsvItems = $script:Items   # from the CSV end-to-end run above
@@ -464,8 +511,8 @@ Plain page after the slow one,$Web/ok,,N,
         $capture = [ordered]@{ type = 'capture'; scroll = [ordered]@{ mode = 'none' } }
         # Third in the file: the pages after it must keep the CSV run's numbers and file names.
         $config['pages'].Insert(2, [ordered]@{ id = 'off'; name = 'Switched off'; url = "$Web/ok"; enabled = $false; actions = @($capture) })
-        $config['pages'].Add([ordered]@{ id = 'newer'; name = 'Needs a newer Vouch'; url = "$Web/ok"
-            actions = @([ordered]@{ type = 'waitFor'; selector = '#x' }, $capture) })
+        $config['pages'].Add([ordered]@{ id = 'waits'; name = 'Waits for an element'; url = "$Web/ok"
+            actions = @([ordered]@{ type = 'waitFor'; selector = 'h1' }, $capture) })
         $config['pages'].Add([ordered]@{ id = 'timing'; name = 'Own timing'; url = "$Web/ok"
             overrides = [ordered]@{ navigationTimeoutSec = 9; settleSeconds = 0.73 }; actions = @($capture) })
 
@@ -543,13 +590,13 @@ Plain page after the slow one,$Web/ok,,N,
         $script:CfgOutput | Should -Match '1 other page\(s\) not selected or switched off'
     }
 
-    It 'fails a page that needs a newer Vouch without visiting it, and carries on' {
-        $item = $script:CfgItems['Needs a newer Vouch']
-        $item.Status | Should -Be 'FAILED'
-        ($item.Details -join ' ') | Should -Match '"waitFor" action.*cannot run yet'
-        $item.Captures.Count | Should -Be 0
-        $item.HttpStatus | Should -Be 0
-        $item.StepsText | Should -Be 'waitfor:#x'
+    It 'runs a page that waits for an element, and carries on' {
+        $item = $script:CfgItems['Waits for an element']
+        $item.Status | Should -Be 'OK' -Because ($item.Details -join ' | ')
+        @($item.StepLog | ForEach-Object { "$($_.Text)|$($_.Ok)" }) | Should -Be @('waitfor:h1|True')
+        $item.Captures.Count | Should -Be 1
+        $item.HttpStatus | Should -Be 200
+        $item.StepsText | Should -Be 'waitfor:h1'
         $script:CfgItems['Own timing'].Status | Should -Be 'OK' -Because ($script:CfgItems['Own timing'].Details -join ' | ')
     }
 
@@ -655,6 +702,280 @@ Tall page,$Web/tall?px=3000,,Y,
         $script:Tall.ScrollArea | Should -Be 'the page'
         $script:Tall.Captures.Count | Should -BeGreaterOrEqual 2
         $script:Tall.Captures[-1].SegmentCount | Should -Be $script:Tall.Captures.Count
+    }
+}
+
+Describe 'Page actions (one page at a time, desktop functions mocked)' -Tag 'Integration' {
+    # Each page runs through Invoke-CaptureItem. The screenshot is mocked, so the mock
+    # records the page's state (a JavaScript probe) at the moment each image is taken.
+    BeforeAll {
+        Connect-TestPage
+        Mock Set-EdgeForeground { $null }
+        $global:VouchShots = [System.Collections.Generic.List[string]]::new()
+        $global:VouchShotProbe = ''
+        Mock Get-ScreenCapture {
+            $state = ''
+            if ($global:VouchShotProbe) { $state = [string](Invoke-CdpEval -Expression $global:VouchShotProbe -TimeoutSec 10) }
+            $global:VouchShots.Add($state)
+            , [byte[]](0xFF, 0xD8, 0xFF, 0xD9)
+        }
+
+        function Invoke-TestPage {
+            param(
+                [Parameter(Mandatory)][string]$Url,
+                [Parameter(Mandatory)][object[]]$Actions,
+                [string]$Probe = 'document.title',
+                [string]$WaitFor = '',
+                [int]$TimeoutSec = 10
+            )
+            $global:VouchShots.Clear()
+            $global:VouchShotProbe = $Probe
+            $definition = ConvertTo-CaptureDefinition -Index 7 -Page ([ordered]@{ name = 'Actions'; url = $Url; actions = $Actions })
+            $run = Resolve-RunSettings -BoundParameters @{} -Config $null -Defaults @{
+                NavigationTimeoutSec = $TimeoutSec; SettleSeconds = 0.1; ScrollSettleSeconds = 0.1; MaxScrollSegments = 10
+            }
+            $config = Get-DefaultVouchConfig
+            $config['defaults']['waitFor'] = $WaitFor
+            $settings = Get-PageSettings -Settings $run -Definition $definition -Config $config
+            $context = @{
+                RunId = [guid]::NewGuid().ToString(); Format = 'jpeg'; Quality = 85; Extension = 'jpg'
+                SaveImages = $false; ImagesDir = ''; Screen = '1x1'
+            }
+            $item = Invoke-CaptureItem -Definition $definition -Settings $settings -CaptureContext $context 6>$null
+            return [pscustomobject]@{ Item = $item; Shots = @($global:VouchShots) }
+        }
+        function New-Capture([string]$Label = '', [string]$Mode = 'none', [string]$Selector = '') {
+            [ordered]@{ type = 'capture'; label = $Label; scroll = [ordered]@{ mode = $Mode; selector = $Selector } }
+        }
+    }
+
+    AfterAll {
+        Close-CdpSocket
+        Remove-Variable -Name VouchShots, VouchShotProbe -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'takes one capture set per tab: click A, capture, click B, capture' {
+        $result = Invoke-TestPage -Url "$Web/tabs" -Actions @(
+            [ordered]@{ type = 'click'; selector = '#t-general' }
+            (New-Capture 'General tab')
+            [ordered]@{ type = 'clickText'; text = 'Audit Log' }
+            (New-Capture 'Audit tab'))
+        $item = $result.Item
+        $item.Status | Should -Be 'OK' -Because ($item.Details -join ' | ')
+        @($item.Captures.FileName) | Should -Be @('007_Actions_seg01.jpg', '007_Actions_c02_seg01.jpg')
+        @($item.Captures.CaptureNumber) | Should -Be @(1, 2)
+        @($item.Captures.Label) | Should -Be @('General tab', 'Audit tab')
+        $result.Shots | Should -Be @('General', 'Audit Log')
+        @($item.StepLog | ForEach-Object { "$($_.Text)|$($_.Ok)" }) |
+            Should -Be @('click:#t-general|True', 'capture:General tab|True', 'clicktext:Audit Log|True', 'capture:Audit tab|True')
+        $item.StepsText | Should -Be 'click:#t-general; capture:General tab; clicktext:Audit Log; capture:Audit tab'
+    }
+
+    It 'records a failed action once, runs the rest and still takes every capture' {
+        $result = Invoke-TestPage -Url "$Web/tabs" -Actions @(
+            [ordered]@{ type = 'click'; selector = '#missing' }
+            (New-Capture 'first')
+            [ordered]@{ type = 'clickText'; text = 'No such tab' }
+            [ordered]@{ type = 'click'; selector = '#t-logs' }
+            (New-Capture 'second'))
+        $item = $result.Item
+        $item.Status | Should -Be 'WARNING'
+        @($item.Details | Where-Object { $_ -like 'Completed with errors*' }) | Should -Be @('Completed with errors: 2 of 3 step(s) failed.')
+        @($item.StepLog.Ok) | Should -Be @($false, $true, $false, $true, $true)
+        $result.Shots | Should -Be @('Tabs', 'Logs')
+    }
+
+    It 'scrolls each named area in turn and does not report the other as missed' {
+        $result = Invoke-TestPage -Url "$Web/tworegions" -Probe "document.getElementById('left').scrollTop + '|' + document.getElementById('right').scrollTop" -Actions @(
+            (New-Capture 'Left' 'area' '#left')
+            (New-Capture 'Right' 'area' '#right'))
+        $item = $result.Item
+        $item.Status | Should -Be 'OK' -Because ($item.Details -join ' | ')
+        ($item.Details -join ' ') | Should -Not -Match 'Another scrolling area'
+        $item.ScrollArea | Should -Be 'div#left; div#right'
+        $first = @($item.Captures | Where-Object CaptureNumber -eq 1)
+        $second = @($item.Captures | Where-Object CaptureNumber -eq 2)
+        $first.Count | Should -BeGreaterOrEqual 2
+        $second.Count | Should -Be $first.Count
+        # Second segment of each set: only its own area has moved.
+        $result.Shots[1] | Should -Match '^[1-9]\d*\|0$'
+        $result.Shots[$first.Count + 1] | Should -Match '^0\|[1-9]\d*$'
+    }
+
+    It 'still reports an area the page never captures' {
+        $result = Invoke-TestPage -Url "$Web/tworegions" -Actions @((New-Capture 'Left' 'area' '#left'))
+        $result.Item.Status | Should -Be 'WARNING'
+        ($result.Item.Details -join ' ') | Should -Match 'Another scrolling area \(div#right\)'
+    }
+
+    It 'scrolls a frame named by its frame element' {
+        $result = Invoke-TestPage -Url "$Web/framepage?rows=30" -Probe "document.getElementById('content').contentWindow.scrollY" -Actions @(
+            (New-Capture 'Frame' 'area' '#content'))
+        $item = $result.Item
+        $item.Status | Should -Be 'OK' -Because ($item.Details -join ' | ')
+        $item.ScrollArea | Should -BeLike 'the frame *framecontent*'
+        $item.Captures.Count | Should -BeGreaterOrEqual 2
+        [int]$result.Shots[1] | Should -BeGreaterThan 0
+    }
+
+    It 'falls back to the automatic search when the area <Case>, and says so' -ForEach @(
+        @{ Case = 'matches nothing'; Selector = '#nope'; Pattern = "*'#nope' of the capture 'Panel' matches no element*div#main*" }
+        @{ Case = 'does not scroll'; Selector = 'header'; Pattern = "*'header' of the capture 'Panel' does not scroll*div#main*" }
+    ) {
+        $result = Invoke-TestPage -Url "$Web/innerscroll?rows=20" -Actions @((New-Capture 'Panel' 'area' $Selector))
+        $item = $result.Item
+        $item.Status | Should -Be 'WARNING'
+        @($item.Details | Where-Object { $_ -like $Pattern }).Count | Should -Be 1 -Because ($item.Details -join ' | ')
+        $item.ScrollArea | Should -Be 'div#main'
+        $item.Captures.Count | Should -BeGreaterOrEqual 2
+    }
+
+    It 'scroll mode page scrolls the window even when a panel holds more' {
+        $result = Invoke-TestPage -Url "$Web/bigpanel" -Probe "window.scrollY + '|' + document.getElementById('panel').scrollTop" -Actions @(
+            (New-Capture 'Whole page' 'page'))
+        $item = $result.Item
+        $item.ScrollArea | Should -Be 'the page'
+        $item.Captures.Count | Should -BeGreaterOrEqual 2
+        $result.Shots[1] | Should -Match '^[1-9]\d*\|0$'
+        ($item.Details -join ' ') | Should -Match 'Another scrolling area \(div#panel\)'
+    }
+
+    It 'scroll mode page takes one screen of a page whose window does not scroll' {
+        $result = Invoke-TestPage -Url "$Web/innerscroll?rows=20" -Actions @((New-Capture '' 'page'))
+        $result.Item.ScrollArea | Should -BeLike 'nothing to scroll*'
+        $result.Item.Captures.Count | Should -Be 1
+        ($result.Item.Details -join ' ') | Should -Match 'Another scrolling area \(div#main\)'
+    }
+
+    It 'a waitFor action waits until the element is visible' {
+        $result = Invoke-TestPage -Url "$Web/delayed?ms=1500" -Probe "getComputedStyle(document.getElementById('late')).display" -Actions @(
+            [ordered]@{ type = 'waitFor'; selector = '#late'; timeoutSec = 10 }
+            (New-Capture))
+        $result.Item.Status | Should -Be 'OK' -Because ($result.Item.Details -join ' | ')
+        $result.Item.StepLog[0].Ok | Should -BeTrue
+        $result.Shots | Should -Be @('block')
+    }
+
+    It 'a waitFor action that times out is a warning, and the page is still captured' {
+        $result = Invoke-TestPage -Url "$Web/delayed?ms=8000" -Probe "getComputedStyle(document.getElementById('late')).display" -Actions @(
+            [ordered]@{ type = 'waitFor'; selector = '#late'; timeoutSec = 1 }
+            (New-Capture))
+        $item = $result.Item
+        $item.Status | Should -Be 'WARNING'
+        $item.StepLog[0].Ok | Should -BeFalse
+        $item.StepLog[0].Message | Should -BeLike "*'#late' within 1 second(s)*"
+        $result.Shots | Should -Be @('none')
+    }
+
+    It 'without a wait-for the page is captured before the element shows' {
+        $result = Invoke-TestPage -Url "$Web/delayed?ms=1500" -Probe "getComputedStyle(document.getElementById('late')).display" -Actions @((New-Capture))
+        $result.Shots | Should -Be @('none')
+    }
+
+    It 'the page''s wait-for setting holds every action until the element shows' {
+        $result = Invoke-TestPage -Url "$Web/delayed?ms=1500" -WaitFor '#late' -Probe "getComputedStyle(document.getElementById('late')).display" -Actions @((New-Capture))
+        $result.Item.Status | Should -Be 'OK' -Because ($result.Item.Details -join ' | ')
+        $result.Shots | Should -Be @('block')
+    }
+
+    It 'the page''s wait-for setting warns when the element never shows' {
+        $result = Invoke-TestPage -Url "$Web/delayed?ms=60000" -WaitFor '#late' -TimeoutSec 2 -Probe "getComputedStyle(document.getElementById('late')).display" -Actions @((New-Capture))
+        $item = $result.Item
+        $item.Status | Should -Be 'WARNING'
+        ($item.Details -join ' ') | Should -Match "did not show '#late' within 2 seconds"
+        $item.Captures.Count | Should -Be 1
+    }
+
+    It 'skips a pause with a warning and runs the rest of the page' {
+        $result = Invoke-TestPage -Url "$Web/tabs" -Actions @(
+            [ordered]@{ type = 'pause'; message = 'Sign in' }
+            [ordered]@{ type = 'clickText'; text = 'General' }
+            (New-Capture))
+        $item = $result.Item
+        $item.Status | Should -Be 'WARNING'
+        ($item.Details -join ' ') | Should -Match 'pause is not available yet'
+        @($item.StepLog | ForEach-Object { "$($_.Text)|$($_.Ok)" }) | Should -Be @('pause:Sign in|True', 'clicktext:General|True')
+        $item.StepLog[0].Message | Should -BeLike '*not available yet*'
+        $result.Shots | Should -Be @('General')
+    }
+}
+
+Describe 'Invoke-Main with several captures per page (desktop functions mocked)' -Tag 'Integration' {
+    BeforeAll {
+        Close-CdpSocket
+        $script:RealNewHtmlReportForMulti = ${function:New-HtmlReport}
+        $global:VouchMulti = @{}
+        $config = Get-DefaultVouchConfig
+        $config['browser']['profileDir'] = $script:ProfileDir
+        $config['browser']['debugPort'] = $script:CdpPort
+        $config['defaults']['navigationTimeoutSec'] = 10
+        $config['defaults']['settleSeconds'] = 0.1
+        $config['defaults']['scrollSettleSeconds'] = 0.1
+        $config['output']['dir'] = 'out'
+        $config['output']['reportName'] = 'multi.html'
+        $config['output']['saveImages'] = $true
+        $config['output']['jsonSummary'] = $true
+        $config['pages'].Add([ordered]@{ name = 'Plain'; url = "$Web/ok" })
+        $config['pages'].Add([ordered]@{ name = 'Tabs'; url = "$Web/tabs"; actions = @(
+                [ordered]@{ type = 'click'; selector = '#t-general' }
+                [ordered]@{ type = 'capture'; label = 'General' }
+                [ordered]@{ type = 'click'; selector = '#t-logs' }
+                [ordered]@{ type = 'capture'; label = 'Logs' }) })
+        $config['pages'].Add([ordered]@{ name = 'Regions'; url = "$Web/tworegions"; actions = @(
+                [ordered]@{ type = 'capture'; label = 'Left'; scroll = [ordered]@{ mode = 'area'; selector = '#left' } }
+                [ordered]@{ type = 'capture'; label = 'Right'; scroll = [ordered]@{ mode = 'area'; selector = '#right' } }) })
+        $folder = Join-Path -Path $TestDrive -ChildPath 'multi'
+        [void](New-Item -ItemType Directory -Path $folder)
+        $path = Join-Path -Path $folder -ChildPath 'multi.json'
+        [System.IO.File]::WriteAllText($path, ($config | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+        $script:MultiReport = Join-Path -Path $folder -ChildPath 'out\multi.html'
+
+        Mock Set-EdgeForeground { $null }
+        Mock Get-ScreenCapture {
+            $bitmap = [System.Drawing.Bitmap]::new(16, 10)
+            try {
+                if ($Metadata) { Set-JpegMetadata -Image $bitmap -Metadata $Metadata }
+                $stream = [System.IO.MemoryStream]::new()
+                $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                , $stream.ToArray()
+            }
+            finally { $bitmap.Dispose() }
+        }
+        Mock New-HtmlReport {
+            $global:VouchMulti.Items = $Items
+            & $script:RealNewHtmlReportForMulti -Items $Items -Run $Run
+        }
+        Invoke-Main -BoundParameters @{ ConfigPath = $path } 6>$null
+        $script:MultiExit = $script:ExitCode
+    }
+
+    AfterAll { Remove-Variable -Name VouchMulti -Scope Global -ErrorAction SilentlyContinue }
+
+    It 'names the extra capture sets _c02 and keeps the first set''s names' {
+        $script:MultiExit | Should -Be 0
+        $tabs = @($global:VouchMulti.Items | Where-Object Name -eq 'Tabs')[0]
+        @($tabs.Captures.FileName) | Should -Be @('002_Tabs_seg01.jpg', '002_Tabs_c02_seg01.jpg')
+        $plain = @($global:VouchMulti.Items | Where-Object Name -eq 'Plain')[0]
+        @($plain.Captures.FileName) | Should -Be @('001_Plain_seg01.jpg')
+        $images = Join-Path (Split-Path $script:MultiReport) 'images\multi'
+        Join-Path $images '002_Tabs_c02_seg01.jpg' | Should -Exist
+        Join-Path $images '003_Regions_c02_seg02.jpg' | Should -Exist
+    }
+
+    It 'produces a report that -Verify accepts, listing every image in order with its label' {
+        $results = @(Test-ReportIntegrity -Path $script:MultiReport)
+        @($results | Where-Object { -not $_.Ok }) | Should -BeNullOrEmpty
+        $html = [System.IO.File]::ReadAllText($script:MultiReport)
+        $files = @([regex]::Matches($html, 'data-file="([^"]*)"') | ForEach-Object { $_.Groups[1].Value })
+        $files[1..2] | Should -Be @('002_Tabs_seg01.jpg', '002_Tabs_c02_seg01.jpg')
+        $html | Should -Match '<strong>Capture 2: Logs</strong>'
+    }
+
+    It 'lists the capture number and label of each image in the JSON summary' {
+        $summary = Get-Content -LiteralPath ([System.IO.Path]::ChangeExtension($script:MultiReport, '.json')) -Raw | ConvertFrom-Json
+        $tabs = @($summary.Items | Where-Object Name -eq 'Tabs')[0]
+        @($tabs.Captures.Label) | Should -Be @('General', 'Logs')
+        @($tabs.Captures.CaptureNumber) | Should -Be @(1, 2)
     }
 }
 

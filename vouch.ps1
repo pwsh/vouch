@@ -1373,45 +1373,16 @@ function Select-VouchPage {
     return , $selected
 }
 
-function Test-LegacyActionList {
-    <#
-        TEMPORARY - remove when the engine runs action lists (Invoke-PageAction).
-        The engine still runs a page as "steps, then one capture that scrolls the page or
-        not". A configuration may already describe more (waiting for an element,
-        pausing for the user, several captures, scrolling a chosen area); running such a
-        page the old way would produce different evidence than the file asks for, so the
-        page is refused with a reason instead. Returns { Supported; Reason }.
-    #>
-    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Actions)
-
-    $problems = [System.Collections.Generic.List[string]]::new()
-    $captures = @($Actions | Where-Object { $_['type'] -eq 'capture' })
-    if ($captures.Count -gt 1) { $problems.Add("$($captures.Count) captures") }
-    foreach ($type in 'waitFor', 'pause') {
-        if (@($Actions | Where-Object { $_['type'] -eq $type }).Count -gt 0) { $problems.Add("a ""$type"" action") }
-    }
-    if ($Actions.Count -gt 0 -and $Actions[-1]['type'] -ne 'capture') { $problems.Add('actions after the capture') }
-    foreach ($capture in $captures) {
-        $mode = [string]$capture['scroll']['mode']
-        if ($mode -in 'page', 'area' -and -not $problems.Contains("scroll mode ""$mode""")) { $problems.Add("scroll mode ""$mode""") }
-        if ($mode -ne 'none' -and $capture['scroll']['as'] -eq 'single' -and -not $problems.Contains('one tall image ("as": "single")')) {
-            $problems.Add('one tall image ("as": "single")')
-        }
-    }
-    if ($problems.Count -eq 0) { return [pscustomobject]@{ Supported = $true; Reason = '' } }
-    return [pscustomobject]@{
-        Supported = $false
-        Reason    = "Not captured: this page uses $($problems -join ', '), which this version of Vouch cannot run yet. Remove it or use a newer vouch.ps1."
-    }
-}
-
 function Get-InactiveConfigSetting {
     <#
         TEMPORARY - shrink as each setting starts working (capture area and zoom,
-        prompts, report fields, zip, open when done).
+        prompts and pause actions, report fields, zip, open when done).
         Settings the file may set that this engine does not apply yet. A non-default
         value is listed so the user is told it had no effect rather than finding out
         from the evidence. Returns the setting paths, each once.
+        Two page actions are listed as well: "pause" (skipped with a warning by
+        Invoke-PageAction until the prompt exists) and a capture with "as": "single"
+        (one tall image needs page-content capture; it is taken as segments for now).
     #>
     param([Parameter(Mandatory)][System.Collections.IDictionary]$Config)
 
@@ -1423,7 +1394,7 @@ function Get-InactiveConfigSetting {
         if ($Value -is [string] -and [string]::IsNullOrWhiteSpace($Value) -and [string]::IsNullOrWhiteSpace([string]$Default)) { return }
         if ($Value -ne $Default -and -not $names.Contains($Name)) { $names.Add($Name) }
     }
-    $pageKeys = 'account', 'captureArea', 'zoomPercent', 'waitFor', 'onNotReady', 'promptTimeoutSec'
+    $pageKeys = 'account', 'captureArea', 'zoomPercent', 'onNotReady', 'promptTimeoutSec'
     foreach ($key in $pageKeys) { & $check "defaults.$key" $Config['defaults'][$key] $defaults['defaults'][$key] }
     foreach ($key in 'embedImages', 'openReport') { & $check "output.$key" $Config['output'][$key] $defaults['output'][$key] }
     & $check 'output.zip.enabled' $Config['output']['zip']['enabled'] $false
@@ -1436,6 +1407,15 @@ function Get-InactiveConfigSetting {
         else { & $check "report.$key" $Config['report'][$key] $defaults['report'][$key] }
     }
     foreach ($page in $Config['pages']) {
+        foreach ($action in @($page['actions'])) {
+            if ($action -isnot [System.Collections.IDictionary]) { continue }
+            $type = Get-VouchActionType -Type $action['type']
+            if ($type -eq 'pause') { & $check 'page actions: pause' $true $false }
+            if ($type -eq 'capture' -and $action['scroll'] -is [System.Collections.IDictionary] -and
+                $action['scroll']['as'] -eq 'single' -and $action['scroll']['mode'] -and $action['scroll']['mode'] -ne 'none') {
+                & $check 'page actions: capture scroll "as": "single"' $true $false
+            }
+        }
         if ($page['overrides'] -isnot [System.Collections.IDictionary]) { continue }
         foreach ($key in $pageKeys) { & $check "page overrides: $key" $page['overrides'][$key] $defaults['defaults'][$key] }
     }
@@ -1555,7 +1535,6 @@ function Test-InternalPageTarget {
     $url = if ($null -ne $Target -and $Target.PSObject.Properties['url']) { [string]$Target.url } else { '' }
     return $url -match '^(?i)(edge|chrome|devtools|chrome-extension|edge-extension)://'
 }
-
 
 function Get-CdpPageTarget {
     <#
@@ -2487,17 +2466,35 @@ function Get-ScrollTargetScript {
         their content in a frame; scrolling only the window would capture one screen of
         those and miss the rest.
 
-        Candidates: the window; every element that scrolls vertically; every frame (same
-        site) whose document scrolls - including elements inside frames. The one with
-        the largest visible area wins, so an ordinary scrolling page keeps using the
-        window. Areas smaller than a quarter of the screen are ignored (sidebars, code
-        boxes). Other large scrolling areas, and large frames from another site, are
-        reported so the item can be flagged: their hidden content is not captured.
+        -Mode auto (the CSV's ScrollFullPage Y): candidates are the window; every element
+        that scrolls vertically; every frame (same site) whose document scrolls -
+        including elements inside frames. The one with the largest visible area wins, so
+        an ordinary scrolling page keeps using the window. Areas smaller than a quarter
+        of the screen are ignored (sidebars, code boxes).
+        -Mode page: always the window, even when a panel inside holds more content - the
+        person asked for the page as a whole.
+        -Mode area: the first element matching -Selector in the page and its same-site
+        frames (the order clicks use). A frame element, or the html/body of a frame,
+        means that frame's document. When nothing matches or the match does not scroll,
+        auto is used instead and "fallback" says why, so the item can say so.
+
+        Other large scrolling areas, and large frames from another site, are reported so
+        the item can be flagged: their hidden content is not captured. Areas the page
+        captures explicitly in another capture (-ExplicitSelectors) are not reported:
+        their content is in the evidence.
 
         Leaves window.__vouchTarget with measure() -> {view,total,top} and to(y) -> top.
     #>
+    param(
+        [ValidateSet('auto', 'page', 'area')][string]$Mode = 'auto',
+        [AllowEmptyString()][string]$Selector = '',
+        [AllowEmptyCollection()][string[]]$ExplicitSelectors = @()
+    )
+    $modeLiteral = ConvertTo-JsLiteral -Value $Mode
+    $selectorLiteral = ConvertTo-JsLiteral -Value $Selector
+    $explicitLiteral = '[' + ((@($ExplicitSelectors) | Where-Object { $_ } | ForEach-Object { ConvertTo-JsLiteral -Value $_ }) -join ',') + ']'
     return @"
-(function () {
+(function (mode, wanted, explicit) {
 $(Get-FrameDocsScript)
   var vw = window.innerWidth, vh = window.innerHeight, viewArea = vw * vh;
   function visibleArea(rect, off) {
@@ -2517,42 +2514,83 @@ $(Get-FrameDocsScript)
     return d;
   }
   var docs = vouchDocs();
-  var candidates = [];
   var topScroller = document.scrollingElement || document.documentElement;
-  if (topScroller.scrollHeight > vh + 16) {
-    candidates.push({ kind: 'window', area: viewArea, desc: 'the page', node: null, entry: docs.list[0] });
+  function windowCandidate() {
+    if (!(topScroller.scrollHeight > vh + 16)) { return null; }
+    return { kind: 'window', area: viewArea, desc: 'the page', node: null, entry: docs.list[0] };
   }
+  function frameCandidate(entry) {
+    var fs = entry.doc.scrollingElement || entry.doc.documentElement;
+    if (!(fs && fs.scrollHeight > entry.win.innerHeight + 16)) { return null; }
+    return { kind: 'frame', area: visibleArea(entry.frame.getBoundingClientRect(), offsetOf(entry.parent)),
+      desc: 'the frame ' + vouchFrameName(entry.frame), node: entry.frame, entry: entry };
+  }
+  // strict: only overflow auto/scroll/overlay, as the automatic search has always done;
+  // an area the person named may also be overflow hidden (it still scrolls by script).
+  function elementCandidate(el, entry, off, strict) {
+    if (el === entry.doc.documentElement || el.clientHeight < 50 || el.scrollHeight <= el.clientHeight + 16) { return null; }
+    var oy = entry.win.getComputedStyle(el).overflowY;
+    if (strict ? (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') : oy === 'visible') { return null; }
+    return { kind: 'element', area: visibleArea(el.getBoundingClientRect(), off),
+      desc: describe(el) + (entry.frame ? ' in the frame ' + vouchFrameName(entry.frame) : ''), node: el, entry: entry };
+  }
+  function areaFor(sel) {
+    var hit = null;
+    for (var i = 0; i < docs.list.length && !hit; i++) {
+      var el = null;
+      try { el = docs.list[i].doc.querySelector(sel); } catch (e) { return { found: false, cand: null }; }
+      if (el) { hit = { el: el, entry: docs.list[i] }; }
+    }
+    if (!hit) { return { found: false, cand: null }; }
+    var tag = hit.el.tagName.toLowerCase();
+    if (tag === 'iframe' || tag === 'frame') {
+      for (var j = 0; j < docs.list.length; j++) {
+        if (docs.list[j].frame === hit.el) { return { found: true, cand: frameCandidate(docs.list[j]) }; }
+      }
+      return { found: true, cand: null };
+    }
+    if (hit.el === hit.entry.doc.documentElement || hit.el === hit.entry.doc.body) {
+      return { found: true, cand: hit.entry.frame ? frameCandidate(hit.entry) : windowCandidate() };
+    }
+    return { found: true, cand: elementCandidate(hit.el, hit.entry, offsetOf(hit.entry), false) };
+  }
+
+  var candidates = [];
+  var win = windowCandidate();
+  if (win) { candidates.push(win); }
   docs.list.forEach(function (entry) {
     var off = offsetOf(entry);
-    if (entry.frame) {
-      var fs = entry.doc.scrollingElement || entry.doc.documentElement;
-      if (fs && fs.scrollHeight > entry.win.innerHeight + 16) {
-        candidates.push({ kind: 'frame', area: visibleArea(entry.frame.getBoundingClientRect(), offsetOf(entry.parent)),
-          desc: 'the frame ' + vouchFrameName(entry.frame), node: entry.frame, entry: entry });
-      }
-    }
+    if (entry.frame) { var fc = frameCandidate(entry); if (fc) { candidates.push(fc); } }
     var all = entry.doc.querySelectorAll('*');
     for (var i = 0; i < all.length; i++) {
-      var el = all[i];
-      if (el === entry.doc.documentElement || el.clientHeight < 50 || el.scrollHeight <= el.clientHeight + 16) { continue; }
-      var oy = entry.win.getComputedStyle(el).overflowY;
-      if (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') { continue; }
-      candidates.push({ kind: 'element', area: visibleArea(el.getBoundingClientRect(), off),
-        desc: describe(el) + (entry.frame ? ' in the frame ' + vouchFrameName(entry.frame) : ''), node: el, entry: entry });
+      var c = elementCandidate(all[i], entry, off, true);
+      if (c) { candidates.push(c); }
     }
   });
 
   var usable = candidates.filter(function (c) { return c.area >= viewArea * 0.25; })
     .sort(function (a, b) { return b.area - a.area; });
-  var chosen = usable.length > 0 ? usable[0] : null;
-  function related(c) {
-    if (!chosen) { return false; }
-    if (chosen.kind === 'frame' && c.entry === chosen.entry) { return true; }
-    if (c.kind === 'frame' && chosen.entry === c.entry) { return true; }
-    if (c.entry === chosen.entry && c.node && chosen.node && (c.node.contains(chosen.node) || chosen.node.contains(c.node))) { return true; }
+  var chosen = null, fallback = '';
+  if (mode === 'page') { chosen = win; }
+  else if (mode === 'area') {
+    var named = areaFor(wanted);
+    if (named.cand) { chosen = named.cand; } else { fallback = named.found ? 'notscrollable' : 'notfound'; }
+  }
+  if (mode === 'auto' || fallback) { chosen = usable.length > 0 ? usable[0] : null; }
+
+  function related(c, x) {
+    if (!x) { return false; }
+    if (c.kind === x.kind && c.node === x.node && c.entry === x.entry) { return true; }
+    if (x.kind === 'frame' && c.entry === x.entry) { return true; }
+    if (c.kind === 'frame' && x.entry === c.entry) { return true; }
+    if (c.entry === x.entry && c.node && x.node && (c.node.contains(x.node) || x.node.contains(c.node))) { return true; }
     return false;
   }
-  var others = usable.slice(1).filter(function (c) { return !related(c); }).map(function (c) { return c.desc; });
+  var elsewhere = explicit.map(function (s) { return areaFor(s).cand; }).filter(function (c) { return c; });
+  var others = usable.filter(function (c) {
+    if (related(c, chosen)) { return false; }
+    return !elsewhere.some(function (x) { return related(c, x); });
+  }).map(function (c) { return c.desc; });
   var blocked = docs.blocked.filter(function (b) {
     return visibleArea(b.frame.getBoundingClientRect(), offsetOf(b.parent)) >= viewArea * 0.25;
   }).map(function (b) { return vouchFrameName(b.frame); });
@@ -2581,8 +2619,9 @@ $(Get-FrameDocsScript)
   };
   window.__vouchTarget.to(0);
   var m = window.__vouchTarget.measure();
-  return { kind: t ? t.kind : 'none', description: t ? t.desc : '', view: m.view, total: m.total, others: others, blockedFrames: blocked };
-})()
+  return { kind: t ? t.kind : 'none', description: t ? t.desc : '', view: m.view, total: m.total, others: others,
+    blockedFrames: blocked, fallback: fallback };
+})($modeLiteral, $selectorLiteral, $explicitLiteral)
 "@
 }
 
@@ -2592,6 +2631,56 @@ function Get-BlockedFrameNote {
     return " The page also contains $Count frame(s) from another site, which Vouch cannot look inside."
 }
 
+function Get-ElementDescriptionScript {
+    <#
+        Browser-side helper for the find-only scripts: what a person needs to recognise
+        an element (tag, id, its visible text, the frame it is in). The Designer's picker
+        compares this with the element that was picked, so a recorded step is only kept
+        when replaying it would hit the same element.
+    #>
+    return @'
+function vouchDescribe(entry, el, exact) {
+  var text = String(el.innerText || el.textContent || el.value || '').replace(/\s+/g, ' ').trim();
+  return { found: true, tag: el.tagName.toLowerCase(), id: el.id || '', text: text.substring(0, 200),
+    frame: entry.frame ? vouchFrameName(entry.frame) : '', exact: exact, visible: vouchVisible(entry, el) };
+}
+'@
+}
+
+function Get-ClickSelectorScript {
+    <#
+        The page script behind a click: step: the first element matching the selector,
+        looking in the page first and then in its frames (same site only). With
+        -FindOnly it clicks nothing and returns the element it would click, so the
+        Designer can check a selector before recording it, through the very same search.
+        Returns 'OK' / 'NOTFOUND|<blocked frames>', or with -FindOnly an object
+        { found; tag; id; text; frame; exact; visible; blocked }.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Selector,
+        [switch]$FindOnly
+    )
+    $literal = ConvertTo-JsLiteral -Value $Selector
+    $findOnlyJs = if ($FindOnly) { 'true' } else { 'false' }
+    return @"
+(function (sel, findOnly) {
+$(Get-FrameDocsScript)
+$(Get-ElementDescriptionScript)
+  var docs = vouchDocs();
+  for (var i = 0; i < docs.list.length; i++) {
+    var el = docs.list[i].doc.querySelector(sel);
+    if (!el) { continue; }
+    if (findOnly) { var found = vouchDescribe(docs.list[i], el, true); found.blocked = docs.blocked.length; return found; }
+    if (el.scrollIntoView) { el.scrollIntoView({ block: 'center' }); }
+    el.click();
+    return 'OK';
+  }
+  if (findOnly) { return { found: false, hidden: false, blocked: docs.blocked.length }; }
+  return 'NOTFOUND|' + docs.blocked.length;
+})($literal, $findOnlyJs)
+"@
+}
+
 function Invoke-ClickSelector {
     <#
         Clicks the first element matching the selector, looking in the page first and
@@ -2599,43 +2688,38 @@ function Invoke-ClickSelector {
     #>
     param([Parameter(Mandatory)][string]$Selector)
 
-    $literal = ConvertTo-JsLiteral -Value $Selector
-    $expression = @"
-(function (sel) {
-$(Get-FrameDocsScript)
-  var docs = vouchDocs();
-  for (var i = 0; i < docs.list.length; i++) {
-    var el = docs.list[i].doc.querySelector(sel);
-    if (!el) { continue; }
-    if (el.scrollIntoView) { el.scrollIntoView({ block: 'center' }); }
-    el.click();
-    return 'OK';
-  }
-  return 'NOTFOUND|' + docs.blocked.length;
-})($literal)
-"@
-    $outcome = [string](Invoke-CdpEval -Expression $expression)
+    $outcome = [string](Invoke-CdpEval -Expression (Get-ClickSelectorScript -Selector $Selector))
     if ($outcome -ne 'OK') {
         $blocked = if ($outcome -match '\|(\d+)$') { [int]$Matches[1] } else { 0 }
         throw "No element matched the CSS selector '$Selector'.$(Get-BlockedFrameNote -Count $blocked)"
     }
 }
 
-function Invoke-ClickText {
-    param([Parameter(Mandatory)][string]$Text)
-
+function Get-ClickTextScript {
     <#
-        Only rendered elements are considered: hidden duplicates (collapsed mobile menus
-        and the like) come earlier in the DOM surprisingly often. An exact match wins;
-        otherwise the partial match with the shortest label, i.e. the closest one. A
-        partial match never selects a sign-out control unless the wanted text itself
-        says so - clicking "Log out" for "Log" would end the audit profile's session.
-        The page is searched first, then its frames (same site only).
+        The page script behind a clicktext: step. Only rendered elements are considered:
+        hidden duplicates (collapsed mobile menus and the like) come earlier in the DOM
+        surprisingly often. An exact match wins; otherwise the partial match with the
+        shortest label, i.e. the closest one. A partial match never selects a sign-out
+        control unless the wanted text itself says so - clicking "Log out" for "Log"
+        would end the audit profile's session. The page is searched first, then its
+        frames (same site only).
+        With -FindOnly the same search runs but nothing is clicked: it returns the
+        element it would click, so the Designer can check that a recorded text resolves
+        to the element that was picked.
+        Returns 'OK' / 'HIDDEN|<blocked>' / 'NOTFOUND|<blocked>', or with -FindOnly an
+        object { found; hidden; tag; id; text; frame; exact; visible; blocked }.
     #>
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [switch]$FindOnly
+    )
     $literal = ConvertTo-JsLiteral -Value $Text
-    $expression = @"
-(function (wanted) {
+    $findOnlyJs = if ($FindOnly) { 'true' } else { 'false' }
+    return @"
+(function (wanted, findOnly) {
 $(Get-FrameDocsScript)
+$(Get-ElementDescriptionScript)
   var target = String(wanted).replace(/\s+/g, ' ').trim().toLowerCase();
   var label = function (el) {
     var text = el.innerText || el.textContent || el.value || '';
@@ -2644,8 +2728,8 @@ $(Get-FrameDocsScript)
   var signOut = /\b(log|sign)\s*-?\s*(out|off)\b/;
   var docs = vouchDocs();
   var hiddenMatch = false;
-  var exact = null;
-  var partial = null;
+  var exact = null, exactEntry = null;
+  var partial = null, partialEntry = null;
   for (var d = 0; d < docs.list.length && !exact; d++) {
     var entry = docs.list[d];
     var nodes = entry.doc.querySelectorAll(
@@ -2654,25 +2738,82 @@ $(Get-FrameDocsScript)
       var text = label(nodes[i]);
       if (text.indexOf(target) === -1) { continue; }
       if (!vouchVisible(entry, nodes[i])) { hiddenMatch = true; continue; }
-      if (text === target) { exact = nodes[i]; break; }
+      if (text === target) { exact = nodes[i]; exactEntry = entry; break; }
       if (signOut.test(text) && !signOut.test(target)) { continue; }
-      if (!partial || text.length < label(partial).length) { partial = nodes[i]; }
+      if (!partial || text.length < label(partial).length) { partial = nodes[i]; partialEntry = entry; }
     }
   }
   var pick = exact || partial;
+  if (findOnly) {
+    if (!pick) { return { found: false, hidden: hiddenMatch, blocked: docs.blocked.length }; }
+    var found = vouchDescribe(exact ? exactEntry : partialEntry, pick, !!exact);
+    found.hidden = false;
+    found.blocked = docs.blocked.length;
+    return found;
+  }
   if (!pick) { return (hiddenMatch ? 'HIDDEN' : 'NOTFOUND') + '|' + docs.blocked.length; }
   if (pick.scrollIntoView) { pick.scrollIntoView({ block: 'center' }); }
   pick.click();
   return 'OK';
-})($literal)
+})($literal, $findOnlyJs)
 "@
-    $outcome = [string](Invoke-CdpEval -Expression $expression)
+}
+
+function Invoke-ClickText {
+    <#
+        Clicks the element whose visible text matches (Get-ClickTextScript has the
+        rules) and turns the outcome into a message a person can act on.
+    #>
+    param([Parameter(Mandatory)][string]$Text)
+
+    $outcome = [string](Invoke-CdpEval -Expression (Get-ClickTextScript -Text $Text))
     $blocked = if ($outcome -match '\|(\d+)$') { [int]$Matches[1] } else { 0 }
     if ($outcome -like 'HIDDEN*') {
         throw "Only hidden elements have the text '$Text'; nothing was clicked.$(Get-BlockedFrameNote -Count $blocked)"
     }
     if ($outcome -ne 'OK') {
         throw "No clickable element with the text '$Text' was found.$(Get-BlockedFrameNote -Count $blocked)"
+    }
+}
+
+function Wait-PageElement {
+    <#
+        Waits until an element matching the selector is VISIBLE in the page or in one of
+        its frames (same site only) - the same documents a click searches, so "wait for
+        #grid, then click #grid tr" behaves the way it reads. Visible, because many
+        applications put the element in the page at once and only show it when its data
+        has arrived. Polling, like Wait-PageReady: no event pump is needed.
+        Returns $true when it appeared, $false on timeout; throws for a selector the
+        browser cannot read, because waiting would never end well.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Selector,
+        [Parameter(Mandatory)][double]$TimeoutSec
+    )
+    $literal = ConvertTo-JsLiteral -Value $Selector
+    $expression = @"
+(function (sel) {
+$(Get-FrameDocsScript)
+  var docs = vouchDocs();
+  for (var i = 0; i < docs.list.length; i++) {
+    var nodes;
+    try { nodes = docs.list[i].doc.querySelectorAll(sel); } catch (e) { return 'INVALID'; }
+    for (var j = 0; j < nodes.length; j++) {
+      if (vouchVisible(docs.list[i], nodes[j])) { return 'FOUND'; }
+    }
+  }
+  return 'WAITING';
+})($literal)
+"@
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ($true) {
+        $state = ''
+        try { $state = [string](Invoke-CdpEval -Expression $expression -TimeoutSec 10) }
+        catch { Write-Verbose "Element check failed (the page may be loading): $($_.Exception.Message)" }
+        if ($state -eq 'FOUND') { return $true }
+        if ($state -eq 'INVALID') { throw "'$Selector' is not a CSS selector the browser understands." }
+        if ((Get-Date) -ge $deadline) { return $false }
+        Start-Sleep -Milliseconds 250
     }
 }
 
@@ -2760,51 +2901,167 @@ $(Get-FrameDocsScript)
     }
 }
 
-function Invoke-RowSteps {
+function Get-DefinitionActionList {
     <#
-        Runs the parsed steps for one row. Every step is isolated: a failure is recorded
-        and the remaining steps still run, so a capture is always produced.
+        The ordered actions of a page. CSV rows and configuration pages both carry
+        Actions; a definition built by hand with only Steps (older callers) gets the
+        same list the CSV import would give it, so the engine has one path.
+    #>
+    param([Parameter(Mandatory)][object]$Definition)
+    if ($Definition.PSObject.Properties['Actions'] -and $null -ne $Definition.Actions) {
+        $list = [System.Collections.Generic.List[object]]::new()
+        foreach ($action in $Definition.Actions) { $list.Add($action) }
+        return , $list
+    }
+    $steps = if ($Definition.PSObject.Properties['Steps'] -and $null -ne $Definition.Steps) { @($Definition.Steps) } else { @() }
+    return ConvertTo-ActionList -Steps $steps -ScrollFullPage ([bool]$Definition.ScrollFullPage)
+}
+
+function Invoke-PageAction {
+    <#
+        Runs one action of a page. Every action except a capture is isolated: a failure
+        is returned in the log entry { Text; Ok; Message } and the caller carries on with
+        the next action, so a page always ends with its captures. A capture is not
+        isolated: when no screenshot can be taken the page has no evidence, and the
+        error goes to Invoke-CaptureItem, which marks the page FAILED (as before actions
+        existed).
+        A click waits SettleSeconds, then for any page it opened (Wait-StepNavigation),
+        exactly as CSV steps always have.
+        -Item, -CaptureContext and friends are needed for capture and pause only.
     #>
     param(
-        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Steps,
-        [Parameter(Mandatory)][double]$SettleSeconds,
-        [int]$NavigationTimeoutSec = 30
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Action,
+        # NavigationTimeoutSec, SettleSeconds (and the scroll settings for a capture).
+        [Parameter(Mandatory)][object]$Settings,
+        # The text the step log shows; ConvertTo-LegacyStepText when not given.
+        [AllowEmptyString()][string]$Text = '',
+        [object]$Item = $null,
+        [hashtable]$CaptureContext = $null,
+        [int]$CaptureNumber = 1,
+        [bool]$BrowserErrorPage = $false,
+        # Every scroll-area selector the page captures, for Get-ScrollTargetScript.
+        [AllowEmptyCollection()][string[]]$ExplicitAreas = @()
     )
 
-    $log = [System.Collections.Generic.List[object]]::new()
+    if (-not $Text) { $Text = ConvertTo-LegacyStepText -Action $Action }
+    $entry = [pscustomobject]@{ Text = $Text; Ok = $true; Message = '' }
+    $navigationTimeoutSec = [int]$Settings.NavigationTimeoutSec
 
-    foreach ($step in $Steps) {
-        $entry = [pscustomobject]@{ Text = $step.Text; Ok = $true; Message = '' }
-        try {
-            switch ($step.Verb) {
-                'click' {
-                    Set-StepNavigationProbe
-                    Invoke-ClickSelector -Selector ([string]$step.Argument)
-                    Start-Sleep -Milliseconds ([int]($SettleSeconds * 1000))
-                    Wait-StepNavigation -TimeoutSec $NavigationTimeoutSec
-                }
-                'clicktext' {
-                    Set-StepNavigationProbe
-                    Invoke-ClickText -Text ([string]$step.Argument)
-                    Start-Sleep -Milliseconds ([int]($SettleSeconds * 1000))
-                    Wait-StepNavigation -TimeoutSec $NavigationTimeoutSec
-                }
-                'wait' {
-                    Start-Sleep -Milliseconds ([int]([double]$step.Argument * 1000))
-                }
-            }
+    if ($Action['type'] -eq 'capture') {
+        try { [void](Send-CdpCommand -Method 'Page.bringToFront' -TimeoutSec 10) }
+        catch { Write-Verbose "Page.bringToFront failed: $($_.Exception.Message)" }
+
+        $pageTitle = ''
+        try { $pageTitle = [string](Invoke-CdpEval -Expression 'document.title' -TimeoutSec 10) }
+        catch { Write-Verbose "Could not read the page title: $($_.Exception.Message)" }
+
+        $focusWarning = Set-EdgeForeground -ExpectedTitle $pageTitle
+        if ($null -ne $focusWarning) {
+            if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+            if (-not $Item.Details.Contains($focusWarning)) { $Item.Details.Add($focusWarning) }
         }
-        catch {
-            $entry.Ok = $false
-            $entry.Message = $_.Exception.Message
-        }
-        $log.Add($entry)
+
+        $scroll = $Action['scroll']
+        $mode = if ($scroll -is [System.Collections.IDictionary] -and $scroll['mode']) { [string]$scroll['mode'] } else { 'none' }
+        $selector = if ($scroll -is [System.Collections.IDictionary] -and $scroll['selector']) { [string]$scroll['selector'] } else { '' }
+        Invoke-ScrollCapture -Item $Item -ScrollMode $mode -ScrollSelector $selector -ExplicitAreas $ExplicitAreas `
+            -CaptureNumber $CaptureNumber -Label ([string]$Action['label']) -BrowserErrorPage $BrowserErrorPage `
+            -Settings $Settings -CaptureContext $CaptureContext
+        return $entry
     }
 
-    return , $log
+    try {
+        switch ($Action['type']) {
+            'click' {
+                Set-StepNavigationProbe
+                Invoke-ClickSelector -Selector ([string]$Action['selector'])
+                Start-Sleep -Milliseconds ([int]($Settings.SettleSeconds * 1000))
+                Wait-StepNavigation -TimeoutSec $navigationTimeoutSec
+            }
+            'clickText' {
+                Set-StepNavigationProbe
+                Invoke-ClickText -Text ([string]$Action['text'])
+                Start-Sleep -Milliseconds ([int]($Settings.SettleSeconds * 1000))
+                Wait-StepNavigation -TimeoutSec $navigationTimeoutSec
+            }
+            'wait' {
+                Start-Sleep -Milliseconds ([int]([double]$Action['seconds'] * 1000))
+            }
+            'waitFor' {
+                $timeout = if ($Action.Contains('timeoutSec') -and $null -ne $Action['timeoutSec']) { [double]$Action['timeoutSec'] } else { $navigationTimeoutSec }
+                $selector = [string]$Action['selector']
+                if (-not (Wait-PageElement -Selector $selector -TimeoutSec $timeout)) {
+                    throw "No visible element matched '$selector' within $timeout second(s); the next actions ran anyway."
+                }
+            }
+            'pause' {
+                # TEMPORARY (until the prompt exists): listed by Get-InactiveConfigSetting too.
+                $entry.Message = 'skipped: pause is not available yet'
+                if ($null -ne $Item) {
+                    if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+                    $Item.Details.Add("The pause action ($Text) was skipped: pause is not available yet in this version of Vouch.")
+                }
+            }
+            default {
+                throw "Unknown action '$($Action['type'])'."
+            }
+        }
+    }
+    catch {
+        $entry.Ok = $false
+        $entry.Message = $_.Exception.Message
+    }
+    return $entry
+}
+
+function Add-StepFailureDetail {
+    <#
+        Keeps one "Completed with errors" line per page, written where the first failure
+        is noticed (before the next capture's own details, as it always was for CSV
+        rows) and brought up to date when later actions fail too: one page, one line.
+        Returns the line's position in Details (-1 while nothing failed).
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Item,
+        [Parameter(Mandatory)][int]$Failed,
+        [Parameter(Mandatory)][int]$Total,
+        [Parameter(Mandatory)][int]$Position
+    )
+    if ($Failed -le 0) { return $Position }
+    if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+    $line = "Completed with errors: $Failed of $Total step(s) failed."
+    if ($Position -lt 0) {
+        $Item.Details.Add($line)
+        return $Item.Details.Count - 1
+    }
+    $Item.Details[$Position] = $line
+    return $Position
+}
+
+function Get-CaptureFileName {
+    <#
+        The file name of one screenshot: 001_Name_seg01.jpg. A page's first capture keeps
+        exactly the names Vouch has always used, so SHA256SUMS files and workpapers that
+        cite them stay valid; the second and later captures of a page add _c02, _c03 ...
+        so every name is unique and sorts in the order the captures were taken.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$Index,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][int]$SegmentIndex,
+        [Parameter(Mandatory)][string]$Extension,
+        [int]$CaptureNumber = 1
+    )
+    $capturePart = if ($CaptureNumber -gt 1) { '_c{0:d2}' -f $CaptureNumber } else { '' }
+    return '{0:d3}_{1}{2}_seg{3:d2}.{4}' -f $Index, (Get-SafeFileName -Name $Name), $capturePart, $SegmentIndex, $Extension
 }
 
 function New-CaptureRecord {
+    <#
+        The record of one screenshot. CaptureNumber and Label say which capture action
+        of the page took it (1 and '' for a page with one unlabelled capture), so the
+        report and the JSON summary can keep a page's capture sets apart.
+    #>
     param(
         [Parameter(Mandatory)][byte[]]$Bytes,
         # Empty when the browser would not report its URL; the screenshot still counts.
@@ -2813,22 +3070,26 @@ function New-CaptureRecord {
         [Parameter(Mandatory)][int]$SegmentCount,
         [string]$FilePath = '',
         [string]$FileName = '',
-        [System.Nullable[System.DateTimeOffset]]$CapturedAt = $null
+        [System.Nullable[System.DateTimeOffset]]$CapturedAt = $null,
+        [int]$CaptureNumber = 1,
+        [AllowEmptyString()][string]$Label = ''
     )
 
     # PowerShell hands a Nullable parameter over already unwrapped.
     $when = if ($null -ne $CapturedAt) { [System.DateTimeOffset]$CapturedAt } else { [System.DateTimeOffset]::Now }
     return [pscustomobject]@{
-        Timestamp    = $when.ToString('yyyy-MM-dd HH:mm:ss')
-        CapturedAt   = $when.ToString('yyyy-MM-ddTHH:mm:ss.fffzzz', [System.Globalization.CultureInfo]::InvariantCulture)
-        Url          = $Url
-        SegmentIndex = $SegmentIndex
-        SegmentCount = $SegmentCount
-        Base64       = [Convert]::ToBase64String($Bytes)
-        Bytes        = $Bytes.Length
-        Sha256       = Get-Sha256Hex -Bytes $Bytes
-        FileName     = $FileName
-        FilePath     = $FilePath
+        Timestamp     = $when.ToString('yyyy-MM-dd HH:mm:ss')
+        CapturedAt    = $when.ToString('yyyy-MM-ddTHH:mm:ss.fffzzz', [System.Globalization.CultureInfo]::InvariantCulture)
+        Url           = $Url
+        SegmentIndex  = $SegmentIndex
+        SegmentCount  = $SegmentCount
+        Base64        = [Convert]::ToBase64String($Bytes)
+        Bytes         = $Bytes.Length
+        Sha256        = Get-Sha256Hex -Bytes $Bytes
+        FileName      = $FileName
+        FilePath      = $FilePath
+        CaptureNumber = $CaptureNumber
+        Label         = $Label
     }
 }
 
@@ -2842,10 +3103,14 @@ function Add-ItemCapture {
         [Parameter(Mandatory)][int]$SegmentIndex,
         [Parameter(Mandatory)][int]$SegmentCount,
         [AllowEmptyString()][string]$PageUrl = '',
-        [Parameter(Mandatory)][hashtable]$Context
+        [Parameter(Mandatory)][hashtable]$Context,
+        # Which capture action of the page this is (Get-CaptureFileName), and its label.
+        [int]$CaptureNumber = 1,
+        [AllowEmptyString()][string]$Label = ''
     )
 
-    $fileName = '{0:d3}_{1}_seg{2:d2}.{3}' -f $Item.Index, (Get-SafeFileName -Name $Item.Name), $SegmentIndex, $Context.Extension
+    $fileName = Get-CaptureFileName -Index $Item.Index -Name $Item.Name -SegmentIndex $SegmentIndex `
+        -Extension $Context.Extension -CaptureNumber $CaptureNumber
     $capturedAt = [System.DateTimeOffset]::Now
     $metadata = New-CaptureMetadata -RunId $Context.RunId -ItemIndex $Item.Index -ItemName $Item.Name -RequestedUrl $Item.Url `
         -PageUrl $PageUrl -CapturedAt $capturedAt -SegmentIndex $SegmentIndex -SegmentCount $SegmentCount -Screen $Context.Screen
@@ -2857,7 +3122,7 @@ function Add-ItemCapture {
         [System.IO.File]::WriteAllBytes($filePath, $bytes)
     }
     $Item.Captures.Add((New-CaptureRecord -Bytes $bytes -Url $PageUrl -SegmentIndex $SegmentIndex -SegmentCount $SegmentCount `
-        -FilePath $filePath -FileName $fileName -CapturedAt $capturedAt))
+        -FilePath $filePath -FileName $fileName -CapturedAt $capturedAt -CaptureNumber $CaptureNumber -Label $Label))
 }
 
 function Get-CaptureManifest {
@@ -3094,7 +3359,10 @@ a { color: #12507d; }
         if ($item.StepLog.Count -gt 0) {
             [void]$sb.AppendLine('<h3>Steps executed</h3><ul class="steps">')
             foreach ($step in $item.StepLog) {
-                if ($step.Ok) {
+                if ($step.Ok -and -not [string]::IsNullOrWhiteSpace([string]$step.Message)) {
+                    [void]$sb.AppendLine("<li><code>$(Encode-Html $step.Text)</code> &mdash; $(Encode-Html $step.Message)</li>")
+                }
+                elseif ($step.Ok) {
                     [void]$sb.AppendLine("<li><code>$(Encode-Html $step.Text)</code> &mdash; ok</li>")
                 }
                 else {
@@ -3112,13 +3380,24 @@ a { color: #12507d; }
             [void]$sb.AppendLine('<p class="empty">No screenshot could be taken for this item.</p>')
         }
         else {
+            # A page with several capture actions: say which capture each image belongs
+            # to, in the order they were taken. A page with one unlabelled capture reads
+            # exactly as before.
+            $captureSets = @($item.Captures | ForEach-Object { if ($_.PSObject.Properties['CaptureNumber']) { [int]$_.CaptureNumber } else { 1 } } |
+                Sort-Object -Unique).Count
             foreach ($capture in $item.Captures) {
                 $segmentText = if ($capture.SegmentCount -gt 1) { " &middot; segment $($capture.SegmentIndex) of $($capture.SegmentCount)" } else { '' }
+                $captureNumber = if ($capture.PSObject.Properties['CaptureNumber']) { [int]$capture.CaptureNumber } else { 1 }
+                $label = if ($capture.PSObject.Properties['Label']) { [string]$capture.Label } else { '' }
+                $setText = ''
+                if ($captureSets -gt 1 -or $label) {
+                    $setText = "Capture $captureNumber" + $(if ($label) { ": $label" } else { '' })
+                }
                 [void]$sb.AppendLine('<figure>')
                 # The data-* attributes are what -Verify checks each image against; keep
                 # their order in step with Test-ReportIntegrity.
                 [void]$sb.Append('<img alt="')
-                [void]$sb.Append((Encode-Html "$($item.Name) screenshot $($capture.SegmentIndex) of $($capture.SegmentCount)"))
+                [void]$sb.Append((Encode-Html "$($item.Name)$(if ($setText) { " - $setText" }) screenshot $($capture.SegmentIndex) of $($capture.SegmentCount)"))
                 [void]$sb.Append('" data-file="')
                 [void]$sb.Append((Encode-Html $capture.FileName))
                 [void]$sb.Append('" data-sha256="')
@@ -3132,7 +3411,8 @@ a { color: #12507d; }
                 [void]$sb.Append(';base64,')
                 [void]$sb.Append($capture.Base64)
                 [void]$sb.AppendLine('">')
-                [void]$sb.AppendLine("<figcaption>Captured $(Encode-Html $capture.Timestamp)$segmentText &middot; $(Encode-Html $capture.Url)<br>" +
+                $setHtml = if ($setText) { "<strong>$(Encode-Html $setText)</strong> &middot; " } else { '' }
+                [void]$sb.AppendLine("<figcaption>$($setHtml)Captured $(Encode-Html $capture.Timestamp)$segmentText &middot; $(Encode-Html $capture.Url)<br>" +
                     "<span class=""hash"">SHA-256 $($capture.Sha256) &middot; $(Encode-Html $capture.FileName)</span></figcaption>")
                 [void]$sb.AppendLine('</figure>')
             }
@@ -3315,6 +3595,9 @@ function ConvertTo-RunSummaryJson {
                         SegmentCount = $_.SegmentCount
                         Bytes        = $_.Bytes
                         FilePath     = $_.FilePath
+                        # Which capture action of the page took it (1, 2, ...) and its label.
+                        CaptureNumber = $(if ($_.PSObject.Properties['CaptureNumber']) { $_.CaptureNumber } else { 1 })
+                        Label         = $(if ($_.PSObject.Properties['Label']) { $_.Label } else { '' })
                     }
                 })
             }
@@ -3697,14 +3980,22 @@ function New-CaptureItem {
 
 function Invoke-ScrollCapture {
     <#
-        Takes the screenshots for a page that is already loaded and in the foreground:
-        one screen, or (ScrollFullPage) one per screen of whatever scrolls - the page, a
-        panel inside it or a frame. Errors from scrolling itself are left to the caller
+        Takes the screenshots of one capture action, for a page that is already loaded
+        and in the foreground: one screen (-ScrollMode none), or one per screen of what
+        scrolls - found automatically (auto), the window (page) or a named area (area;
+        see Get-ScrollTargetScript). Errors from scrolling itself are left to the caller
         (Invoke-CaptureItem marks the page FAILED and the run moves on).
+        A page may capture several times; a detail an earlier capture of the same page
+        already reported is not repeated.
     #>
     param(
         [Parameter(Mandatory)][object]$Item,
-        [Parameter(Mandatory)][bool]$ScrollFullPage,
+        [ValidateSet('none', 'auto', 'page', 'area')][string]$ScrollMode = 'none',
+        [AllowEmptyString()][string]$ScrollSelector = '',
+        # Every area the page captures explicitly; never reported as "not scrolled".
+        [AllowEmptyCollection()][string[]]$ExplicitAreas = @(),
+        [int]$CaptureNumber = 1,
+        [AllowEmptyString()][string]$Label = '',
         # The browser's own error page is shown: its URL is not the page's, so keep FinalUrl.
         [Parameter(Mandatory)][bool]$BrowserErrorPage,
         [Parameter(Mandatory)][object]$Settings,
@@ -3713,29 +4004,44 @@ function Invoke-ScrollCapture {
 
     $maxScrollSegments = $Settings.MaxScrollSegments
     $scrollSettleMs = [int]($Settings.ScrollSettleSeconds * 1000)
+    $scrolls = $ScrollMode -ne 'none'
+    $earlierDetails = @($Item.Details)
+    $addDetail = {
+        param([string]$Text)
+        if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+        if ($earlierDetails -notcontains $Text) { $Item.Details.Add($Text) }
+    }
 
     $segmentCount = 1
     $viewportHeight = 0.0
-    if ($ScrollFullPage) {
+    if ($scrolls) {
         try {
             # Find what scrolls - the page, a panel inside it, or a frame - and start at its top.
-            $scrollTarget = Invoke-CdpEval -Expression (Get-ScrollTargetScript) -TimeoutSec 20
+            $scrollTarget = Invoke-CdpEval -TimeoutSec 20 -Expression (
+                Get-ScrollTargetScript -Mode $ScrollMode -Selector $ScrollSelector -ExplicitSelectors $ExplicitAreas)
             Start-Sleep -Milliseconds $scrollSettleMs
 
             $viewportHeight = [double]$scrollTarget.view
             $pageHeight = [double]$scrollTarget.total
-            $Item.ScrollArea = switch ([string]$scrollTarget.kind) {
+            $areaText = switch ([string]$scrollTarget.kind) {
                 'window'  { 'the page' }
                 'none'    { 'nothing to scroll - the content fits on one screen' }
                 default   { [string]$scrollTarget.description }
             }
+            if (-not $Item.ScrollArea) { $Item.ScrollArea = $areaText }
+            elseif (@($Item.ScrollArea -split '; ') -notcontains $areaText) { $Item.ScrollArea += "; $areaText" }
+
+            $fallback = if ($scrollTarget.PSObject.Properties['fallback']) { [string]$scrollTarget.fallback } else { '' }
+            if ($fallback) {
+                $which = if ($Label) { " of the capture '$Label'" } else { '' }
+                $why = if ($fallback -eq 'notfound') { 'matches no element on the page' } else { 'does not scroll' }
+                & $addDetail "The scroll area '$ScrollSelector'$which $why, so Vouch scrolled what it found itself ($areaText)."
+            }
             foreach ($other in @($scrollTarget.others)) {
-                if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
-                $Item.Details.Add("Another scrolling area ($other) was not scrolled; content hidden in it is not captured.")
+                & $addDetail "Another scrolling area ($other) was not scrolled; content hidden in it is not captured."
             }
             foreach ($frameName in @($scrollTarget.blockedFrames)) {
-                if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
-                $Item.Details.Add("A frame from another site ($frameName) cannot be scrolled; content hidden in it is not captured.")
+                & $addDetail "A frame from another site ($frameName) cannot be scrolled; content hidden in it is not captured."
             }
 
             if ($viewportHeight -gt 0 -and $pageHeight -gt 0) {
@@ -3744,8 +4050,7 @@ function Invoke-ScrollCapture {
             if ($segmentCount -lt 1) { $segmentCount = 1 }
         }
         catch {
-            if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
-            $Item.Details.Add("The page height could not be measured, so only the first screen was captured: $($_.Exception.Message)")
+            & $addDetail "The page height could not be measured, so only the first screen was captured: $($_.Exception.Message)"
             $segmentCount = 1
             $viewportHeight = 0
         }
@@ -3755,12 +4060,11 @@ function Invoke-ScrollCapture {
     $truncationNoted = $false
     if ($segmentCount -gt $maxScrollSegments) {
         $segmentCount = $maxScrollSegments
-        if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
-        $Item.Details.Add($truncationMessage)
+        & $addDetail $truncationMessage
         $truncationNoted = $true
     }
 
-    if ($ScrollFullPage -and $segmentCount -gt 1 -and $viewportHeight -gt 0) {
+    if ($scrolls -and $segmentCount -gt 1 -and $viewportHeight -gt 0) {
         $recheckDone = $false
         for ($segment = 0; $segment -lt $segmentCount; $segment++) {
             $offset = [int]([Math]::Round($segment * $viewportHeight))
@@ -3779,7 +4083,7 @@ function Invoke-ScrollCapture {
                                 $recomputed = $maxScrollSegments
                                 if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
                                 if (-not $truncationNoted) {
-                                    $Item.Details.Add($truncationMessage)
+                                    & $addDetail $truncationMessage
                                     $truncationNoted = $true
                                 }
                             }
@@ -3793,23 +4097,27 @@ function Invoke-ScrollCapture {
             }
 
             $segmentUrl = if ($BrowserErrorPage) { $Item.FinalUrl } else { Get-CurrentPageUrl }
-            Add-ItemCapture -Item $Item -SegmentIndex ($segment + 1) -SegmentCount $segmentCount -PageUrl $segmentUrl -Context $CaptureContext
+            Add-ItemCapture -Item $Item -SegmentIndex ($segment + 1) -SegmentCount $segmentCount -PageUrl $segmentUrl `
+                -Context $CaptureContext -CaptureNumber $CaptureNumber -Label $Label
         }
 
         try { [void](Invoke-CdpEval -Expression 'window.__vouchTarget.to(0)' -TimeoutSec 10) }
         catch { Write-Verbose "Could not scroll back to the top: $($_.Exception.Message)" }
     }
     else {
-        Add-ItemCapture -Item $Item -SegmentIndex 1 -SegmentCount 1 -PageUrl $Item.FinalUrl -Context $CaptureContext
+        Add-ItemCapture -Item $Item -SegmentIndex 1 -SegmentCount 1 -PageUrl $Item.FinalUrl -Context $CaptureContext `
+            -CaptureNumber $CaptureNumber -Label $Label
     }
 }
 
 function Invoke-CaptureItem {
     <#
         Captures one page in the tab the CDP socket is connected to: navigate, wait until
-        ready, check for errors and sign-in redirects, run the steps, bring Edge to the
-        front and take the screenshots. Never throws: whatever goes wrong is recorded on
-        the item, because one failing page must not stop a run.
+        ready (and for the page's wait-for element), check for errors and sign-in
+        redirects, then run the page's actions in order - clicks, waits and captures, so
+        "click tab A, capture, click tab B, capture" gives one set of screenshots per tab.
+        Never throws: whatever goes wrong is recorded on the item, because one failing
+        page must not stop a run.
         Pass -Item to fill a record the caller already holds (Invoke-Main adds it to the
         run before visiting the page); otherwise a new one is made. Returns the item.
     #>
@@ -3830,16 +4138,6 @@ function Invoke-CaptureItem {
     $settleSeconds = $Settings.SettleSeconds
 
     Write-Host ("[{0}/{1}] {2} - {3}" -f $Definition.Index, $ItemCount, $Definition.Name, $Definition.Url)
-
-    if ($Definition.PSObject.Properties['Actions']) {
-        $legacy = Test-LegacyActionList -Actions @($Definition.Actions)
-        if (-not $legacy.Supported) {
-            $Item.Status = 'FAILED'
-            $Item.Details.Add($legacy.Reason)
-            Write-RowStatus -Message "    FAILED - $($legacy.Reason)" -Status 'FAILED'
-            return $Item
-        }
-    }
 
     try {
         Set-NavigationMarker
@@ -3912,32 +4210,66 @@ function Invoke-CaptureItem {
             }
         }
 
-        if ($Definition.Steps.Count -gt 0) {
-            $stepLog = Invoke-RowSteps -Steps @($Definition.Steps) -SettleSeconds $settleSeconds -NavigationTimeoutSec $navigationTimeoutSec
-            foreach ($entry in $stepLog) { $Item.StepLog.Add($entry) }
-            $failedSteps = @($stepLog | Where-Object { -not $_.Ok })
-            if ($failedSteps.Count -gt 0) {
-                if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
-                $Item.Details.Add("Completed with errors: $($failedSteps.Count) of $($stepLog.Count) step(s) failed.")
+        # The page's wait-for element (defaults.waitFor or its override): the page is
+        # only ready when it shows. Not on an error page, which will never show it.
+        $readySelector = if ($Settings.PSObject.Properties['WaitFor']) { [string]$Settings.WaitFor } else { '' }
+        if (-not [string]::IsNullOrWhiteSpace($readySelector) -and $Item.Status -ne 'FAILED') {
+            $readyProblem = ''
+            try {
+                if (-not (Wait-PageElement -Selector $readySelector -TimeoutSec $navigationTimeoutSec)) {
+                    $readyProblem = "The page did not show '$readySelector' within $navigationTimeoutSec seconds; it was captured in whatever state it had reached."
+                }
             }
-            if (-not $browserErrorPage) { $Item.FinalUrl = Get-CurrentPageUrl }
+            catch {
+                $readyProblem = "Vouch could not wait for '$readySelector': $($_.Exception.Message)"
+            }
+            if ($readyProblem) {
+                if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+                $Item.Details.Add($readyProblem)
+            }
         }
 
-        try { [void](Send-CdpCommand -Method 'Page.bringToFront' -TimeoutSec 10) }
-        catch { Write-Verbose "Page.bringToFront failed: $($_.Exception.Message)" }
-
-        $pageTitle = ''
-        try { $pageTitle = [string](Invoke-CdpEval -Expression 'document.title' -TimeoutSec 10) }
-        catch { Write-Verbose "Could not read the page title: $($_.Exception.Message)" }
-
-        $focusWarning = Set-EdgeForeground -ExpectedTitle $pageTitle
-        if ($null -ne $focusWarning) {
-            if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
-            $Item.Details.Add($focusWarning)
+        $actions = Get-DefinitionActionList -Definition $Definition
+        $captureCount = @($actions | Where-Object { $_['type'] -eq 'capture' }).Count
+        $stepCount = $actions.Count - $captureCount
+        $explicitAreas = [string[]]@($actions | Where-Object {
+                $_['type'] -eq 'capture' -and $_['scroll'] -is [System.Collections.IDictionary] -and
+                $_['scroll']['mode'] -eq 'area' -and $_['scroll']['selector'] } |
+            ForEach-Object { [string]$_['scroll']['selector'] })
+        # CSV rows log each step as it was written in the file ("Click: #go").
+        $stepTexts = [System.Collections.Generic.Queue[string]]::new()
+        if ($Definition.PSObject.Properties['Steps'] -and $null -ne $Definition.Steps) {
+            foreach ($step in $Definition.Steps) { $stepTexts.Enqueue([string]$step.Text) }
         }
 
-        Invoke-ScrollCapture -Item $Item -ScrollFullPage ([bool]$Definition.ScrollFullPage) -BrowserErrorPage $browserErrorPage `
-            -Settings $Settings -CaptureContext $CaptureContext
+        $captureNumber = 0
+        $failedSteps = 0
+        $stepsSinceUrl = 0
+        $failureLine = -1
+        for ($position = 0; $position -lt $actions.Count; $position++) {
+            $action = $actions[$position]
+            if ($action['type'] -eq 'capture') {
+                $captureNumber++
+                $failureLine = Add-StepFailureDetail -Item $Item -Failed $failedSteps -Total $stepCount -Position $failureLine
+                if ($stepsSinceUrl -gt 0 -and -not $browserErrorPage) { $Item.FinalUrl = Get-CurrentPageUrl }
+                $stepsSinceUrl = 0
+                $entry = Invoke-PageAction -Action $action -Settings $Settings -Item $Item -CaptureContext $CaptureContext `
+                    -CaptureNumber $captureNumber -BrowserErrorPage $browserErrorPage -ExplicitAreas $explicitAreas
+                # The one final capture of a page is implied, as in a CSV row; any other
+                # capture is a step of its own.
+                if (-not ($captureCount -eq 1 -and $position -eq $actions.Count - 1)) { $Item.StepLog.Add($entry) }
+                continue
+            }
+
+            $text = ''
+            if ($action['type'] -in 'click', 'clickText', 'wait' -and $stepTexts.Count -gt 0) { $text = $stepTexts.Dequeue() }
+            $entry = Invoke-PageAction -Action $action -Settings $Settings -Text $text -Item $Item
+            $Item.StepLog.Add($entry)
+            $stepsSinceUrl++
+            if (-not $entry.Ok) { $failedSteps++ }
+        }
+        $failureLine = Add-StepFailureDetail -Item $Item -Failed $failedSteps -Total $stepCount -Position $failureLine
+        if ($stepsSinceUrl -gt 0 -and -not $browserErrorPage) { $Item.FinalUrl = Get-CurrentPageUrl }
 
         $summary = "    $($Item.Status) - $($Item.Captures.Count) capture(s)"
         if ($Item.Details.Count -gt 0) { $summary += " - $($Item.Details[0])" }

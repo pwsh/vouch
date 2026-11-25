@@ -70,6 +70,22 @@ while ($listener.IsListening) {
                     "<div class='pane' id='left'>$column</div><div class='pane' id='right'>$column</div>"
                 Send-Response $context 200 (Page 'Two regions' $body)
             }
+            '^/bigpanel$' {
+                # The window scrolls, and a panel inside it holds far more content.
+                $rows = (1..40 | ForEach-Object { "<div class='row'>Panel row $_</div>" }) -join ''
+                $body = "<style>body{margin:0} #panel{height:70vh;overflow-y:auto} .row{height:100px;border-bottom:1px solid #ccc}" +
+                    " footer{height:2000px;background:linear-gradient(#fff,#0a0)}</style>" +
+                    "<header>Report</header><div id='panel'>$rows</div><footer>Page footer</footer>"
+                Send-Response $context 200 (Page 'Big panel' $body)
+            }
+            '^/delayed$' {
+                # #late is in the page from the start but only shown after ms milliseconds,
+                # the way applications reveal a grid once its data has arrived.
+                $ms = if ($query['ms']) { [int]$query['ms'] } else { 1000 }
+                $body = "<h1>Delayed</h1><div id='late' style='display:none'>Arrived</div>" +
+                    "<script>setTimeout(function () { document.getElementById('late').style.display = 'block'; }, $ms);</script>"
+                Send-Response $context 200 (Page 'Delayed' $body)
+            }
             '^/framepage$' {
                 $rows = if ($query['rows']) { [int]$query['rows'] } else { 12 }
                 $body = "<style>html,body{margin:0;height:100%;overflow:hidden}</style>" +
