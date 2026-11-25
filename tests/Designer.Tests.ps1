@@ -12,7 +12,9 @@ BeforeAll {
     Add-Type -AssemblyName System.Drawing
     Add-Type -AssemblyName System.Windows.Forms
     $script:DesignerPath = Join-Path -Path (Split-Path -Path $script:VouchPath -Parent) -ChildPath 'designer\Designer.ps1'
-    . ([scriptblock]::Create((Get-VouchFunctionSource -Path $script:VouchPath, $script:DesignerPath)))
+    $script:DesignerRunPath = Join-Path -Path (Split-Path -Path $script:VouchPath -Parent) -ChildPath 'designer\Designer.Run.ps1'
+    $script:FakeChildPath = Join-Path -Path $PSScriptRoot -ChildPath 'FakeVouchChild.ps1'
+    . ([scriptblock]::Create((Get-VouchFunctionSource -Path $script:VouchPath, $script:DesignerPath, $script:DesignerRunPath)))
     $script:SamplePath = Join-Path -Path (Split-Path -Path $script:VouchPath -Parent) -ChildPath 'captures.sample.json'
 
     # A request body that counts what is read from it, or fails the test if read at all.
@@ -75,17 +77,19 @@ namespace VouchTest {
             Without -AuditPort it never connects to a browser (-NoBrowser); with it, it
             attaches to the headless Edge listening there and never starts one.
         #>
-        param([string]$ConfigPath = '', [string]$Name = 'server', [int]$AuditPort = 0, [string]$AuditProfile = '')
+        param([string]$ConfigPath = '', [string]$Name = 'server', [int]$AuditPort = 0, [string]$AuditProfile = '', [string]$RunScript = '', [string]$OpenLog = '')
         $folder = Join-Path -Path $TestDrive -ChildPath $Name
         [void](New-Item -ItemType Directory -Path $folder -Force)
         $ready = Join-Path -Path $folder -ChildPath 'ready.json'
         $literal = { param($s) "'" + ([string]$s).Replace("'", "''") + "'" }
         $browser = if ($AuditPort -gt 0) { "-DebugPort $AuditPort -AuditProfileDir $(& $literal $AuditProfile) -NoBrowserLaunch" } else { '-NoBrowser' }
+        if ($RunScript) { $browser += " -RunScriptPath $(& $literal $RunScript)" }
+        if ($OpenLog) { $browser += " -OpenLog $(& $literal $OpenLog)" }
         $hostScript = @"
 `$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . $(& $literal (Join-Path $PSScriptRoot 'TestHelpers.ps1'))
-. ([scriptblock]::Create((Get-VouchFunctionSource -Path $(& $literal $script:VouchPath), $(& $literal $script:DesignerPath))))
+. ([scriptblock]::Create((Get-VouchFunctionSource -Path $(& $literal $script:VouchPath), $(& $literal $script:DesignerPath), $(& $literal $script:DesignerRunPath))))
 Start-VouchDesigner -ScriptPath $(& $literal $script:VouchPath) -ConfigPath $(& $literal $ConfigPath) -NoPanel -ReadyFile $(& $literal $ready) -Version 'test' $browser
 "@
         $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($hostScript))
@@ -288,13 +292,10 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
         $r.Data.config.report.title | Should -Be 'Audit Evidence Report'
     }
 
-    It 'answers 501 with a plain message for <_>' -ForEach @(
-        'POST /api/run', 'GET /api/run', 'POST /api/run/stop', 'GET /preview/run1/001.jpg') {
-        $method, $path = $_ -split ' ', 2
-        $r = Invoke-TestRoute $method $path -State $script:State
-        $r.Status | Should -Be 501
-        $r.Data.code | Should -Be 'later'
-        $r.Data.detail | Should -Match 'later step'
+    It 'has no route left that answers 501 (runs are implemented)' {
+        (Get-DesignerLaterRoute).Count | Should -Be 0
+        (Invoke-TestRoute GET '/api/run' -State $script:State).Status | Should -Be 200
+        (Invoke-TestRoute GET '/preview/run1/001.jpg' -State $script:State).Status | Should -Be 404
     }
 
     It 'answers 405 for a known address with the wrong method, and 404 for an unknown one' {
@@ -1172,7 +1173,7 @@ return { text: box.textContent, codes: [S.command.run], warning: !!box.querySele
         $r.warning | Should -BeTrue
         $r.codes[0] | Should -BeLike "pwsh -NoProfile -ExecutionPolicy Bypass -File *vouch.ps1`" -ConfigPath `"$($script:PanelConfig)`""
         $r.text | Should -Match 'Schedule it'
-        $r.later | Should -Match 'later step'
+        $r.later | Should -Match 'need the audit browser'
     }
 
     It 'saves through the API, and the saved file reads back as the configuration shown' {
@@ -1468,6 +1469,18 @@ Describe 'Designer mode in vouch.ps1 and the panel window' {
         "$alone\logs" | Should -Not -Exist
     }
 
+    It 'says the same when the designer folder lacks its run file (Designer.Run.ps1)' {
+        $partial = Join-Path $TestDrive 'partial'
+        [void](New-Item -ItemType Directory -Path (Join-Path $partial 'designer') -Force)
+        Copy-Item -LiteralPath $script:VouchPath -Destination (Join-Path $partial 'vouch.ps1')
+        Copy-Item -LiteralPath $script:DesignerPath -Destination (Join-Path $partial 'designer\Designer.ps1')
+        $out = Join-Path $partial 'out.txt'
+        $process = Start-Process -FilePath (Get-Process -Id $PID).Path -NoNewWindow -Wait -PassThru -RedirectStandardOutput $out `
+            -ArgumentList '-NoProfile', '-NonInteractive', '-File', "`"$(Join-Path $partial 'vouch.ps1')`"", '-Designer'
+        $process.ExitCode | Should -Be 1
+        Get-Content -Raw -LiteralPath $out | Should -Match "needs the folder 'designer' next to vouch.ps1"
+    }
+
     It 'has a launcher that starts the Designer and explains a missing PowerShell 7 (Windows line ends)' {
         $cmd = Join-Path (Split-Path $script:VouchPath) 'Vouch-Designer.cmd'
         $bytes = [System.IO.File]::ReadAllBytes($cmd)
@@ -1620,7 +1633,8 @@ Describe 'Browser link and picker: routes and rules without a browser' {
         $r.Data.capabilities.browser | Should -BeTrue
         $r.Data.capabilities.pick | Should -BeTrue
         $r.Data.capabilities.test | Should -BeTrue
-        $r.Data.capabilities.run | Should -BeFalse
+        # A run needs the connected audit Edge (the child attaches to its tab).
+        $r.Data.capabilities.run | Should -BeTrue
         $r.Data.browser.title | Should -Be 'Some page'
         $r.Data.browser.settingsChanged | Should -BeFalse
     }
@@ -2748,6 +2762,37 @@ Describe 'Browser link and picker in headless Edge (functions called directly)' 
         Invoke-CdpEval -Expression 'JSON.stringify(window.__hits)' | Should -Be '[]'
     }
 
+    It 'ends the pick with the plain "typing" message when the page fills in a field itself (execCommand insertText)' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 300
+        # The page's own script: execCommand fires no beforeinput in Edge, so the field changes
+        # and its trusted input event ends the pick - an accepted, stated limit.
+        [void](Invoke-CdpEval -Expression "(function () { var f = document.getElementById('q'); f.focus({ preventScroll: true }); document.execCommand('insertText', false, 'X'); return true; })()")
+        $r = Wait-TestPick
+        $r.state | Should -Be 'error'
+        $r.code | Should -Be 'typing'
+        $r.message | Should -Match 'or the page filled it in itself'
+        $r.message | Should -Not -Match 'focus|frame'
+        Invoke-CdpEval -Expression "typeof window.__vouchPicker + '|' + document.querySelectorAll('vouch-picker-ui').length" | Should -Be 'undefined|0'
+    }
+
+    It 'removes the picker from the page by itself when the Designer stops asking for it (heartbeat)' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        # Polled now and then (as the Designer does): it stays for longer than the limit.
+        for ($i = 0; $i -lt 7; $i++) { Start-Sleep -Milliseconds 1000; (Get-ElementPickResult -State $script:B).state | Should -Be 'picking' }
+        Invoke-CdpEval -Expression "typeof window.__vouchPicker + '|' + document.querySelectorAll('vouch-picker-ui').length" | Should -Be 'object|1'
+        # Nobody asks any more (the Designer died, or gave up on the tab without stop()).
+        Start-Sleep -Milliseconds 6000
+        Invoke-CdpEval -Expression "typeof window.__vouchPicker + '|' + document.querySelectorAll('vouch-picker-ui').length" | Should -Be 'undefined|0'
+        # The page works again: a real click reaches its button.
+        Send-TestClick (Get-TestPoint "document.querySelector('[data-testid=save-settings]')")
+        Start-Sleep -Milliseconds 200
+        Invoke-CdpEval -Expression 'JSON.stringify(window.__hits)' | Should -Be '["save"]'
+        Stop-ElementPick -State $script:B -NoLayout
+    }
+
     It 'with the focus on the picking layer: Ctrl+Z does not undo the page''s typing, and a paste never reaches the page' {
         Open-TestPage "/pickme?x=$($script:Web2)"
         [void](Invoke-CdpEval -Expression "(function () { var f = document.getElementById('q'); f.focus({ preventScroll: true }); f.setSelectionRange(4, 4); return true; })()")
@@ -3311,5 +3356,1015 @@ return { on: !!on, text: document.querySelector('#browser-strip').textContent };
 '@
         $r.on | Should -BeTrue
         $r.text | Should -Match 'Browser connected'
+    }
+}
+
+Describe 'Runs from the panel: routes, plan and rules (no browser, no child)' {
+    BeforeAll {
+        $script:R = New-TestState
+        $script:R.SessionFolder = Join-Path $TestDrive 'runs-unit'
+        function New-RunConfig {
+            $config = Get-DefaultVouchConfig
+            $config['pages'].Add([ordered]@{ id = 'p001'; name = 'One'; url = 'https://example.com/1' })
+            $config['pages'].Add([ordered]@{ id = 'p002'; name = 'Two'; url = 'https://example.com/2'; enabled = $false })
+            return $config
+        }
+    }
+    AfterEach { $script:R.Run = New-DesignerRunState; $script:R.Browser.Connected = $false }
+
+    It 'answers GET /api/run with the idle run, and reads "since" from the query string' {
+        $r = Invoke-TestRoute GET '/api/run' -State $script:R
+        $r.Status | Should -Be 200
+        $r.Data.state | Should -Be 'idle'
+        @($r.Data.events).Count | Should -Be 0
+        $r.Data.next | Should -Be 0
+        Get-DesignerQueryNumber -Query '?since=12' -Name 'since' | Should -Be 12
+        Get-DesignerQueryNumber -Query '?a=1&since=7' -Name 'since' | Should -Be 7
+        Get-DesignerQueryNumber -Query '?since=x' -Name 'since' | Should -Be 0
+        Get-DesignerQueryNumber -Query '' -Name 'since' | Should -Be 0
+    }
+
+    It 'slices the events from "since" on, at most 500 at a time' {
+        $run = New-DesignerRunState
+        $run.Number = 1; $run.State = 'done'
+        for ($i = 0; $i -lt 620; $i++) { $run.Events.Add([ordered]@{ type = 'detail'; n = $i }) }
+        $script:R.Run = $run
+        $first = ConvertFrom-TestBody (Invoke-DesignerRequest -Method GET -Path '/api/run' -Query '?since=0' -State $script:R)
+        @($first.events).Count | Should -Be 500
+        $first.next | Should -Be 500
+        $rest = ConvertFrom-TestBody (Invoke-DesignerRequest -Method GET -Path '/api/run' -Query "?since=$($first.next)" -State $script:R)
+        @($rest.events).Count | Should -Be 120
+        $rest.events[0].n | Should -Be 500
+        $rest.next | Should -Be 620
+    }
+
+    It 'refuses to run without the audit browser (409, with the reason)' {
+        $r = Invoke-TestRoute POST '/api/run' ([ordered]@{ config = (New-RunConfig); kind = 'full' }) -State $script:R
+        $r.Status | Should -Be 409
+        $r.Data.code | Should -Be 'no-browser'
+    }
+
+    It 'refuses a run with problems with the messages Save shows (422), and starts nothing' {
+        $script:R.Browser.Connected = $true
+        $config = New-RunConfig
+        $config['pages'][0]['url'] = 'intranet.example.com'
+        $r = Invoke-TestRoute POST '/api/run' ([ordered]@{ config = $config; kind = 'full' }) -State $script:R
+        $r.Status | Should -Be 422
+        $r.Data.code | Should -Be 'invalid'
+        $r.Data.error | Should -Match 'problem\(s\), so it was not run'
+        $save = Invoke-TestRoute POST '/api/config/save' ([ordered]@{ config = $config; path = '' }) -State $script:R
+        ($r.Data.errors | ForEach-Object { $_.message }) | Should -Be ($save.Data.errors | ForEach-Object { $_.message })
+        $script:R.Run.State | Should -Be 'idle'
+        $r = Invoke-TestRoute POST '/api/run' ([ordered]@{ config = $config; kind = 'page'; pageId = 'p001' }) -State $script:R
+        $r.Data.error | Should -Match 'so it was not tested'
+    }
+
+    It 'refuses an unknown kind (400), a page that is not there (400) and a path not handed out (403)' {
+        $script:R.Browser.Connected = $true
+        (Invoke-TestRoute POST '/api/run' ([ordered]@{ config = (New-RunConfig); kind = 'everything' }) -State $script:R).Status | Should -Be 400
+        $r = Invoke-TestRoute POST '/api/run' ([ordered]@{ config = (New-RunConfig); kind = 'page'; pageId = 'p999' }) -State $script:R
+        $r.Status | Should -Be 400
+        $r.Data.code | Should -Be 'page'
+        foreach ($route in '/api/run', '/api/run/plan') {
+            (Invoke-TestRoute POST $route ([ordered]@{ config = (New-RunConfig); path = 'C:\Windows\win.ini'; kind = 'full' }) -State $script:R).Status | Should -Be 403
+            $request = New-DesignerRequest -Method POST -Path $route -Headers (New-GoodHeaders $script:R -Post) -BodyText '{"path":"C:\\Windows\\win.ini","config":{}}'
+            (Test-DesignerRequest -Request $request -State $script:R).Status | Should -Be 403
+        }
+        $script:R.Run.State | Should -Be 'idle'
+    }
+
+    It 'keeps every run route behind the gate: <_>' -ForEach @('POST /api/run', 'GET /api/run', 'POST /api/run/stop', 'POST /api/run/plan', 'GET /preview/0123/001_a.jpg') {
+        $method, $path = $_ -split ' ', 2
+        $headers = New-GoodHeaders $script:R -Post:($method -eq 'POST')
+        $headers.Remove('X-Vouch-Token')
+        $request = New-DesignerRequest -Method $method -Path $path -Headers $headers -BodyText '{}'
+        $refusal = Test-DesignerRequest -Request $request -State $script:R
+        $refusal.Status | Should -Be 403
+        (ConvertFrom-TestBody $refusal).code | Should -Be 'token'
+        $headers = New-GoodHeaders $script:R -Post:($method -eq 'POST')
+        $headers['Origin'] = 'https://evil.example'
+        (Test-DesignerRequest -Request (New-DesignerRequest -Method $method -Path $path -Headers $headers -BodyText '{}') -State $script:R).Status | Should -Be 403
+    }
+
+    It 'answers 409 to a stop with nothing running, and 405 for a POST to a preview' {
+        $r = Invoke-TestRoute POST '/api/run/stop' -State $script:R
+        $r.Status | Should -Be 409
+        $r.Data.code | Should -Be 'not-running'
+        (Invoke-TestRoute POST '/preview/abc/x.jpg' -State $script:R).Status | Should -Be 405
+        (Invoke-TestRoute GET '/api/run/stop' -State $script:R).Status | Should -Be 405
+        (Invoke-TestRoute GET '/api/run/plan' -State $script:R).Status | Should -Be 405
+    }
+
+    It 'plans a run of a configuration never saved: folders from Documents\Vouch, "unsaved", the switches it adds' {
+        $script:R.Browser.Connected = $true; $script:R.Browser.TabId = 'TAB-9'; $script:R.Browser.Port = 9555; $script:R.Browser.ProfileDir = 'C:\Audit'
+        $r = Invoke-TestRoute POST '/api/run/plan' ([ordered]@{ config = (New-RunConfig); kind = 'full' }) -State $script:R
+        $r.Status | Should -Be 200
+        $documents = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Vouch'
+        $r.Data.saved | Should -BeFalse
+        $r.Data.unsaved | Should -BeTrue
+        $r.Data.baseFolder | Should -Be $documents
+        $r.Data.outputFolder | Should -Be (Join-Path $documents 'reports')
+        ($r.Data.notes -join ' ') | Should -Match 'has not been saved yet'
+        $r.Data.sessionFlags | Should -Contain 'The tab the Designer shows (-TabId).'
+        ($r.Data.sessionFlags -join ' ') | Should -Match '-EventLogPath'
+        ($r.Data.sessionFlags -join ' ') | Should -Match '-DebugPort 9555'
+        $page = Invoke-TestRoute POST '/api/run/plan' ([ordered]@{ config = (New-RunConfig); kind = 'page'; pageId = 'p002' }) -State $script:R
+        $page.Data.pageName | Should -Be 'Two'
+        ($page.Data.sessionFlags -join ' ') | Should -Match '-Only p002'
+        ($page.Data.sessionFlags -join ' ') | Should -Match '-Zip:\$false'
+        ($page.Data.sessionFlags -join ' ') | Should -Match '-OpenReport:\$false'
+        ($page.Data.notes -join ' ') | Should -Match 'temporary preview folder'
+    }
+
+    It 'plans a saved configuration against its own folder, and sees whether the shown one differs from the file' {
+        $folder = Join-Path $TestDrive 'plan saved'
+        [void](New-Item -ItemType Directory -Path $folder -Force)
+        $config = New-RunConfig
+        $config['output']['dir'] = 'out\evidence'
+        $config['report']['logoPath'] = 'logo.png'
+        $file = Join-Path $folder 'c.json'
+        [void](Save-VouchConfig -Config $config -Path $file)
+        $known = Add-DesignerKnownPath -State $script:R -Path $file -Kind config
+        $r = Invoke-TestRoute POST '/api/run/plan' ([ordered]@{ config = $config; path = $known; kind = 'full' }) -State $script:R
+        $r.Data.saved | Should -BeTrue
+        $r.Data.unsaved | Should -BeFalse
+        $r.Data.outputFolder | Should -Be (Join-Path $folder 'out\evidence')
+        $config['report']['title'] = 'Edited, not saved'
+        (Invoke-TestRoute POST '/api/run/plan' ([ordered]@{ config = $config; path = $known; kind = 'full' }) -State $script:R).Data.unsaved | Should -BeTrue
+        $resolved = Resolve-DesignerRunConfig -Config $config -BaseFolder $folder
+        $resolved.Config['report']['logoPath'] | Should -Be (Join-Path $folder 'logo.png')
+        $resolved.Config['output']['dir'] | Should -Be (Join-Path $folder 'out\evidence')
+        $resolved.Config['report']['title'] | Should -Be 'Edited, not saved'
+        # Nothing but the four paths changes; the shown configuration itself is not touched.
+        $config['output']['dir'] | Should -Be 'out\evidence'
+    }
+
+    It 'plans the virtual desktop: <Case>' -ForEach @(
+        @{ Case = 'a full run with the Edge the Designer opened'; Kind = 'full'; Launched = $true; Expect = 'used'; Words = 'closes the audit Edge it opened'; Flag = $false }
+        @{ Case = 'a full run with an Edge the Designer found'; Kind = 'full'; Launched = $false; Expect = 'skipped'; Words = 'does not use a separate virtual desktop'; Flag = $true }
+        @{ Case = 'a page test'; Kind = 'page'; Launched = $true; Expect = 'ignored'; Words = 'never uses a separate virtual desktop'; Flag = $true }
+    ) {
+        $script:R.Browser.LaunchedByDesigner = $Launched
+        $script:R.Browser.LaunchedPid = $(if ($Launched) { 4242 } else { 0 })
+        $config = New-RunConfig
+        $config['browser']['useVirtualDesktop'] = $true
+        $plan = Get-DesignerRunPlan -State $script:R -Config $config -Kind $Kind -PageId 'p001'
+        $plan.VirtualDesktop | Should -Be $Expect
+        ($plan.Notes -join ' ') | Should -Match $Words
+        $flags = Get-DesignerRunSessionFlag -State $script:R -Plan $plan -EventPath 'e' -PreviewFolder 'p' -TabId 'T'
+        $arguments = @($flags | ForEach-Object { $_.Arguments })
+        ($arguments -contains '-UseVirtualDesktop:$false') | Should -Be $Flag
+        ($arguments -contains '-TabId') | Should -Be ($Expect -ne 'used')
+        $script:R.Browser.LaunchedByDesigner = $false; $script:R.Browser.LaunchedPid = 0
+    }
+
+    It 'gives the run''s arguments as an array that the shown command spells out exactly' {
+        $file = Join-Path $TestDrive 'Prüfung $x `y & ''z'' 100% (Q3)\c.json'
+        $command = Get-VouchCommandLine -Config (New-RunConfig) -ConfigPath $file -ScriptPath $script:VouchPath
+        $command.RunArguments | Should -Be @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:VouchPath, '-ConfigPath', $file)
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($command.Run, [ref]$null, [ref]$null)
+        $elements = $ast.EndBlock.Statements[0].PipelineElements[0].CommandElements
+        $values = @($elements | ForEach-Object { if ($_ -is [System.Management.Automation.Language.CommandParameterAst]) { '-' + $_.ParameterName } else { $_.SafeGetValue() } })
+        $values | Should -Be (@('pwsh') + $command.RunArguments)
+    }
+
+    It 'answers 409 to every browser route while a run is going, and to a second run' {
+        $script:R.Run.State = 'running'
+        foreach ($route in 'GET /api/browser/current', 'POST /api/browser/connect', 'POST /api/browser/navigate', 'POST /api/browser/layout',
+            'POST /api/browser/zoom-off', 'POST /api/page/from-current', 'POST /api/pick/start', 'POST /api/action/test') {
+            $method, $path = $route -split ' ', 2
+            $r = Invoke-TestRoute $method $path ([ordered]@{ url = 'https://example.com/'; mode = 'click'; action = [ordered]@{ type = 'wait'; seconds = 1 } }) -State $script:R
+            $r.Status | Should -Be 409 -Because $route
+            $r.Data.code | Should -Be 'running'
+            $r.Data.error | Should -Be 'A run is using the audit browser.'
+        }
+        $script:R.Browser.Connected = $true
+        (Invoke-TestRoute POST '/api/run' ([ordered]@{ config = (New-RunConfig); kind = 'full' }) -State $script:R).Data.code | Should -Be 'running'
+        # Editing and saving go on.
+        (Invoke-TestRoute POST '/api/config/validate' ([ordered]@{ config = (New-RunConfig) }) -State $script:R).Status | Should -Be 200
+        $state = (Invoke-TestRoute GET '/api/state' -State $script:R).Data
+        $state.run.state | Should -Be 'running'
+        $state.capabilities.run | Should -BeTrue
+        $script:R.Browser.Connected = $false
+        $state = (Invoke-TestRoute GET '/api/state' -State $script:R).Data
+        $state.browser.inRun | Should -BeTrue
+        $state.browser.message | Should -Match 'A run is using the audit Edge'
+        $state.capabilities.pick | Should -BeFalse
+        # The tick leaves the browser alone.
+        Mock Update-DesignerBrowser { throw 'The tick looked at the browser during a run.' }
+        Mock Connect-DesignerBrowser { throw 'The tick reconnected during a run.' }
+        $script:R.Browser.ConnectPending = $true
+        Invoke-DesignerBrowserTick -State $script:R
+        Should -Invoke Update-DesignerBrowser -Times 0
+        Should -Invoke Connect-DesignerBrowser -Times 0
+        $script:R.Browser.ConnectPending = $false
+    }
+
+    It 'refuses to shut down in the middle of a run unless asked to stop it' {
+        $script:R.Run.State = 'running'
+        $r = Invoke-TestRoute POST '/api/shutdown' -State $script:R
+        $r.Status | Should -Be 409
+        $script:R.Running | Should -BeTrue
+    }
+
+    It 'reads complete lines only: a split line waits for its end, garbage and over-long lines are skipped' {
+        $run = New-DesignerRunState
+        $run.EventPath = Join-Path $TestDrive 'manual.ndjson'
+        $state = New-TestState
+        $append = { param($t) [System.IO.File]::AppendAllText($run.EventPath, $t, [System.Text.UTF8Encoding]::new($false)) }
+        Read-DesignerRunEvent -State $state -Run $run | Should -Be 0
+        & $append '{"type":"runStart","runId":"r1"'
+        Read-DesignerRunEvent -State $state -Run $run | Should -Be 0
+        $run.Pending.Length | Should -BeGreaterThan 0
+        & $append ("}`n" + '{"type":"pageStart","pageId":"p1","name":"Ä & ''b''","index":1,"total":1}' + "`nnot json`n[1]`n`n")
+        Read-DesignerRunEvent -State $state -Run $run | Should -Be 2
+        $run.Skipped | Should -Be 2
+        $run.State = 'starting'
+        $run.Pages['id:p1'].name | Should -Be "Ä & 'b'"
+        # A line over the limit, read in small pieces, is dropped as a whole; the next one counts.
+        & $append (('{"type":"detail","text":"' + ('y' * 300) + '"}') + "`n" + '{"type":"pageEnd","pageId":"p1","status":"OK","details":[],"captureCount":0}' + "`n")
+        Read-DesignerRunEvent -State $state -Run $run -MaxBytes 64 -MaxLineBytes 100 | Should -Be 1
+        $run.Skipped | Should -Be 3
+        $run.Pages['id:p1'].status | Should -Be 'OK'
+        $state.PageResults['p1'].status | Should -Be 'OK'
+        # At the end, an unfinished last line is lost, not half-read.
+        & $append '{"type":"runEnd","exitCode":0'
+        Read-DesignerRunEvent -State $state -Run $run -Final | Should -Be 0
+        $run.Skipped | Should -Be 4
+        $run.RunEnd | Should -BeNullOrEmpty
+    }
+
+    It 'puts the exit code into words: <Code>' -ForEach @(
+        @{ Code = 0; RunEnd = $true; Words = 'Finished: every page was captured' }
+        @{ Code = 2; RunEnd = $true; Words = 'page\(s\) failed' }
+        @{ Code = 3; RunEnd = $true; Words = 'Fail on warnings' }
+        @{ Code = 1; RunEnd = $true; Words = 'could not start: Edge has no tab' }
+        @{ Code = 9; RunEnd = $false; Words = 'ended unexpectedly \(exit code 9\)' }
+    ) {
+        $run = New-DesignerRunState
+        $run.ErrorMessage = 'Edge has no tab'
+        if ($RunEnd) { $run.RunEnd = [ordered]@{ type = 'runEnd' }; $run.Counts = [ordered]@{ pages = 2; run = 2; ok = 1; warning = 0; failed = 1; notRun = 0; captures = 1 } }
+        else { $run.Pages['id:p1'] = [ordered]@{} }
+        Get-DesignerRunOutcome -Run $run -ProcessExitCode $Code | Should -Match $Words
+    }
+}
+
+Describe 'Runs with a stand-in child process (the run state machine)' -Tag 'Integration' {
+    BeforeAll {
+        function New-RunTestState([string]$Name) {
+            $state = New-TestState
+            $state.RunScriptPath = $script:FakeChildPath
+            $state.SessionFolder = Join-Path $TestDrive $Name
+            return $state
+        }
+        function New-RunTestConfig([string]$Scenario) {
+            $config = Get-DefaultVouchConfig
+            $config['name'] = "fake:$Scenario"
+            $config['defaults']['navigationTimeoutSec'] = 5
+            $config['pages'].Add([ordered]@{ id = 'p001'; name = 'One'; url = 'http://localhost/1' })
+            $config['pages'].Add([ordered]@{ id = 'p002'; name = 'Two'; url = 'http://localhost/2' })
+            return $config
+        }
+        function Start-TestRun([object]$State, [string]$Scenario, [string]$Kind = 'full', [string]$PageId = '', [object]$Config = $null) {
+            if ($null -eq $Config) { $Config = New-RunTestConfig $Scenario }
+            $plan = Get-DesignerRunPlan -State $State -Config $Config -Kind $Kind -PageId $PageId
+            return Start-DesignerRun -State $State -Plan $plan
+        }
+        function Wait-TestRun([object]$State, [int]$TimeoutSec = 30, [scriptblock]$Until = $null) {
+            $deadline = (Get-Date).AddSeconds($TimeoutSec)
+            while ((Get-Date) -lt $deadline) {
+                Update-DesignerRun -State $State
+                if ($null -ne $Until) { if (& $Until) { break } }
+                elseif (-not (Test-DesignerRunActive -State $State)) { break }
+                Start-Sleep -Milliseconds 100
+            }
+            return Get-DesignerRunData -State $State
+        }
+        function Get-EventType([object]$Data) { return @($Data.events | ForEach-Object { $_['type'] }) }
+        $script:Started = [System.Collections.Generic.List[object]]::new()
+    }
+    AfterAll {
+        foreach ($run in $script:Started) { if ($null -ne $run.Process) { Stop-DesignerChildProcess -Process $run.Process } }
+    }
+
+    It 'follows a normal run: events in order, each page''s result, the counts, and this run''s paths only' {
+        $state = New-RunTestState 'normal'
+        $state.OpenTargets['report'] = 'C:\old\report.html'
+        $run = Start-TestRun $state 'normal'
+        $script:Started.Add($run)
+        $run.State | Should -Be 'starting'
+        $data = Wait-TestRun $state
+        $data.state | Should -Be 'done'
+        $data.exitCode | Should -Be 0
+        Get-EventType $data | Should -Be @('runStart', 'pageStart', 'capture', 'pageEnd', 'pageStart', 'detail', 'capture', 'pageEnd', 'runEnd')
+        @($data.pages).Count | Should -Be 2
+        $data.pages[0].status | Should -Be 'OK'
+        $data.pages[0].name | Should -Be "Page 1 'quoted' & é"
+        $data.pages[1].status | Should -Be 'WARNING'
+        $data.pages[1].details | Should -Be @('Page truncated at 3 segments (raise -MaxScrollSegments to capture more).')
+        $data.pages[1].captureCount | Should -Be 1
+        $data.counts.warning | Should -Be 1
+        $data.message | Should -Match '2 page\(s\) captured, 1 with warnings'
+        $state.OpenTargets['report'] | Should -Be $data.reportPath
+        $state.OpenTargets['folder'] | Should -Be (Split-Path $data.reportPath -Parent)
+        $state.OpenTargets['log'] | Should -Be $data.logPath
+        $state.OpenTargets.Contains('zip') | Should -BeFalse
+        $data.pageResults['p002'].status | Should -Be 'WARNING'
+        $data.pageResults['p002'].kind | Should -Be 'full'
+        $data.pageResults['p002'].time | Should -Match '^\d\d:\d\d$'
+        # The configuration copy and the stop file are gone; the saved file was never involved.
+        $run.ConfigTempPath | Should -Not -Exist
+        $run.StopPath | Should -Not -Exist
+        $run.Process | Should -BeNullOrEmpty
+    }
+
+    It 'passes the shown command''s arguments plus the session flags, hazardous values intact' {
+        $state = New-RunTestState 'Sess ''q'' $x %USERNAME% & é `b (1)'
+        $state.Browser.Connected = $true
+        $state.Browser.TabId = 'TAB-1'
+        $state.Browser.Port = 9555
+        $state.Browser.ProfileDir = 'C:\Audit "Profile" it''s $x %USERNAME% & é'
+        Mock Connect-DesignerBrowser { $State.Browser.Connected = $true; $State.Browser.TabId = 'TAB-1' }
+        Mock Set-DesignerLayout { [pscustomobject]@{ Ok = $true; Message = '' } }
+        Mock Clear-PageZoom { }
+        $run = Start-TestRun $state 'normal'
+        $script:Started.Add($run)
+        $state.Browser.Connected | Should -BeFalse
+        $data = Wait-TestRun $state
+        $data.state | Should -Be 'done'
+        $command = Get-VouchCommandLine -Config (New-RunTestConfig 'normal') -ConfigPath $run.ConfigTempPath -ScriptPath $script:FakeChildPath
+        $flags = @('-EventLogPath', $run.EventPath, '-TabId', 'TAB-1', '-DebugPort', '9555', '-EdgeProfileDir', $state.Browser.ProfileDir)
+        $run.Arguments | Should -Be (@($command.RunArguments) + $flags)
+        $received = @(Get-Content -Raw -LiteralPath "$($run.EventPath).args.json" | ConvertFrom-Json)
+        $received | Should -Be (@($command.RunArguments | Select-Object -Skip 5) + $flags)
+        # Connected again afterwards, to the same tab.
+        Should -Invoke Connect-DesignerBrowser -Times 1 -Exactly
+        $state.Browser.TabId | Should -Be 'TAB-1'
+    }
+
+    It 'shows the person is answering the Vouch dialog while a prompt has no answer yet' {
+        $state = New-RunTestState 'prompt'
+        $run = Start-TestRun $state 'prompt'
+        $script:Started.Add($run)
+        $data = Wait-TestRun $state -Until { (Get-DesignerRunData -State $state).state -eq 'waitingForUser' }
+        $data.state | Should -Be 'waitingForUser'
+        $data.prompt.title | Should -Be 'Vouch has paused'
+        (Get-DesignerRunSummary -State $state).state | Should -Be 'waitingForUser'
+        [System.IO.File]::WriteAllText("$($run.EventPath).answer", '')
+        $data = Wait-TestRun $state
+        $data.state | Should -Be 'done'
+        $data.prompt | Should -BeNullOrEmpty
+        Get-EventType $data | Should -Contain 'promptResult'
+    }
+
+    It 'reports a failing page: exit code 2 in words' {
+        $state = New-RunTestState 'failpage'
+        $script:Started.Add((Start-TestRun $state 'failpage'))
+        $data = Wait-TestRun $state
+        $data.state | Should -Be 'done'
+        $data.exitCode | Should -Be 2
+        $data.pages[1].status | Should -Be 'FAILED'
+        $data.message | Should -Be 'Finished, but 1 page(s) failed. The report shows what went wrong on each.'
+    }
+
+    It 'stops a run cleanly through its stop file; the report is still written' {
+        $state = New-RunTestState 'stop'
+        $run = Start-TestRun $state 'stop'
+        $script:Started.Add($run)
+        [void](Wait-TestRun $state -Until { @((Get-DesignerRunData -State $state).pages).Count -ge 2 })
+        $r = Invoke-TestRoute POST '/api/run/stop' -State $state
+        $r.Status | Should -Be 200
+        $r.Data.state | Should -Be 'stopping'
+        $r.Data.stopRequested | Should -BeTrue
+        $r.Data.forceAvailable | Should -BeFalse
+        $data = Wait-TestRun $state
+        $data.state | Should -Be 'done'
+        $data.stopped | Should -BeTrue
+        $data.counts.notRun | Should -BeGreaterThan 0
+        $data.message | Should -Match '^Stopped by you after \d of 6 page\(s\)'
+        $data.reportPath | Should -Exist
+        $run.StopPath | Should -Not -Exist
+    }
+
+    It 'offers Force stop only after the grace time, then ends the child''s process tree' {
+        $state = New-RunTestState 'ignorestop'
+        $run = Start-TestRun $state 'ignorestop'
+        $script:Started.Add($run)
+        $childId = $run.ProcessId
+        [void](Wait-TestRun $state -Until { (Get-DesignerRunData -State $state).state -eq 'running' })
+        $run.GraceSec | Should -Be 35
+        $run.GraceSec = 2
+        (Invoke-TestRoute POST '/api/run/stop' -State $state).Status | Should -Be 200
+        $early = Invoke-TestRoute POST '/api/run/stop' ([ordered]@{ force = $true }) -State $state
+        $early.Status | Should -Be 409
+        $early.Data.code | Should -Be 'too-early'
+        $data = Wait-TestRun $state -Until { (Get-DesignerRunData -State $state).forceAvailable }
+        $data.forceAvailable | Should -BeTrue
+        $r = Invoke-TestRoute POST '/api/run/stop' ([ordered]@{ force = $true }) -State $state
+        $r.Status | Should -Be 200
+        $r.Data.state | Should -Be 'failed'
+        $r.Data.message | Should -Match 'force-stopped the run. Its report may be missing'
+        Get-Process -Id $childId -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
+        $run.StopPath | Should -Not -Exist
+    }
+
+    It 'reports a run that died without its end as failed, with what it said: <Scenario>' -ForEach @(
+        @{ Scenario = 'die'; Words = '(?s)ended unexpectedly \(exit code 7\).*Something broke badly inside the run' }
+        @{ Scenario = 'nothing'; Words = '^The run could not start: The configuration file could not be read' }
+        @{ Scenario = 'failstart'; Words = '^The run could not start: Edge has no open tab' }
+    ) {
+        $state = New-RunTestState $Scenario
+        $script:Started.Add((Start-TestRun $state $Scenario))
+        $data = Wait-TestRun $state
+        $data.state | Should -Be 'failed'
+        $data.message | Should -Match $Words
+        $data.errorText | Should -Not -BeNullOrEmpty
+        $state.OpenTargets.Contains('report') | Should -BeFalse
+    }
+
+    It 'skips garbage, waits for a line written in two parts, and drops an unfinished last line' {
+        $state = New-RunTestState 'garbage'
+        $script:Started.Add((Start-TestRun $state 'garbage'))
+        $data = Wait-TestRun $state
+        $data.state | Should -Be 'done'
+        $data.skippedLines | Should -Be 4
+        @($data.events | Where-Object { $_['text'] -eq 'split line' }).Count | Should -Be 1
+        (Get-EventType $data)[-1] | Should -Be 'runEnd'
+    }
+
+    It 'skips a line of several megabytes and goes on' {
+        $state = New-RunTestState 'longline'
+        $script:Started.Add((Start-TestRun $state 'longline'))
+        $data = Wait-TestRun $state
+        $data.state | Should -Be 'done'
+        $data.skippedLines | Should -Be 1
+        @($data.pages).Count | Should -Be 2
+    }
+
+    It 'virtual desktop (desktop functions mocked): closes only the Edge it opened, runs without -TabId, connects again after' {
+        $state = New-RunTestState 'vdesk'
+        $state.Browser.Connected = $true; $state.Browser.TabId = 'TAB-1'; $state.Browser.Port = 9556; $state.Browser.ProfileDir = 'C:\Audit'
+        $state.Browser.LaunchedByDesigner = $true; $state.Browser.LaunchedPid = 4242
+        Mock Get-Process { [pscustomobject]@{ Id = 4242 } } -ParameterFilter { $Id -eq 4242 }
+        Mock Stop-EdgeProcess { }
+        Mock New-CaptureDesktop { throw 'No real virtual desktop in a test.' }
+        Mock Send-KeyChord { throw 'No keystrokes in a test.' }
+        Mock Connect-DesignerBrowser { $State.Browser.Connected = $true; $State.Browser.TabId = 'TAB-2' }
+        Mock Set-DesignerLayout { [pscustomobject]@{ Ok = $true; Message = '' } }
+        Mock Clear-PageZoom { }
+        Mock Get-DevToolsTargetList { @() }
+        $config = New-RunTestConfig 'normal'
+        $config['browser']['useVirtualDesktop'] = $true
+        $run = Start-TestRun $state 'normal' -Config $config
+        $script:Started.Add($run)
+        Should -Invoke Stop-EdgeProcess -Times 1 -Exactly
+        $state.Browser.LaunchedByDesigner | Should -BeFalse
+        $run.Arguments | Should -Not -Contain '-TabId'
+        $run.Arguments | Should -Not -Contain '-UseVirtualDesktop:$false'
+        $data = Wait-TestRun $state
+        $data.state | Should -Be 'done'
+        $data.virtualDesktop | Should -Be 'used'
+        ($data.notes -join ' ') | Should -Match 'closes the audit Edge it opened'
+        Should -Invoke Connect-DesignerBrowser -Times 1 -Exactly
+        Should -Invoke New-CaptureDesktop -Times 0
+        # An Edge the Designer only found is never closed: the run goes without the desktop.
+        $state.Browser.LaunchedByDesigner = $false; $state.Browser.LaunchedPid = 0
+        $run = Start-TestRun $state 'normal' -Config $config
+        $script:Started.Add($run)
+        Should -Invoke Stop-EdgeProcess -Times 1 -Exactly
+        $run.Arguments | Should -Contain '-UseVirtualDesktop:$false'
+        $run.Arguments | Should -Contain '-TabId'
+        $data = Wait-TestRun $state
+        $data.virtualDesktop | Should -Be 'skipped'
+        ($data.notes -join ' ') | Should -Match 'does not use a separate virtual desktop'
+    }
+
+    It 'stops a run cleanly when the Designer is closed from the panel (/api/shutdown {stopRun})' {
+        $state = New-RunTestState 'shutdown'
+        $run = Start-TestRun $state 'stop'
+        $script:Started.Add($run)
+        [void](Wait-TestRun $state -Until { (Get-DesignerRunData -State $state).state -eq 'running' })
+        $r = Invoke-TestRoute POST '/api/shutdown' ([ordered]@{ stopRun = $true }) -State $state
+        $r.Status | Should -Be 200
+        $r.Data.waiting | Should -BeTrue
+        $state.Running | Should -BeTrue
+        $data = Wait-TestRun $state
+        $data.state | Should -Be 'done'
+        $data.stopped | Should -BeTrue
+        $state.Running | Should -BeFalse
+        $state.StopReason | Should -Match 'run was stopped'
+    }
+
+    It 'stops a run first when the Designer ends some other way (window closed, Ctrl+C), forcing it after the grace time' {
+        $state = New-RunTestState 'exit'
+        $run = Start-TestRun $state 'ignorestop'
+        $script:Started.Add($run)
+        $childId = $run.ProcessId
+        [void](Wait-TestRun $state -Until { (Get-DesignerRunData -State $state).state -eq 'running' })
+        $run.GraceSec = 1
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        Stop-DesignerRunForExit -State $state 6>$null
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 8
+        $state.Run.State | Should -Be 'failed'
+        $state.Run.Forced | Should -BeTrue
+        Get-Process -Id $childId -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
+        Remove-DesignerSessionFolder -State $state
+        $state.SessionFolder | Should -Not -Exist
+    }
+}
+
+Describe 'A real run from the Designer (vouch.ps1 as a child, headless Edge, page capture area)' -Tag 'Integration' {
+    BeforeAll {
+        $script:RealWeb = Get-FreeTcpPort
+        $script:RealBase = "http://localhost:$($script:RealWeb)"
+        $script:RealServer = Start-TestServer -Port $script:RealWeb
+        $script:RealCdp = Get-FreeTcpPort
+        $script:RealProfile = Join-Path ([System.IO.Path]::GetTempPath()) "vouch-designer-realrun-$($script:RealCdp)"
+        [void](Start-HeadlessEdge -Port $script:RealCdp -ProfileDir $script:RealProfile)
+        Close-CdpSocket
+        $script:S = New-TestState
+        $script:S.SessionFolder = Join-Path $TestDrive 'Sitzung ''q'' $x %USERNAME% & é (1)'
+        $script:S.OpenLog = Join-Path $TestDrive 'opened.txt'
+        $script:S.Browser.TypedPort = $script:RealCdp
+        $script:S.Browser.TypedProfileDir = $script:RealProfile
+        $script:S.Browser.AllowLaunch = $false
+        Connect-DesignerBrowser -State $script:S
+        Set-NavigationMarker
+        [void](Send-CdpCommand -Method 'Page.navigate' -Params @{ url = "$($script:RealBase)/ok" })
+        [void](Wait-PageReady -TimeoutSec 15)
+        $script:RealTab = $script:S.Browser.TabId
+        $script:RealWidth = Invoke-CdpEval -Expression 'window.innerWidth'
+
+        # The saved file: relative output folder, read from the file's own folder.
+        $script:RealFolder = Join-Path $TestDrive 'Prüfung ''saved'' & 100% (Q3)'
+        [void](New-Item -ItemType Directory -Path $script:RealFolder -Force)
+        $config = Get-DefaultVouchConfig
+        $config['defaults']['captureArea'] = 'page'
+        $config['defaults']['settleSeconds'] = 0.1
+        $config['defaults']['navigationTimeoutSec'] = 10
+        $config['output']['dir'] = 'out'
+        $config['output']['reportName'] = 'proof {title}'
+        $config['output']['jsonSummary'] = $true
+        $config['report']['title'] = 'Saved title'
+        $config['pages'].Add([ordered]@{ id = 'p001'; name = 'Plain page'; url = "$($script:RealBase)/ok"; overrides = [ordered]@{ zoomPercent = 50 } })
+        $config['pages'].Add([ordered]@{ id = 'p002'; name = 'Tabs'; url = "$($script:RealBase)/tabs"; actions = @([ordered]@{ type = 'clickText'; text = 'General' }, [ordered]@{ type = 'capture'; label = 'General' }) })
+        $config['pages'].Add([ordered]@{ id = 'p003'; name = 'Switched off'; url = "$($script:RealBase)/ok"; enabled = $false })
+        $script:RealFile = Join-Path $script:RealFolder 'captures.json'
+        [void](Save-VouchConfig -Config $config -Path $script:RealFile)
+        $script:RealKnown = Add-DesignerKnownPath -State $script:S -Path $script:RealFile -Kind config
+        $script:RealBytes = [System.IO.File]::ReadAllBytes($script:RealFile)
+        # What the panel shows: the saved file plus an edit that was not saved, with every quoting hazard.
+        $script:Hazard = 'Q3 R&D ''review'' "quoted" $HOME %USERNAME% `n é (draft)'
+        $script:Shown = Read-DesignerConfigFile -Path $script:RealFile
+        $script:Shown.Config['report']['title'] = $script:Hazard
+
+        function Wait-RealRun([int]$TimeoutSec = 90, [scriptblock]$Until = $null) {
+            $deadline = (Get-Date).AddSeconds($TimeoutSec)
+            while ((Get-Date) -lt $deadline) {
+                Update-DesignerRun -State $script:S
+                if ($null -ne $Until) { if (& $Until) { break } }
+                elseif (-not (Test-DesignerRunActive -State $script:S)) { break }
+                Start-Sleep -Milliseconds 150
+            }
+            return Get-DesignerRunData -State $script:S
+        }
+        function Get-PreviewResponse([string]$Path, [switch]$NoToken) {
+            $headers = New-GoodHeaders $script:S
+            if ($NoToken) { $headers.Remove('X-Vouch-Token') }
+            return Invoke-DesignerExchange -Method GET -Path $Path -Headers $headers -State $script:S
+        }
+    }
+    AfterAll {
+        if ($null -ne $script:S -and $null -ne $script:S.Run.Process) { Stop-DesignerChildProcess -Process $script:S.Run.Process }
+        Close-CdpSocket
+        Stop-HeadlessEdge -ProfileDir $script:RealProfile
+        if ($null -ne $script:RealServer) { Stop-Process -Id $script:RealServer.Id -Force -ErrorAction SilentlyContinue }
+        Remove-DirectoryWithRetry -Path $script:RealProfile
+    }
+
+    It 'runs every page as shown (unsaved edits included), hands the browser over and takes it back, and the report verifies' {
+        $script:S.Browser.Connected | Should -BeTrue
+        # A pick and a zoom preview in progress end before the run.
+        [void](Set-DesignerZoomPreview -State $script:S -Percent 50)
+        [void](Start-ElementPick -State $script:S -Mode click)
+        $script:S.Pick.State | Should -Be 'picking'
+        $r = Invoke-TestRoute POST '/api/run' ([ordered]@{ config = $script:Shown.Config; path = $script:RealKnown; kind = 'full' }) -State $script:S
+        $r.Status | Should -Be 200 -Because ($r.Data | ConvertTo-Json -Depth 5)
+        $r.Data.unsaved | Should -BeTrue
+        $script:S.Pick.State | Should -Be 'cancelled'
+        $script:S.Browser.ZoomPercent | Should -Be 100
+        # During the run the Designer has no connection and leaves the browser alone.
+        $during = Wait-RealRun -Until { (Get-DesignerRunData -State $script:S).state -eq 'running' }
+        $during.state | Should -Be 'running'
+        $script:CdpSocket | Should -BeNullOrEmpty
+        $script:S.Browser.Connected | Should -BeFalse
+        (Invoke-TestRoute GET '/api/browser/current' -State $script:S).Status | Should -Be 409
+        (Invoke-TestRoute POST '/api/pick/start' ([ordered]@{ mode = 'click' }) -State $script:S).Status | Should -Be 409
+        $data = Wait-RealRun
+        $data.state | Should -Be 'done' -Because "$($data.message) $($data.errorText)"
+        $data.exitCode | Should -Be 0
+        $types = @($data.events | ForEach-Object { $_['type'] } | Where-Object { $_ -in 'runStart', 'pageStart', 'pageEnd', 'runEnd' })
+        $types | Should -Be @('runStart', 'pageStart', 'pageEnd', 'pageStart', 'pageEnd', 'runEnd')
+        @($data.pages | ForEach-Object { $_.pageId }) | Should -Be @('p001', 'p002')
+        # Relative output folder: next to the SAVED file.
+        $out = Join-Path $script:RealFolder 'out'
+        Split-Path $data.reportPath -Parent | Should -Be $out
+        # The unsaved title, with every hazard, reached the engine exactly.
+        $summary = Get-Content -Raw -LiteralPath ([System.IO.Path]::ChangeExtension($data.reportPath, '.json')) | ConvertFrom-Json
+        $summary.ReportDetails.Title | Should -BeExactly $script:Hazard
+        (Get-Content -Raw -LiteralPath $data.logPath) | Should -Match ([regex]::Escape("Definition file: $($script:S.SessionFolder)"))
+        # The saved file was never written.
+        [System.IO.File]::ReadAllBytes($script:RealFile) | Should -Be $script:RealBytes
+        # -Verify on the report, from the real script.
+        $verify = Start-Process -FilePath (Get-Process -Id $PID).Path -Wait -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $TestDrive 'verify.txt') -ArgumentList '-NoProfile', '-File', "`"$script:VouchPath`"", '-Verify', "`"$($data.reportPath)`""
+        $verify.ExitCode | Should -Be 0
+        # Connected again to the same tab, no zoom left.
+        $script:S.Browser.Connected | Should -BeTrue
+        $script:S.Browser.TabId | Should -Be $script:RealTab
+        Invoke-CdpEval -Expression 'window.innerWidth' | Should -Be $script:RealWidth
+    }
+
+    It 'opens only what this run produced, by kind, never a path from the request' {
+        $data = Get-DesignerRunData -State $script:S
+        Remove-Item -LiteralPath $script:S.OpenLog -ErrorAction SilentlyContinue
+        (Invoke-TestRoute POST '/api/open' ([ordered]@{ what = 'report'; path = 'C:\Windows\win.ini' }) -State $script:S).Status | Should -Be 200
+        (Invoke-TestRoute POST '/api/open' ([ordered]@{ what = 'folder' }) -State $script:S).Status | Should -Be 200
+        (Invoke-TestRoute POST '/api/open' ([ordered]@{ what = 'log' }) -State $script:S).Status | Should -Be 200
+        (Invoke-TestRoute POST '/api/open' ([ordered]@{ what = 'zip' }) -State $script:S).Status | Should -Be 409
+        (Invoke-TestRoute POST '/api/open' ([ordered]@{ what = 'C:\Windows\win.ini' }) -State $script:S).Status | Should -Be 400
+        $opened = @(Get-Content -LiteralPath $script:S.OpenLog)
+        $opened | Should -Be @("report|$($data.reportPath)", "folder|$(Split-Path $data.reportPath -Parent)", "log|$($data.logPath)")
+    }
+
+    It 'tests one page (switched off, too) into a preview folder, never the output folder, and clears its zoom' {
+        $out = Join-Path $script:RealFolder 'out'
+        $before = @(Get-ChildItem -LiteralPath $out -Recurse | ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" })
+        foreach ($id in 'p003', 'p001') {
+            $r = Invoke-TestRoute POST '/api/run' ([ordered]@{ config = $script:Shown.Config; path = $script:RealKnown; kind = 'page'; pageId = $id }) -State $script:S
+            $r.Status | Should -Be 200
+            $data = Wait-RealRun
+            $data.state | Should -Be 'done' -Because "$($data.message) $($data.errorText)"
+            $data.kind | Should -Be 'page'
+            @($data.pages).Count | Should -Be 1
+            $data.pages[0].pageId | Should -Be $id
+            $data.previewAvailable | Should -BeTrue
+            @($data.preview.images).Count | Should -Be 1
+            $data.pageResults[$id].kind | Should -Be 'page'
+        }
+        # p001 runs at 50%: the engine cleared it at the end, and the Designer shows no zoom.
+        Invoke-CdpEval -Expression 'window.innerWidth' | Should -Be $script:RealWidth
+        $script:S.Browser.ZoomPercent | Should -Be 100
+        $script:S.Browser.TabId | Should -Be $script:RealTab
+        $after = @(Get-ChildItem -LiteralPath $out -Recurse | ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" })
+        $after | Should -Be $before
+        [System.IO.File]::ReadAllBytes($script:RealFile) | Should -Be $script:RealBytes
+        $folder = $script:S.Run.PreviewFolder
+        $folder | Should -BeLike "$($script:S.SessionFolder)\preview-p001-*"
+        Split-Path $data.reportPath -Parent | Should -Be $folder
+        (Get-ChildItem -LiteralPath (Join-Path $folder 'images') -Recurse -Filter *.jpg).Count | Should -Be 1
+        $script:PreviewUrl = $data.preview.images[0].url
+        $script:PreviewData = $data
+    }
+
+    It 'serves the preview images only with the token, only the files this run made, nothing else' {
+        $data = $script:PreviewData
+        $id = $data.preview.id
+        $name = $data.preview.images[0].name
+        $ok = Get-PreviewResponse $script:PreviewUrl
+        $ok.Status | Should -Be 200
+        $ok.ContentType | Should -Be 'image/jpeg'
+        $file = Join-Path $script:S.Run.PreviewFolder (Join-Path 'images' (Join-Path ([System.IO.Path]::GetFileNameWithoutExtension($data.reportPath)) $name))
+        $ok.Body | Should -Be ([System.IO.File]::ReadAllBytes($file))
+        (Get-DesignerSecurityHeader)['X-Content-Type-Options'] | Should -Be 'nosniff'
+        (Get-PreviewResponse $script:PreviewUrl -NoToken).Status | Should -Be 403
+        $reportName = [Uri]::EscapeDataString([System.IO.Path]::GetFileName($data.reportPath))
+        foreach ($path in @(
+                "/preview/$id/", "/preview/$id", "/preview/$id/$reportName", "/preview/$id/SHA256SUMS",
+                "/preview/$id/..%2F..%2F$reportName", "/preview/$id/..%5C..%5C$reportName", "/preview/$id/../$name",
+                "/preview/$id/$name/x", "/preview/0000$id/$name", "/preview/$($id.ToUpperInvariant())/$name", '/preview/')) {
+            (Get-PreviewResponse $path).Status | Should -Be 404 -Because $path
+        }
+    }
+
+    It 'replaces the preview with a newer test of the same page, and removes everything when the Designer stops' {
+        $oldFolder = $script:S.Run.PreviewFolder
+        $r = Invoke-TestRoute POST '/api/run' ([ordered]@{ config = $script:Shown.Config; path = $script:RealKnown; kind = 'page'; pageId = 'p001' }) -State $script:S
+        $r.Status | Should -Be 200
+        $oldFolder | Should -Not -Exist
+        (Get-PreviewResponse $script:PreviewUrl).Status | Should -Be 404
+        $data = Wait-RealRun
+        $data.state | Should -Be 'done'
+        (Get-PreviewResponse $data.preview.images[0].url).Status | Should -Be 200
+        # The preview of the other page (p003) is still there until the Designer stops.
+        @($script:S.Previews.Values | ForEach-Object { $_.PageId }) | Sort-Object | Should -Be @('p001', 'p003')
+        Remove-DesignerSessionFolder -State $script:S
+        (Get-PreviewResponse $data.preview.images[0].url).Status | Should -Be 404
+        $script:S.SessionFolder | Should -Not -Exist
+        $script:S.SessionFolder = Join-Path $TestDrive 'session two'
+    }
+
+    It 'stops a real run in the middle; the engine ends the page and still writes the report' {
+        $config = Copy-VouchConfig -Config $script:Shown.Config
+        $config['pages'][0]['actions'] = @([ordered]@{ type = 'wait'; seconds = 60 }, [ordered]@{ type = 'capture' })
+        $r = Invoke-TestRoute POST '/api/run' ([ordered]@{ config = $config; path = $script:RealKnown; kind = 'full' }) -State $script:S
+        $r.Status | Should -Be 200
+        [void](Wait-RealRun -Until { @((Get-DesignerRunData -State $script:S).pages).Count -ge 1 })
+        Start-Sleep -Milliseconds 500
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        (Invoke-TestRoute POST '/api/run/stop' -State $script:S).Data.state | Should -Be 'stopping'
+        $data = Wait-RealRun
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 30
+        $data.state | Should -Be 'done'
+        $data.stopped | Should -BeTrue
+        $data.pages[0].status | Should -Be 'WARNING'
+        ($data.pages[0].details -join ' ') | Should -Match 'Stopped by the user'
+        $data.reportPath | Should -Exist
+        $data.message | Should -Match '^Stopped by you'
+        $script:S.Browser.Connected | Should -BeTrue
+    }
+}
+
+Describe 'Running and testing from the panel (two headless Edges, real server)' -Tag 'Integration' {
+    BeforeAll {
+        $script:RunUiWeb = Get-FreeTcpPort
+        $script:RunUiBase = "http://localhost:$($script:RunUiWeb)"
+        $script:RunUiServer = Start-TestServer -Port $script:RunUiWeb
+        $script:RunAuditCdp = Get-FreeTcpPort
+        $script:RunAuditProfile = Join-Path ([System.IO.Path]::GetTempPath()) "vouch-designer-runui-audit-$($script:RunAuditCdp)"
+        [void](Start-HeadlessEdge -Port $script:RunAuditCdp -ProfileDir $script:RunAuditProfile)
+        $script:RunSockets = @{}
+        $script:RunCurrent = ''
+        function Use-RunCdp([string]$Name) {
+            if ($script:RunCurrent) { $script:RunSockets[$script:RunCurrent] = @{ Socket = $script:CdpSocket; Url = $script:CdpWebSocketUrl; Id = $script:CdpMessageId } }
+            $saved = $script:RunSockets[$Name]
+            $script:CdpSocket = $saved.Socket; $script:CdpWebSocketUrl = $saved.Url; $script:CdpMessageId = $saved.Id
+            $script:RunCurrent = $Name
+        }
+        function Connect-RunTab([string]$Name, [int]$Port) {
+            if ($script:RunCurrent) { Use-RunCdp $script:RunCurrent; $script:CdpSocket = $null }
+            $target = Get-CdpPageTarget -Port $Port -WaitSeconds 5 -TabId ''
+            Connect-CdpSocket -WebSocketUrl ([string]$target.webSocketDebuggerUrl)
+            $script:RunCurrent = $Name
+            $script:RunSockets[$Name] = @{ Socket = $script:CdpSocket; Url = $script:CdpWebSocketUrl; Id = $script:CdpMessageId }
+        }
+        $script:CdpPort = 0
+        $script:CdpSocket = $null
+        Connect-RunTab -Name 'audit' -Port $script:RunAuditCdp
+        Set-NavigationMarker
+        [void](Send-CdpCommand -Method 'Page.navigate' -Params @{ url = "$($script:RunUiBase)/ok" })
+        [void](Wait-PageReady -TimeoutSec 15)
+
+        $folder = Join-Path $TestDrive 'runui'
+        [void](New-Item -ItemType Directory -Path $folder -Force)
+        $config = Get-DefaultVouchConfig
+        $config['defaults']['captureArea'] = 'page'
+        $config['defaults']['settleSeconds'] = 0.1
+        $config['defaults']['navigationTimeoutSec'] = 10
+        $config['output']['dir'] = 'out'
+        $config['pages'].Add([ordered]@{ id = 'p001'; name = 'Plain page'; url = "$($script:RunUiBase)/ok" })
+        $config['pages'].Add([ordered]@{ id = 'p002'; name = 'Tall page'; url = "$($script:RunUiBase)/tall?px=2200"; actions = @([ordered]@{ type = 'capture'; scroll = [ordered]@{ mode = 'page' } }) })
+        $script:RunUiFile = Join-Path $folder 'panel runs.json'
+        [void](Save-VouchConfig -Config $config -Path $script:RunUiFile)
+        $script:RunUiBytes = [System.IO.File]::ReadAllBytes($script:RunUiFile)
+        $script:RunUiOpenLog = Join-Path $TestDrive 'runui-opened.txt'
+        $script:RunUi = Start-DesignerTestServer -ConfigPath $script:RunUiFile -Name 'runui' -AuditPort $script:RunAuditCdp -AuditProfile $script:RunAuditProfile -RunScript $script:FakeChildPath -OpenLog $script:RunUiOpenLog
+
+        $script:RunPanelCdp = Get-FreeTcpPort
+        $script:RunPanelProfile = Join-Path ([System.IO.Path]::GetTempPath()) "vouch-designer-runui-panel-$($script:RunPanelCdp)"
+        [void](Start-HeadlessEdge -Port $script:RunPanelCdp -ProfileDir $script:RunPanelProfile)
+        Connect-RunTab -Name 'panel' -Port $script:RunPanelCdp
+        $collector = @'
+window.__errs = [];
+window.addEventListener('error', e => window.__errs.push('error: ' + (e.message || e.type) + ' ' + (e.filename || '')), true);
+window.addEventListener('unhandledrejection', e => window.__errs.push('rejection: ' + ((e.reason && e.reason.message) || e.reason)));
+document.addEventListener('securitypolicyviolation', e => window.__errs.push('csp: ' + e.violatedDirective + ' ' + e.blockedURI));
+const vouchConsoleError = console.error;
+console.error = function () { window.__errs.push('console: ' + Array.from(arguments).join(' ')); return vouchConsoleError.apply(console, arguments); };
+'@
+        [void](Send-CdpCommand -Method 'Page.enable')
+        [void](Send-CdpCommand -Method 'Page.addScriptToEvaluateOnNewDocument' -Params @{ source = $collector })
+        [void](Send-CdpCommand -Method 'Emulation.setDeviceMetricsOverride' -Params @{ width = 480; height = 900; deviceScaleFactor = 1; mobile = $false })
+        Set-NavigationMarker
+        [void](Send-CdpCommand -Method 'Page.navigate' -Params @{ url = $script:RunUi.Url })
+        [void](Wait-PageReady -TimeoutSec 15)
+        [void](Invoke-CdpEval -Expression 'window.VouchDesigner.ready.then(() => true)' -TimeoutSec 20)
+        [void](Invoke-CdpEval -Expression @'
+window.__field = path => Array.from(document.querySelectorAll('[data-path]')).find(e => e.dataset.path === path && e.type !== 'radio');
+window.__type = (path, value) => { const el = window.__field(path); if (!el) throw new Error('no field ' + path); el.value = value; el.dispatchEvent(new Event('input', { bubbles: true })); };
+true
+'@)
+        function Invoke-RunPanel([string]$Script, [int]$TimeoutSec = 60) {
+            Use-RunCdp 'panel'
+            $json = Invoke-CdpEval -TimeoutSec $TimeoutSec -Expression "(async () => { const D = window.VouchDesigner; const S = D.S; const until = async (f, ms) => { const end = Date.now() + (ms || 10000); while (Date.now() < end) { const v = f(); if (v) return v; await new Promise(r => setTimeout(r, 100)); } return null; }; const btnByKey = k => Array.from(document.querySelectorAll('button')).find(b => b.dataset.fkey === k); const r = await (async () => { $Script })(); return JSON.stringify(r === undefined ? null : r); })()"
+            if ($null -eq $json) { return $null }
+            return $json | ConvertFrom-Json -Depth 64
+        }
+        function Get-RunUiChild {
+            # The stand-in run the server started (its command line names FakeVouchChild.ps1).
+            return @(Get-CimInstance -ClassName Win32_Process -Filter "Name='pwsh.exe'" | Where-Object { $_.CommandLine -and $_.CommandLine.Contains('FakeVouchChild.ps1') -and $_.ParentProcessId -eq $script:RunUi.Process.Id })
+        }
+    }
+    AfterAll {
+        foreach ($name in @($script:RunSockets.Keys)) { Use-RunCdp $name; Close-CdpSocket }
+        $script:RunCurrent = ''
+        if ($null -ne $script:RunUi) { Stop-Process -Id $script:RunUi.Process.Id -Force -ErrorAction SilentlyContinue }
+        Get-RunUiChild | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Stop-HeadlessEdge -ProfileDir $script:RunPanelProfile
+        Stop-HeadlessEdge -ProfileDir $script:RunAuditProfile
+        if ($null -ne $script:RunUiServer) { Stop-Process -Id $script:RunUiServer.Id -Force -ErrorAction SilentlyContinue }
+        Remove-DirectoryWithRetry -Path $script:RunPanelProfile
+        Remove-DirectoryWithRetry -Path $script:RunAuditProfile
+    }
+
+    It 'shows what a run would do before it starts, and says when unsaved edits run' {
+        $r = Invoke-RunPanel @'
+await until(() => S.browser.connected && S.capabilities.run, 15000);
+D.setTab('run');
+await D.refreshRunPlan();
+const saved = { text: document.querySelector('#panel-run').textContent, unsaved: S.runPlan.unsaved, folder: S.runPlan.outputFolder };
+D.setTab('report');
+__type('report.title', 'Edited in the panel');
+D.setTab('run');
+// The plan follows edits by itself (debounced); wait for the one made with this edit.
+await until(() => S.runPlan && S.runPlan.unsaved, 8000);
+await new Promise(r => setTimeout(r, 100));
+const edited = document.querySelector('#panel-run .run-plan').textContent;
+return { saved, edited, runAll: btnByKey('run-all').getAttribute('aria-disabled') };
+'@
+        $r.saved.unsaved | Should -BeFalse
+        $r.saved.folder | Should -Be (Join-Path (Split-Path $script:RunUiFile -Parent) 'out')
+        $r.saved.text | Should -Match ([regex]::Escape("Reports of a full run go to: $($r.saved.folder)"))
+        $r.saved.text | Should -Not -Match 'Running your current edits'
+        $r.edited | Should -Match 'Running your current edits \(not yet saved\)\. The saved file is not changed by a run\.'
+        $r.edited | Should -Match 'What the Designer adds'
+        $r.runAll | Should -BeNullOrEmpty
+    }
+
+    It 'blocks a run with problems, with the list Save shows' {
+        $r = Invoke-RunPanel @'
+const before = S.run.number;
+D.setTab('pages'); D.selectPage(0);
+__type('pages[0].url', 'intranet.example.com');
+D.setTab('run');
+const going = D.startRun('all');
+await until(() => document.querySelector('#modal').open, 5000);
+const title = document.querySelector('#modal-title').textContent, body = document.querySelector('#modal-body').textContent;
+document.querySelector('#modal').close();
+const started = await going;
+D.setTab('pages'); __type('pages[0].url', S.savedJson ? JSON.parse(S.savedJson).pages[0].url : '');
+return { title, body, started, same: S.run.number === before };
+'@
+        $r.title | Should -Be 'Not run'
+        $r.body | Should -Match 'Address \(URL\)'
+        $r.started | Should -BeFalse
+        $r.same | Should -BeTrue
+    }
+
+    It 'runs all pages from the button: live progress per page, the result, and links that open this run''s files' {
+        $r = Invoke-RunPanel -TimeoutSec 120 @'
+D.setTab('run');
+btnByKey('run-all').click();
+const running = await until(() => ['running', 'starting'].includes(S.run.state) && document.querySelector('.run-state').textContent, 10000);
+const strip = await until(() => S.browser.inRun && document.querySelector('#browser-strip').textContent, 8000);
+const stopShown = !!btnByKey('run-stop');
+await until(() => S.run.state === 'done' || S.run.state === 'failed', 90000);
+await until(() => S.browser.connected, 15000);
+const pages = Array.from(document.querySelectorAll('.run-page')).map(li => ({ name: li.querySelector('.run-page-name').textContent, chip: li.querySelector('.chip').textContent, count: li.querySelector('.run-page-count').textContent, details: li.querySelector('details') ? li.querySelector('details summary').textContent : '' }));
+const message = document.querySelector('#panel-run .run-message').textContent;
+btnByKey('open-report').click(); await new Promise(r => setTimeout(r, 300));
+btnByKey('open-folder').click(); await new Promise(r => setTimeout(r, 300));
+btnByKey('open-log').click(); await new Promise(r => setTimeout(r, 300));
+D.setTab('pages');
+const chips = Array.from(document.querySelectorAll('.page-row .chip')).map(c => c.textContent);
+D.setTab('run');
+return { running, strip, stopShown, state: S.run.state, pages, message, report: S.run.reportPath, log: S.run.logPath, chips, unsaved: S.run.unsaved, zip: !!btnByKey('open-zip') };
+'@
+        $r.state | Should -Be 'done' -Because $r.message
+        $r.running | Should -Match 'Running|Starting'
+        $r.strip | Should -Match 'A run is using the audit browser'
+        $r.stopShown | Should -BeTrue
+        $r.unsaved | Should -BeTrue
+        @($r.pages).Count | Should -Be 2
+        $r.pages[0].name | Should -Be 'Plain page'
+        $r.pages[0].chip | Should -Be 'OK'
+        $r.pages[0].count | Should -Be '1 image'
+        $r.pages[1].chip | Should -BeIn 'OK', 'Warning'
+        $r.message | Should -Match '^Finished'
+        $r.zip | Should -BeFalse
+        @($r.chips | Where-Object { $_ -match '^Run (OK|: warning) \d\d:\d\d$' }).Count | Should -Be 2
+        $opened = @(Get-Content -LiteralPath $script:RunUiOpenLog)
+        $opened | Should -Be @("report|$($r.report)", "folder|$(Split-Path $r.report -Parent)", "log|$($r.log)")
+        $r.report | Should -Exist
+        Split-Path $r.report -Parent | Should -Be (Join-Path (Split-Path $script:RunUiFile -Parent) 'out')
+        (Get-Content -Raw -LiteralPath $r.report) | Should -Match 'Edited in the panel'
+        [System.IO.File]::ReadAllBytes($script:RunUiFile) | Should -Be $script:RunUiBytes
+    }
+
+    It 'tests the selected page from its editor and shows the screenshots as a preview' {
+        $r = Invoke-RunPanel -TimeoutSec 120 @'
+D.setTab('pages'); D.selectPage(1);
+btnByKey('test-page').click();
+await until(() => S.tab === 'run' && S.run.kind === 'page', 10000);
+await until(() => S.run.state === 'done' || S.run.state === 'failed', 90000);
+await until(() => document.querySelectorAll('.thumb-img').length > 0, 15000);
+const imgs = Array.from(document.querySelectorAll('.thumb-img')).map(i => ({ src: i.getAttribute('src').slice(0, 23), ok: i.complete && i.naturalWidth > 0 }));
+const heading = document.querySelector('.preview-block h3').textContent;
+document.querySelector('.thumb').click();
+await until(() => document.querySelector('#modal').open, 3000);
+const large = document.querySelector('#modal-body img.preview-large');
+const largeOk = !!large && large.getAttribute('src').startsWith('data:image/jpeg;base64,');
+document.querySelector('#modal').close();
+btnByKey('open-preview').click(); await new Promise(r => setTimeout(r, 300));
+D.setTab('pages');
+const chip = document.querySelectorAll('.page-row .chip')[1].textContent;
+D.setTab('run');
+return { state: S.run.state, imgs, heading, largeOk, chip, count: S.run.preview.images.length, segments: S.run.preview.images.map(i => i.segmentCount) };
+'@
+        $r.state | Should -Be 'done'
+        $r.heading | Should -Be 'Preview of the page test: Tall page'
+        @($r.imgs).Count | Should -Be $r.count
+        @($r.imgs).Count | Should -BeGreaterThan 1
+        foreach ($img in $r.imgs) { $img.src | Should -Be 'data:image/jpeg;base64,'; $img.ok | Should -BeTrue }
+        $r.largeOk | Should -BeTrue
+        $r.chip | Should -Match '^Test (OK|: warning) \d\d:\d\d$'
+        (Get-Content -LiteralPath $script:RunUiOpenLog)[-1] | Should -Match '^preview-report\|.*\\VouchDesigner-\d+-[0-9a-f]+\\preview-p002-'
+    }
+
+    It 'shows a run that waits for the person in the Vouch window, and stops it from the panel' {
+        $r = Invoke-RunPanel -TimeoutSec 90 @'
+S.config.name = 'fake:prompt';
+D.setTab('run');
+btnByKey('run-all').click();
+const waiting = await until(() => S.run.state === 'waitingForUser' && document.querySelector('#panel-run .callout[role=alert]'), 20000);
+const text = waiting ? waiting.textContent : '';
+const status = document.querySelector('.run-state').textContent;
+btnByKey('run-stop').click();
+const stopping = await until(() => S.run.state === 'stopping' || S.run.state === 'done', 5000);
+await until(() => S.run.state === 'done' || S.run.state === 'failed', 30000);
+return { text, status, stopping: !!stopping, state: S.run.state, stopped: S.run.stopped, message: S.run.message };
+'@
+        $r.text | Should -Match 'Waiting for you in the Vouch window over the browser'
+        $r.text | Should -Match 'Vouch has paused'
+        $r.status | Should -Match 'Waiting for your answer'
+        $r.stopping | Should -BeTrue
+        $r.state | Should -Be 'done'
+        $r.stopped | Should -BeTrue
+        $r.message | Should -Match '^Stopped by you'
+    }
+
+    It 'shows live progress while a run goes, and a run that failed with what it said' {
+        $r = Invoke-RunPanel -TimeoutSec 90 @'
+S.config.name = 'fake:slow';
+D.setTab('run');
+btnByKey('run-all').click();
+const firstDone = await until(() => S.run.state === 'running' && Array.from(document.querySelectorAll('.run-page .chip')).some(c => c.textContent === 'OK') && Array.from(document.querySelectorAll('.run-page .chip')).some(c => c.textContent === 'Running…'), 20000);
+const liveStatus = document.querySelector('.run-state').textContent;
+btnByKey('run-stop').click();
+await until(() => S.run.state === 'done' || S.run.state === 'failed', 30000);
+S.config.name = 'fake:die';
+btnByKey('run-all').click();
+await until(() => S.run.state === 'failed', 30000);
+const callout = document.querySelector('#panel-run .callout-error');
+return { live: !!firstDone, liveStatus, state: S.run.state, failed: callout ? callout.textContent : '', errs: window.__errs };
+'@
+        $r.live | Should -BeTrue
+        $r.liveStatus | Should -Match 'Running…'
+        $r.liveStatus | Should -Match 'of 6 pages done'
+        $r.state | Should -Be 'failed'
+        $r.failed | Should -Match 'ended unexpectedly \(exit code 7\)'
+        $r.failed | Should -Match 'Something broke badly inside the run'
+    }
+
+    It 'had no CSP violation, error or rejection in the whole session' {
+        $r = Invoke-RunPanel 'return { errs: window.__errs, collector: Array.isArray(window.__errs) };'
+        $r.collector | Should -BeTrue
+        @($r.errs).Count | Should -Be 0 -Because ($r.errs -join "`n")
+    }
+
+    It 'asks before closing the Designer during a run, stops the run first, then ends' {
+        $r = Invoke-RunPanel -TimeoutSec 60 @'
+S.config.name = 'fake:slow';
+D.setTab('run');
+btnByKey('run-all').click();
+await until(() => S.run.state === 'running', 15000);
+btnByKey('btn:Close').click();
+await until(() => document.querySelector('#modal').open, 5000);
+const title = document.querySelector('#modal-title').textContent;
+Array.from(document.querySelectorAll('#modal-buttons button')).find(b => b.textContent === 'Stop the run and close').click();
+await until(() => document.querySelector('#modal').open && document.querySelector('#modal-title').textContent !== title, 3000);
+const second = document.querySelector('#modal').open ? document.querySelector('#modal-title').textContent : '';
+if (document.querySelector('#modal').open) Array.from(document.querySelectorAll('#modal-buttons button')).find(b => b.textContent === 'Don’t save').click();
+await until(() => S.closed, 10000);
+return { title, second, closed: S.closed, text: document.querySelector('#app').textContent };
+'@
+        $r.title | Should -Be 'A run is going'
+        # Unsaved changes are asked about next, in the same dialog, without the first answer closing it.
+        $r.second | Should -Be 'Save your changes first?'
+        $r.closed | Should -BeTrue
+        $r.text | Should -Match 'The run is being stopped'
+        $children = Get-RunUiChild
+        $script:RunUi.Process.WaitForExit(30000) | Should -BeTrue
+        foreach ($child in $children) { Get-Process -Id $child.ProcessId -ErrorAction SilentlyContinue | Should -BeNullOrEmpty }
+        [System.IO.File]::ReadAllBytes($script:RunUiFile) | Should -Be $script:RunUiBytes
     }
 }
