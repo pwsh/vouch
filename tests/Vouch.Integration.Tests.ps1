@@ -418,6 +418,60 @@ Plain page after the slow one,$Web/ok,,N,
     }
 }
 
+Describe 'Invoke-CaptureItem on its own (one page, desktop functions mocked)' -Tag 'Integration' {
+    # The single-page path the Designer will use: no Invoke-Main, no CSV run.
+    BeforeAll {
+        Connect-TestPage
+        Mock Set-EdgeForeground { $null }
+        Mock Get-ScreenCapture { , [byte[]](0xFF, 0xD8, 0xFF, 0xD9) }
+
+        $csv = Join-Path -Path $TestDrive -ChildPath 'single.csv'
+        @"
+Name,Url,Steps,ScrollFullPage,Notes
+Tabs with a click,$Web/tabs,clicktext:General,N,one page
+Tall page,$Web/tall?px=3000,,Y,
+"@ | Set-Content -LiteralPath $csv -Encoding utf8
+        $definitions = Import-CaptureDefinition -Path $csv
+
+        $settings = Resolve-RunSettings -BoundParameters @{} -Config $null -Defaults @{
+            NavigationTimeoutSec = 10; SettleSeconds = 0.1; ScrollSettleSeconds = 0.1; MaxScrollSegments = 10
+        }
+        $context = @{
+            RunId = [guid]::NewGuid().ToString(); Format = 'jpeg'; Quality = 85; Extension = 'jpg'
+            SaveImages = $false; ImagesDir = ''; Screen = '1x1'
+        }
+        $script:Single = Invoke-CaptureItem -Definition $definitions[0] -Settings $settings -CaptureContext $context 6>$null
+        $script:Tall = Invoke-CaptureItem -Definition $definitions[1] -Settings $settings -CaptureContext $context 6>$null
+    }
+
+    AfterAll { Close-CdpSocket }
+
+    It 'returns one item with the fields the report and the end-to-end run use' {
+        @($script:Single).Count | Should -Be 1
+        $script:Single.PSObject.Properties.Name | Should -Be @(
+            'Index', 'Name', 'Url', 'FinalUrl', 'Notes', 'StepsText', 'ScrollFullPage', 'ScrollArea',
+            'Status', 'HttpStatus', 'Details', 'StepLog', 'Captures')
+        $script:Single.Captures.GetType().Name | Should -Be 'List`1'
+    }
+
+    It 'navigates, runs the step and captures one screen' {
+        $script:Single.Status | Should -Be 'OK'
+        $script:Single.HttpStatus | Should -Be 200
+        $script:Single.FinalUrl | Should -Be "$Web/tabs"
+        $script:Single.StepLog.Count | Should -Be 1
+        $script:Single.StepLog[0].Ok | Should -BeTrue
+        $script:Single.Captures.Count | Should -Be 1
+        $script:Single.Captures[0].FileName | Should -Be '001_Tabs_with_a_click_seg01.jpg'
+    }
+
+    It 'scrolls a tall page into several segments' {
+        $script:Tall.Status | Should -Be 'OK'
+        $script:Tall.ScrollArea | Should -Be 'the page'
+        $script:Tall.Captures.Count | Should -BeGreaterOrEqual 2
+        $script:Tall.Captures[-1].SegmentCount | Should -Be $script:Tall.Captures.Count
+    }
+}
+
 Describe 'Exit codes for warning-only runs' -Tag 'Integration' {
     BeforeAll {
         $csv = Join-Path -Path $TestDrive -ChildPath 'warn.csv'
