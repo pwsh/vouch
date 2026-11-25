@@ -292,6 +292,7 @@ select.input { padding-right: var(--s5); }
 .callout-warning { background: var(--warning-soft); color: var(--text); border-color: var(--warning); }
 .callout-error { background: var(--danger-soft); color: var(--danger); border-color: var(--danger); }
 .callout-accent { background: var(--accent-soft); border-color: var(--accent); }
+#command-box { display: grid; gap: var(--s4); }
 .command { display: grid; gap: var(--s2); min-width: 0; }
 .command-head { display: flex; justify-content: space-between; align-items: center; gap: var(--s2); flex-wrap: wrap; }
 .code {
@@ -299,6 +300,9 @@ select.input { padding-right: var(--s5); }
   background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius);
   padding: var(--s2) var(--s3); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
 }
+.command-text { white-space: normal; }
+.cmd-line { display: block; padding-left: 2ch; text-indent: -2ch; white-space: pre-wrap; overflow-wrap: anywhere; }
+.busy { width: min(380px, calc(100vw - 2 * var(--s4))); }
 .cmd-variant summary { cursor: pointer; color: var(--muted); font-weight: 600; padding: var(--s1) 0; }
 .cmd-variant[open] { display: grid; gap: var(--s2); }
 .notes { margin: 0; padding-left: var(--s5); color: var(--muted); font-size: 0.93rem; display: grid; gap: var(--s1); }

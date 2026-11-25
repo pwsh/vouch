@@ -85,6 +85,34 @@
     const parent = getAt(obj, P.apply(null, keys.slice(0, -1)));
     if (isObj(parent)) delete parent[keys[keys.length - 1]];
   }
+  // The value a path had in the file as last opened or saved (undefined when absent).
+  function savedValue(path) {
+    try { return getAt(JSON.parse(S.savedJson || 'null'), path); } catch (e) { return undefined; }
+  }
+  /*
+    Clearing a field removes its key, so blanks and empty {} do not pile up in the file.
+    A key the file already had as "" (or {}) is put back as it was instead, so opening
+    a file and saving it without real edits still changes nothing.
+  */
+  function clearValue(path) {
+    const original = savedValue(path);
+    if (original === '') setAt(S.config, path, ''); else deleteAt(S.config, path);
+    const keys = parsePath(path);
+    if (keys.length >= 2 && keys[keys.length - 2] === 'overrides') {
+      const holder = P.apply(null, keys.slice(0, -1));
+      const now = getAt(S.config, holder);
+      const before = savedValue(holder);
+      if (isObj(now) && !Object.keys(now).length && !(isObj(before) && !Object.keys(before).length)) deleteAt(S.config, holder);
+    }
+  }
+  // Text whose blank means "not set" (as opposed to required text, kept so its error shows).
+  const REQUIRED_TEXT = ['name', 'url', 'selector', 'text'];
+  function isOptionalText(path) {
+    const sp = S.schema && S.schema.settings[path];
+    if (sp) return sp.type === 'string';
+    const keys = parsePath(path);
+    return keys[0] === 'pages' && !REQUIRED_TEXT.includes(keys[keys.length - 1]);
+  }
 
   // ------------------------------------------------------------------ state
   const S = {
@@ -116,12 +144,14 @@
     browser: { connected: false },
     closed: false,
     drag: -1,
+    clickStash: null,
   };
   window.VouchDesigner = { S: S };
 
   // ------------------------------------------------------------------ texts
   const LATER_BROWSER = 'This needs the link to the browser, which comes in a later step of the Designer. Until then, type the address, text or selector yourself.';
   const LATER_RUN = 'Running and testing from the Designer comes in a later step. Until then, copy the command from the Run tab into a PowerShell window.';
+  const LATER_RUN_HERE = 'Running and testing from the Designer comes in a later step. Until then, copy the command below into a PowerShell window.';
 
   const SETTING_LABELS = {
     'name': 'Configuration name',
@@ -464,18 +494,27 @@
   }
   let validateTimer = 0, validateSeq = 0;
   function scheduleValidate() { clearTimeout(validateTimer); validateTimer = setTimeout(validateNow, 350); }
+  let validating = null;
+  // Resolves once the newest check has been applied (a later one supersedes an earlier one).
   async function validateNow() {
     if (!S.config || S.closed) return;
+    clearTimeout(validateTimer);
     const seq = ++validateSeq;
-    try {
-      const result = await api('POST', '/api/config/validate', { config: S.config });
-      if (seq !== validateSeq) return;
-      S.check.errors = result.errors || [];
-      S.check.warnings = result.warnings || [];
-      S.check.preview = result.preview || null;
-      S.check.stale = false;
-      lightRender();
-    } catch (e) { if (e.status === 0) serverGone(); }
+    const run = (async () => {
+      try {
+        const result = await api('POST', '/api/config/validate', { config: S.config });
+        if (seq !== validateSeq) return;
+        S.check.errors = result.errors || [];
+        S.check.warnings = result.warnings || [];
+        S.check.preview = result.preview || null;
+        S.check.stale = false;
+        lightRender();
+      } catch (e) { if (e.status === 0) serverGone(); }
+    })();
+    validating = run;
+    let last = run;
+    await last;
+    while (validating !== last) { last = validating; await last; }
   }
   window.VouchDesigner.validateNow = validateNow;
 
@@ -513,11 +552,12 @@
   }
   function commitText(o, raw) {
     if (o.kind === 'number') {
-      if (!raw.trim()) { deleteAt(S.config, o.path); return; }
+      if (!raw.trim()) { clearValue(o.path); return; }
       const n = parseNumber(raw, o.whole);
       setAt(S.config, o.path, n === null ? raw : n);
       return;
     }
+    if (raw === '' && isOptionalText(o.path)) { clearValue(o.path); return; }
     setAt(S.config, o.path, raw);
   }
   function checkField(o) {
@@ -828,6 +868,8 @@
   }
   function renderPages() {
     const panel = $('#panel-pages');
+    // The kept-aside click value lives only as long as its editor is open.
+    if (S.clickStash && S.clickStash.path !== P('pages', S.page, 'actions', S.openAction)) S.clickStash = null;
     const pages = pagesOf(S.config);
     if (S.page >= pages.length) S.page = Math.max(0, pages.length - 1);
     const listCol = h('div', { class: 'pages-list-col' },
@@ -870,7 +912,7 @@
           path: base + '.overrides.account', label: 'Account for this page', value: accountInfo.has ? accountInfo.value : '',
           placeholder: accountInfo.base ? accountInfo.base + ' (default)' : 'The default account',
           help: 'Only when this page is captured with another sign-in than the default (Report tab).',
-          commit: raw => { if (raw.trim()) setAt(S.config, base + '.overrides.account', raw); else deleteAt(S.config, base + '.overrides.account'); },
+          commit: raw => { if (raw.trim()) setAt(S.config, base + '.overrides.account', raw); else clearValue(base + '.overrides.account'); },
         }),
         textField({ path: base + '.id', label: 'Page id', placeholder: pageId(page, i), narrow: true, mono: true, help: 'Used to run one page (-Only ' + pageId(page, i) + ').' })),
       checkField({ path: base + '.enabled', label: 'Capture this page in full runs', value: page.enabled !== false, help: 'Switch off to keep a page in the file without capturing it. “Test this page” still works.' }),
@@ -908,7 +950,7 @@
       const sp = spec('defaults.' + f.key);
       const badge = info.has
         ? h('span', { class: 'override-state' }, h('span', { class: 'chip chip-accent', text: 'Changed for this page' }),
-          btn('Reset to default', () => change(() => deleteAt(S.config, path), { render: 'all' }), { small: true, fkey: 'reset:' + path }))
+          btn('Reset to default', () => change(() => clearValue(path), { render: 'all' }), { small: true, fkey: 'reset:' + path }))
         : h('span', { class: 'chip chip-muted', text: 'Run default' });
       const help = 'Run default: ' + displayValue(f.key, info.base) + '.';
       if (f.kind === 'select') {
@@ -922,7 +964,7 @@
         placeholder: info.base === '' ? 'none' : String(info.base) + ' (run default)', help: help + (f.key === 'waitFor' ? ' A selector that must appear before anything is captured.' : ''),
         badge: badge, extra: pick,
         commit: raw => {
-          if (!raw.trim()) { deleteAt(S.config, path); return; }
+          if (!raw.trim()) { clearValue(path); return; }
           if (f.kind === 'number') { const n = parseNumber(raw, sp.type === 'int'); setAt(S.config, path, n === null ? raw : n); }
           else setAt(S.config, path, raw);
         },
@@ -965,10 +1007,10 @@
         btn('Pick something to click', () => startPick('click', { page: i }), { small: true, later: S.capabilities.pick ? null : LATER_BROWSER, fkey: 'pick-click' }),
         btn('Pick a scroll area', () => startPick('area', { page: i }), { small: true, later: S.capabilities.pick ? null : LATER_BROWSER, fkey: 'pick-area' }),
         btn('Add click', () => addAction(i, { type: 'clickText', text: '' }), { small: true, fkey: 'add-click' }),
-        btn('Add capture', () => addAction(i, { type: 'capture', label: '', scroll: { mode: 'none' } }), { small: true, fkey: 'add-capture' }),
+        btn('Add capture', () => addAction(i, { type: 'capture', scroll: { mode: 'none' } }), { small: true, fkey: 'add-capture' }),
         btn('Add wait', () => addAction(i, { type: 'wait', seconds: 2 }), { small: true, fkey: 'add-wait' }),
         btn('Add wait-for', () => addAction(i, { type: 'waitFor', selector: '' }), { small: true, fkey: 'add-waitfor' }),
-        btn('Add pause', () => addAction(i, { type: 'pause', message: '' }), { small: true, fkey: 'add-pause' })),
+        btn('Add pause', () => addAction(i, { type: 'pause' }), { small: true, fkey: 'add-pause' })),
       S.capabilities.pick ? null : laterNote('Picking in the browser comes in a later step. Until then, use “Add click” and type the words or the selector.'));
   }
   function actionEditor(i, j, action) {
@@ -986,10 +1028,18 @@
               { value: 'clickText', label: 'The words on it', help: 'Clicks the link, button or tab showing these words. Keeps working when the page’s design changes. Capital letters do not matter.' },
               { value: 'click', label: 'An exact element (selector)', help: 'For when the same words appear more than once. A selector such as #tab-users, copied from Edge (F12, right-click, Copy selector).' },
             ],
+            // The value of the other kind is kept aside while this editor is open, so
+            // switching back and forth loses nothing; only the chosen kind's value is in
+            // the configuration.
             commit: value => {
               const a = getAt(S.config, path);
-              if (value === 'click') { const text = a.text; delete a.text; a.type = 'click'; a.selector = typeof a.selector === 'string' ? a.selector : ''; if (text && !a.selector) a.selector = ''; }
-              else { delete a.selector; a.type = 'clickText'; a.text = typeof a.text === 'string' ? a.text : ''; }
+              const from = value === 'click' ? 'text' : 'selector';
+              const to = value === 'click' ? 'selector' : 'text';
+              if (!S.clickStash || S.clickStash.path !== path) S.clickStash = { path: path, values: {} };
+              if (typeof a[from] === 'string') S.clickStash.values[from] = a[from];
+              delete a[from];
+              a.type = value;
+              a[to] = typeof S.clickStash.values[to] === 'string' ? S.clickStash.values[to] : (typeof a[to] === 'string' ? a[to] : '');
             },
           }),
           byText
@@ -1052,7 +1102,7 @@
   }
   function ensurePages(c) { if (!Array.isArray(c.pages)) c.pages = []; return c.pages; }
   function addPage(fields) {
-    const page = Object.assign({ id: nextPageId(), name: 'New page', url: '', notes: '', enabled: true, overrides: {}, actions: [{ type: 'capture', label: '', scroll: { mode: 'none' } }] }, fields || {});
+    const page = Object.assign({ id: nextPageId(), name: 'New page', url: '', enabled: true, actions: [{ type: 'capture', scroll: { mode: 'none' } }] }, fields || {});
     change(c => { ensurePages(c).push(page); }, { render: 'none' });
     S.page = pagesOf(S.config).length - 1;
     S.openAction = -1;
@@ -1119,7 +1169,7 @@
   function browseButton(path, kind, title) {
     return btn('Browse…', async () => {
       try {
-        const result = await api('POST', '/api/dialog', { kind: kind, title: title });
+        const result = await whileServerDialog(() => api('POST', '/api/dialog', { kind: kind, title: title }));
         if (result.cancelled) return;
         change(() => setAt(S.config, path, result.value || result.path), { render: 'all' });
         if (kind === 'image') S.logo = result.logo || null;
@@ -1206,7 +1256,7 @@
         selectField({ path: 'report.classification', label: 'Classification', value: level, options: CLASSIFICATIONS.map(([v, l]) => ({ value: v, label: l })), extra: chip,
           help: 'A coloured banner at the top and bottom of the report, repeated on every printed page.' }),
         textField({ path: 'report.logoPath', label: 'Logo (optional)', mono: true, extra: browseButton('report.logoPath', 'image', 'Choose a logo'),
-          commit: raw => { setAt(S.config, 'report.logoPath', raw); S.logo = null; },
+          commit: raw => { if (raw === '') clearValue('report.logoPath'); else setAt(S.config, 'report.logoPath', raw); S.logo = null; },
           help: 'PNG, JPEG, GIF or SVG, at most 1 MB. It is copied into the report. A relative path is read from the folder of this configuration file.' }),
         logo ? h('div', { class: 'logo-row' }, logo) : (logoPath && !logoNote ? h('p', { class: 'help', text: 'Choose the file with Browse… to see a preview.' }) : null),
         logoNote,
@@ -1244,11 +1294,11 @@
       (run.events || []).map(e => h('li', { class: 'run-event' + (e.status ? ' ev-' + String(e.status).toLowerCase() : '') }, e.time ? h('span', { class: 'ev-time', text: e.time }) : null, e.text)));
     panel.replaceChildren(h('div', { class: 'stack' },
       section('Run', canRun ? 'Run all pages that are switched on, or test the selected page.' : null, [
-        canRun ? null : laterNote(LATER_RUN),
+        canRun ? null : laterNote(LATER_RUN_HERE),
         h('div', { class: 'button-row wrap' },
-          btn('Run all pages', () => startRun('all'), { primary: true, later: canRun ? null : LATER_RUN, disabled: busy, fkey: 'run-all' }),
-          btn('Test this page' + (page ? ': ' + shortText(pageName(page, S.page), 30) : ''), () => startRun('page'), { later: canRun ? null : LATER_RUN, disabled: busy || !page, fkey: 'run-page' }),
-          btn('Stop', () => stopRun(), { danger: true, later: canRun ? null : LATER_RUN, disabled: !busy, fkey: 'run-stop' })),
+          btn('Run all pages', () => startRun('all'), { primary: true, later: canRun ? null : LATER_RUN_HERE, disabled: busy, fkey: 'run-all' }),
+          btn('Test this page' + (page ? ': ' + shortText(pageName(page, S.page), 30) : ''), () => startRun('page'), { later: canRun ? null : LATER_RUN_HERE, disabled: busy || !page, fkey: 'run-page' }),
+          btn('Stop', () => stopRun(), { danger: true, later: canRun ? null : LATER_RUN_HERE, disabled: !busy, fkey: 'run-stop' })),
         h('p', { class: 'run-state', role: 'status', text: runStateText() }),
         waiting ? h('div', { class: 'callout callout-accent' }, h('strong', { text: 'Vouch is waiting for you in the Vouch dialog. ' }), (run.prompt && run.prompt.message) || 'Answer it to go on: Continue, Wait or Skip this page.') : null,
         (run.events || []).length ? log : h('p', { class: 'empty', text: 'Progress appears here while a run is going.' }),
@@ -1265,18 +1315,46 @@
     const s = S.run.state;
     return { idle: 'Nothing is running.', starting: 'Starting…', running: 'Running…', waiting: 'Waiting for your answer in the Vouch dialog.', stopping: 'Stopping after the current step…', done: 'Finished.', failed: 'The run ended with an error.' }[s] || String(s);
   }
+  /*
+    A command shown one switch per line (with a hanging indent, wrapping only inside a
+    long value), so it reads well in the narrow panel. Display only: Copy always gives
+    the exact one-line command.
+  */
+  function commandLines(text) {
+    const tokens = [];
+    let current = '', quote = '';
+    for (const ch of String(text)) {
+      if (quote) { current += ch; if (ch === quote) quote = ''; continue; }
+      if (ch === '"' || ch === "'") { quote = ch; current += ch; continue; }
+      if (ch === ' ') { if (current) tokens.push(current); current = ''; continue; }
+      current += ch;
+    }
+    if (current) tokens.push(current);
+    const lines = [];
+    let pastFile = false;
+    for (const token of tokens) {
+      const starts = lines.length === 0 || (pastFile && token.startsWith('-')) || token === '-File';
+      if (token === '-File') pastFile = true;
+      if (starts) lines.push(token); else lines[lines.length - 1] += ' ' + token;
+    }
+    return lines;
+  }
+  function commandCode(text, labelledBy) {
+    return h('pre', { class: 'code command-text', tabindex: '0', 'aria-labelledby': labelledBy || null },
+      h('code', {}, commandLines(text).map(line => h('span', { class: 'cmd-line', text: line }))));
+  }
   function copyBlock(title, help, text, cmdText, key) {
     const codeId = uid('code');
     const block = h('div', { class: 'command' },
       h('div', { class: 'command-head' }, h('h3', { class: 'sub-title', id: codeId + '-t', text: title }),
         btn('Copy', () => copyText(text, title), { small: true, aria: 'Copy: ' + title, fkey: 'copy:' + key })),
       help ? h('p', { class: 'help', text: help }) : null,
-      h('pre', { class: 'code', id: codeId, 'aria-labelledby': codeId + '-t', tabindex: '0' }, h('code', { text: text })));
+      commandCode(text, codeId + '-t'));
     if (cmdText && cmdText !== text) {
       block.appendChild(h('details', { class: 'cmd-variant' },
         h('summary', { text: 'For cmd.exe or a shortcut' }),
         h('div', { class: 'command-head' }, h('span', { class: 'help', text: 'Quoted for cmd.exe.' }), btn('Copy', () => copyText(cmdText, title + ' (cmd.exe)'), { small: true, aria: 'Copy for cmd.exe: ' + title, fkey: 'copycmd:' + key })),
-        h('pre', { class: 'code', tabindex: '0' }, h('code', { text: cmdText }))));
+        commandCode(cmdText)));
     }
     return block;
   }
@@ -1296,7 +1374,10 @@
     if (c.run) {
       parts.push(copyBlock('Run it', 'Paste into a PowerShell window. Every setting and page comes from the file.', c.run, c.runCmd, 'run'));
       parts.push(copyBlock('Run it with every setting spelled out', 'The same run, with each setting that differs from Vouch’s default written as a switch. Change a switch to override the file for one run.', c.runExpanded, c.runExpandedCmd, 'expanded'));
-      parts.push(copyBlock('Schedule it', 'Sets up a Windows scheduled task that runs this file a few minutes after you sign in.', c.schedule, c.scheduleCmd, 'schedule'));
+      // The schedule command stays in the API (c.schedule) but is not shown until
+      // Install-VouchSchedule.ps1 can take a configuration file.
+      parts.push(h('div', { class: 'command' }, h('h3', { class: 'sub-title', text: 'Schedule it' }),
+        h('p', { class: 'later-note', text: 'Running this file on a schedule comes in a later step of the Designer.' })));
     }
     if (c.notes && c.notes.length) parts.push(h('ul', { class: 'notes' }, c.notes.map(n => h('li', { text: n }))));
     keepFocus(() => box.replaceChildren(...parts));
@@ -1359,7 +1440,7 @@
     const i = target.page;
     if (kind === 'click' && target.action === undefined) { addAction(i, result.action || { type: 'click', selector: result.selector || '' }); return; }
     if (kind === 'click') { change(() => setAt(S.config, P('pages', i, 'actions', target.action), result.action || { type: 'click', selector: result.selector }), {}); return; }
-    if (kind === 'area' && target.action === undefined) { addAction(i, { type: 'capture', label: '', scroll: { mode: 'area', selector: result.selector, as: 'segments' } }); return; }
+    if (kind === 'area' && target.action === undefined) { addAction(i, { type: 'capture', scroll: { mode: 'area', selector: result.selector, as: 'segments' } }); return; }
     if (kind === 'area') { change(() => setAt(S.config, P('pages', i, 'actions', target.action, 'scroll', 'selector'), result.selector), {}); return; }
     if (kind === 'waitFor' && target.override) { change(() => setAt(S.config, P('pages', i, 'overrides', 'waitFor'), result.selector), {}); return; }
     if (kind === 'waitFor') change(() => setAt(S.config, P('pages', i, 'actions', target.action, 'selector'), result.selector), {});
@@ -1404,6 +1485,17 @@
   Object.assign(window.VouchDesigner, { goToUrl, addPageFromCurrentTab, startPick, applyPick, testAction, startRun, pollRun, stopRun, openTarget });
 
   // ------------------------------------------------------------------ files
+  /*
+    A request that may open a Windows file dialog on the server keeps the panel modal
+    until it answers: the dialog can sit behind the panel for a while, and edits made
+    meanwhile would race with the answer (a Save As would mark them saved).
+  */
+  async function whileServerDialog(fn) {
+    const busy = $('#busy');
+    if (!busy.open) busy.showModal();
+    try { return await fn(); }
+    finally { if (busy.open) busy.close(); }
+  }
   async function confirmDiscard(what) {
     if (!isDirty()) return true;
     const choice = await ask({
@@ -1436,7 +1528,7 @@
   async function openConfig(path) {
     if (!path && !(await confirmDiscard('Opening another file replaces the one shown.'))) return false;
     try {
-      const result = await api('POST', '/api/config/open', path ? { path: path } : {});
+      const result = path ? await api('POST', '/api/config/open', { path: path }) : await whileServerDialog(() => api('POST', '/api/config/open', {}));
       if (result.cancelled) return false;
       loadDocument(result);
       const n = (result.errors || []).length;
@@ -1455,12 +1547,17 @@
       if (!ok) return false;
     }
     try {
-      const result = await api('POST', '/api/config/save', { config: S.config, path: saveAs ? '' : S.path, saveAs: !!saveAs });
+      // What is sent is what gets saved. Edits made while the answer is on its way stay
+      // in the panel and stay marked unsaved; they are never replaced by the answer.
+      const sent = JSON.stringify(S.config);
+      const send = () => api('POST', '/api/config/save', { config: JSON.parse(sent), path: saveAs ? '' : S.path, saveAs: !!saveAs });
+      const result = saveAs || !S.path ? await whileServerDialog(send) : await send();
       if (result.cancelled) return false;
       const page = S.page, tab = S.tab, openAction = S.openAction;
-      S.config = result.config;
+      const changedMeanwhile = JSON.stringify(S.config) !== sent;
       S.path = result.path; S.fileName = result.name;
-      S.savedJson = JSON.stringify(S.config);
+      if (changedMeanwhile) S.savedJson = sent;
+      else { S.config = result.config; S.savedJson = JSON.stringify(S.config); }
       S.hasComments = false;
       S.page = page; S.tab = tab; S.openAction = openAction;
       S.check.warnings = result.warnings || [];
@@ -1468,7 +1565,7 @@
       renderAll();
       refreshCommand();
       if (result.notices && result.notices.length) toast(result.notices.join(' '));
-      else toast('Saved ' + result.name + '.');
+      else toast('Saved ' + result.name + '.' + (changedMeanwhile ? ' Changes made while saving are not saved yet.' : ''));
       return true;
     } catch (e) {
       if (e.status === 422 && e.data && e.data.errors) {
@@ -1489,7 +1586,7 @@
   }
   async function importCsv() {
     let result;
-    try { result = await api('POST', '/api/config/import-csv', {}); }
+    try { result = await whileServerDialog(() => api('POST', '/api/config/import-csv', {})); }
     catch (e) { showError(e); return; }
     if (result.cancelled) return;
     const incoming = Array.isArray(result.pages) ? result.pages : [];
@@ -1536,7 +1633,7 @@
     clearInterval(pollTimer);
     $('#app').replaceChildren(h('div', { class: 'closed' }, h('h1', { text: 'Vouch Designer' }), h('p', { text: text })));
   }
-  Object.assign(window.VouchDesigner, { newConfig, openConfig, save, importCsv });
+  Object.assign(window.VouchDesigner, { newConfig, openConfig, save, importCsv, whileServerDialog });
 
   // ------------------------------------------------------------------ server state polling
   let pollTimer = 0, pollFailures = 0;
@@ -1562,7 +1659,7 @@
 
   // ------------------------------------------------------------------ keyboard and window
   document.addEventListener('keydown', ev => {
-    if ($('#modal').open || S.closed) return;
+    if ($('#modal').open || $('#busy').open || S.closed) return;
     const mod = ev.ctrlKey || ev.metaKey;
     if (!mod) return;
     const key = ev.key.toLowerCase();
@@ -1588,6 +1685,7 @@
     if (params.has('t')) history.replaceState(null, '', location.pathname);
     S.token = token;
     buildChrome();
+    $('#busy').addEventListener('cancel', ev => ev.preventDefault());
     if (!token) { showClosed('Open the Vouch Designer with Vouch-Designer.cmd (or vouch.ps1 -Designer); this address alone cannot be used.'); return; }
     let state;
     try { state = await api('GET', '/api/state'); }

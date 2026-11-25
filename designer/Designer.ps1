@@ -53,7 +53,15 @@ function New-DesignerState {
         Origin               = "http://localhost:$Port"
         StartupPath          = ''
         ConfigPath           = ''
-        KnownPaths           = [System.Collections.Generic.HashSet[string]]::new($comparer)
+        # Paths handed to the panel, kept apart by kind (Add-DesignerKnownPath).
+        KnownPaths           = @{
+            config = [System.Collections.Generic.HashSet[string]]::new($comparer)
+            csv    = [System.Collections.Generic.HashSet[string]]::new($comparer)
+            image  = [System.Collections.Generic.HashSet[string]]::new($comparer)
+            folder = [System.Collections.Generic.HashSet[string]]::new($comparer)
+        }
+        # The audit browser profile in effect (Get-DesignerAuditProfile), for the profile guard.
+        AuditProfileDir      = ''
         PendingCommentNotice = $false
         # Paths a run produced, by kind (report, folder, log); Task 9 fills them.
         OpenTargets          = [ordered]@{}
@@ -85,24 +93,28 @@ function Add-DesignerKnownPath {
         Remembers a path the server handed to the panel (from a dialog, an open or a save).
         Only such paths may come back in a later request: the panel can never name a file
         on its own, so even a page that stole the token could not read or write anything
-        the person did not pick.
+        the person did not pick. Paths are kept by kind (config, csv, image, folder) and a
+        route accepts only its own kind, so a picked logo or CSV can never be overwritten
+        by a configuration save.
     #>
     param(
         [Parameter(Mandatory)][object]$State,
-        [AllowEmptyString()][string]$Path
+        [AllowEmptyString()][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('config', 'csv', 'image', 'folder')][string]$Kind
     )
     $full = Resolve-DesignerPath -Path $Path
-    if ($full) { [void]$State.KnownPaths.Add($full) }
+    if ($full) { [void]$State.KnownPaths[$Kind].Add($full) }
     return $full
 }
 
 function Test-DesignerKnownPath {
     param(
         [Parameter(Mandatory)][object]$State,
-        [AllowNull()][AllowEmptyString()][string]$Path
+        [AllowNull()][AllowEmptyString()][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('config', 'csv', 'image', 'folder')][string]$Kind
     )
     $full = Resolve-DesignerPath -Path $Path
-    return [bool]($full -and $State.KnownPaths.Contains($full))
+    return [bool]($full -and $State.KnownPaths[$Kind].Contains($full))
 }
 
 function Test-DesignerTokenMatch {
@@ -147,7 +159,9 @@ function New-DesignerRequest {
         [Parameter(Mandatory)][string]$Path,
         [System.Collections.IDictionary]$Headers = @{},
         [AllowEmptyString()][string]$BodyText = '',
-        [switch]$BodyTooLarge
+        [switch]$BodyTooLarge,
+        # The declared Content-Length; -1 when none was sent (chunked) or not known.
+        [long]$ContentLength = -1
     )
     $headerTable = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($key in $Headers.Keys) { $headerTable[[string]$key] = [string]$Headers[$key] }
@@ -163,21 +177,44 @@ function New-DesignerRequest {
         Headers      = $headerTable
         BodyText     = $BodyText
         BodyTooLarge = [bool]$BodyTooLarge
+        ContentLength = $ContentLength
         Body         = $body
         BodyError    = $bodyError
     }
 }
 
 function Get-DesignerPathRoute {
-    # The routes whose body may name a file ("path"); see Add-DesignerKnownPath.
-    return @('/api/config/open', '/api/config/save', '/api/config/import-csv', '/api/command')
+    # The routes whose body may name a file ("path"), and the kind of file each accepts.
+    return @{
+        '/api/config/open'       = 'config'
+        '/api/config/save'       = 'config'
+        '/api/command'           = 'config'
+        '/api/config/import-csv' = 'csv'
+    }
 }
 
 function Test-DesignerRequest {
     <#
-        The security gate in front of the router. Returns $null when the request may
-        proceed, otherwise the refusal to send. Each rule closes a door a web page in
-        another tab could use:
+        The whole gate for a request whose body is already read (the tests, and the
+        router's callers): the header checks, then the body checks.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Request,
+        [Parameter(Mandatory)][object]$State
+    )
+    $refusal = Test-DesignerRequestHeader -Request $Request -State $State
+    if ($null -ne $refusal) { return $refusal }
+    return Test-DesignerRequestBody -Request $Request -State $State
+}
+
+function Test-DesignerRequestHeader {
+    <#
+        The security gate in front of the router, first half: everything that can be
+        decided from the request line and headers, BEFORE a byte of the body is read -
+        so a page in another tab cannot make the single-threaded server read or parse
+        megabytes just to be refused. Returns $null when the request may proceed,
+        otherwise the refusal to send. Each rule closes a door a web page in another tab
+        could use:
         - Host must be exactly localhost:<port> (DNS rebinding; http.sys already refuses
           most, this is the second lock).
         - A foreign Origin, or a cross-site Sec-Fetch-Site, is refused for every path.
@@ -185,8 +222,9 @@ function Test-DesignerRequest {
           an answer.
         - /api/ and /preview/ need the session token in X-Vouch-Token.
         - A POST must carry our Origin and Content-Type: application/json (a plain HTML
-          form can send neither), stay under the size limit and be valid JSON.
-        - A "path" in the body must be one the server handed out in this session.
+          form can send neither) and declare no more than the size limit (413).
+        The body rules (too large while streaming, valid JSON, known "path") are in
+        Test-DesignerRequestBody.
     #>
     param(
         [Parameter(Mandatory)][object]$Request,
@@ -232,6 +270,24 @@ function Test-DesignerRequest {
         if ($mediaType -ne 'application/json') {
             return New-DesignerError -Status 415 -Code 'content-type' -Message 'The request was not in the expected form.' -Detail 'The Designer accepts JSON only (Content-Type: application/json).'
         }
+        if ($Request.ContentLength -gt $State.MaxBodyBytes) {
+            return New-DesignerError -Status 413 -Code 'too-large' -Message 'The request is too large.' -Detail "A configuration sent to the Designer may be at most $([int]($State.MaxBodyBytes / 1MB)) MB."
+        }
+    }
+    return $null
+}
+
+function Test-DesignerRequestBody {
+    <#
+        The gate's second half, after the body was read (up to the size limit): too
+        large while streaming, not JSON, or a "path" that is not one the server handed
+        out in this session for this kind of file.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Request,
+        [Parameter(Mandatory)][object]$State
+    )
+    if ($Request.Method -eq 'POST') {
         if ($Request.BodyTooLarge) {
             return New-DesignerError -Status 413 -Code 'too-large' -Message 'The request is too large.' -Detail "A configuration sent to the Designer may be at most $([int]($State.MaxBodyBytes / 1MB)) MB."
         }
@@ -239,9 +295,10 @@ function Test-DesignerRequest {
             return New-DesignerError -Status 400 -Code 'bad-json' -Message 'The request was not understood.' -Detail 'Its content is not valid JSON.'
         }
     }
-    if ((Get-DesignerPathRoute) -contains $Request.Path) {
+    $routes = Get-DesignerPathRoute
+    if ($routes.ContainsKey($Request.Path)) {
         $path = Get-DesignerBodyText -Body $Request.Body -Name 'path'
-        if ($path -and -not (Test-DesignerKnownPath -State $State -Path $path)) {
+        if ($path -and -not (Test-DesignerKnownPath -State $State -Path $path -Kind $routes[$Request.Path])) {
             return New-DesignerError -Status 403 -Code 'unknown-path' -Message 'That file was not chosen in the Designer.' -Detail 'Choose the file with Open, Save As or Browse; the Designer only uses files picked in its own dialogs.'
         }
     }
@@ -395,9 +452,10 @@ function Invoke-DesignerRequest {
         }
         if ($Path -eq '/favicon.ico') { return New-DesignerResponse -Status 204 }
 
-        if ((Get-DesignerPathRoute) -contains $Path) {
+        $pathRoutes = Get-DesignerPathRoute
+        if ($pathRoutes.ContainsKey($Path)) {
             $named = Get-DesignerBodyText -Body $Body -Name 'path'
-            if ($named -and -not (Test-DesignerKnownPath -State $State -Path $named)) {
+            if ($named -and -not (Test-DesignerKnownPath -State $State -Path $named -Kind $pathRoutes[$Path])) {
                 return New-DesignerError -Status 403 -Code 'unknown-path' -Message 'That file was not chosen in the Designer.' -Detail 'Choose the file with Open, Save As or Browse.'
             }
         }
@@ -607,7 +665,7 @@ function Invoke-DesignerOpenConfig {
         $path = Show-DesignerFileDialog -Kind open -Title 'Open a Vouch configuration' -Filter (Get-DesignerDialogFilter -Kind 'config') -InitialDirectory (Get-DesignerFolder -State $State)
         if (-not $path) { return New-DesignerJsonResponse -Data ([ordered]@{ cancelled = $true }) }
     }
-    $path = Add-DesignerKnownPath -State $State -Path $path
+    $path = Add-DesignerKnownPath -State $State -Path $path -Kind config
     try { $file = Read-DesignerConfigFile -Path $path }
     catch {
         return New-DesignerError -Status 422 -Code 'unreadable' -Message "'$([System.IO.Path]::GetFileName($path))' cannot be opened." -Detail ([string]$_.Exception.Message)
@@ -616,10 +674,10 @@ function Invoke-DesignerOpenConfig {
     $hasComments = Test-VouchJsonComment -Text $file.Text
     $State.ConfigPath = $path
     $State.PendingCommentNotice = $hasComments
+    # No logo preview here: opening a file must not touch any path named inside it (a
+    # \\server\share logo would make Windows send this user's credentials to that
+    # server). The panel previews a logo only when it is picked with Browse.
     $logo = $null
-    if ($file.Config['report'] -is [System.Collections.IDictionary] -and $file.Config['report']['logoPath'] -is [string]) {
-        $logo = Get-DesignerLogoPreview -LogoPath $file.Config['report']['logoPath'] -ConfigPath $path
-    }
     return New-DesignerJsonResponse -Data ([ordered]@{
             path        = $path
             name        = [System.IO.Path]::GetFileName($path)
@@ -661,7 +719,7 @@ function Invoke-DesignerSaveConfig {
         $path = Show-DesignerFileDialog -Kind save -Title 'Save the Vouch configuration' -Filter (Get-DesignerDialogFilter -Kind 'config') -InitialDirectory (Get-DesignerFolder -State $State) -FileName $suggested -DefaultExtension 'json'
         if (-not $path) { return New-DesignerJsonResponse -Data ([ordered]@{ cancelled = $true }) }
     }
-    $path = Add-DesignerKnownPath -State $State -Path $path
+    $path = Add-DesignerKnownPath -State $State -Path $path -Kind config
     try { $saved = Save-VouchConfig -Config $config -Path $path }
     catch {
         return New-DesignerError -Status 500 -Code 'not-saved' -Message "'$([System.IO.Path]::GetFileName($path))' could not be saved." -Detail ([string]$_.Exception.Message)
@@ -693,7 +751,7 @@ function Invoke-DesignerImportCsv {
         $path = Show-DesignerFileDialog -Kind open -Title 'Import a capture list (CSV)' -Filter (Get-DesignerDialogFilter -Kind 'csv') -InitialDirectory (Get-DesignerFolder -State $State)
         if (-not $path) { return New-DesignerJsonResponse -Data ([ordered]@{ cancelled = $true }) }
     }
-    $path = Add-DesignerKnownPath -State $State -Path $path
+    $path = Add-DesignerKnownPath -State $State -Path $path -Kind csv
     $info = $null
     try {
         $converted = ConvertTo-VouchConfig -Path $path -InformationVariable info 6>$null
@@ -802,7 +860,8 @@ function Invoke-DesignerDialog {
         }
     }
     if (-not $path) { return New-DesignerJsonResponse -Data ([ordered]@{ cancelled = $true }) }
-    $path = Add-DesignerKnownPath -State $State -Path $path
+    $knownKind = @{ 'folder' = 'folder'; 'image' = 'image'; 'csv' = 'csv'; 'config-open' = 'config'; 'config-save' = 'config' }[$kind]
+    $path = Add-DesignerKnownPath -State $State -Path $path -Kind $knownKind
     $data = [ordered]@{ path = $path; value = (Get-DesignerRelativeValue -Path $path -ConfigPath $State.ConfigPath) }
     if ($kind -eq 'image') { $data['logo'] = Get-DesignerLogoPreview -LogoPath $path }
     return New-DesignerJsonResponse -Data $data
@@ -823,7 +882,7 @@ function Invoke-DesignerCommand {
     $path = Get-DesignerBodyText -Body $Body -Name 'path'
     if (-not $path) {
         return New-DesignerJsonResponse -Data ([ordered]@{
-                run = ''; runCmd = ''; runExpanded = ''; runExpandedCmd = ''; schedule = ''; scheduleCmd = ''
+                run = ''; runCmd = ''; runExpanded = ''; runExpandedCmd = ''; schedule = ''; scheduleCmd = ''; scheduleNote = ''
                 unsaved = $true; saved = $false
                 notes = @('Save the configuration to a file first: the commands run a saved file.')
             })
@@ -847,6 +906,7 @@ function Invoke-DesignerCommand {
             runExpandedCmd = $command.RunExpandedCmd
             schedule       = $command.Schedule
             scheduleCmd    = $command.ScheduleCmd
+            scheduleNote   = $command.ScheduleNote
             switches       = @($command.Switches)
             unsaved        = $unsaved
             saved          = $true
@@ -1180,11 +1240,13 @@ function ConvertTo-DesignerCmdArgument {
     <#
         A value quoted for cmd.exe (and the Windows argument rules pwsh uses): in double
         quotes, where & | < > ^ ( ) are plain text; backslashes before the closing quote
-        are doubled. A value with a double quote cannot be written so that cmd.exe and
-        pwsh both read it right: $null, and the caller leaves it out.
+        are doubled. Some values cannot be written so that cmd.exe passes them on
+        unchanged: a double quote (it ends the quoting for cmd.exe), % (cmd.exe replaces
+        %NAME% even inside quotes), ! (replaced when delayed expansion is on) and line
+        breaks. For those: $null, and the caller leaves the value out.
     #>
     param([AllowEmptyString()][string]$Value)
-    if ($Value.Contains('"')) { return $null }
+    if ($Value -match '["%!\r\n]') { return $null }
     $trailing = ([regex]::Match($Value, '\\*$')).Value
     return '"' + $Value + $trailing + '"'
 }
@@ -1290,9 +1352,11 @@ function Get-VouchCommandLine {
     $head = 'pwsh -NoProfile -ExecutionPolicy Bypass -File'
 
     $run = "$head $(& $ps $script) -ConfigPath $(& $ps $configFull)"
-    $runCmd = "$head $(& $cmd $script) -ConfigPath $(& $cmd $configFull)"
-    if ("$script$configFull" -match '[%!]') {
-        $notes.Add('A folder or file name contains % or !, which cmd.exe may change. Use the PowerShell command, or rename the folder.')
+    # A path cmd.exe would change cannot be left out like a setting: no cmd.exe lines then.
+    $cmdSafe = $null -ne (& $cmd $script) -and $null -ne (& $cmd $configFull) -and $null -ne (& $cmd $installer)
+    $runCmd = if ($cmdSafe) { "$head $(& $cmd $script) -ConfigPath $(& $cmd $configFull)" } else { '' }
+    if (-not $cmdSafe) {
+        $notes.Add('A folder or file name contains % or !, which cmd.exe would change, so there is no cmd.exe version. Use the PowerShell command, or rename the folder.')
     }
 
     $switches = Get-VouchCommandSwitch -Config $Config -ConfigPath $configFull -ParameterInfo $ParameterInfo -Notes $notes
@@ -1317,18 +1381,19 @@ function Get-VouchCommandLine {
         $psParts.Add("-$($switch.Name) $(& $ps $text)")
         $included.Add($switch)
         $cmdValue = & $cmd $text
-        if ($null -eq $cmdValue) { $notes.Add("-$($switch.Name) is left out of the cmd.exe line because its value contains a double quote; the file supplies it.") }
-        else {
-            if ($text -match '[%!]') { $notes.Add("The value of -$($switch.Name) contains % or !, which cmd.exe may change; the PowerShell line is exact.") }
-            $cmdParts.Add("-$($switch.Name) $cmdValue")
+        if ($null -eq $cmdValue) {
+            if ($cmdSafe) { $notes.Add("-$($switch.Name) is left out of the cmd.exe line because its value contains "" % or !, which cmd.exe would not pass on unchanged; the file supplies it.") }
         }
+        else { $cmdParts.Add("-$($switch.Name) $cmdValue") }
     }
     $runExpanded = (@($run) + $psParts) -join ' '
-    $runExpandedCmd = (@($runCmd) + $cmdParts) -join ' '
+    $runExpandedCmd = if ($cmdSafe) { (@($runCmd) + $cmdParts) -join ' ' } else { '' }
 
+    # The panel does not show this yet: Install-VouchSchedule.ps1 learns -ConfigPath in
+    # Task 10. Until then the command stops with a parameter error (ScheduleNote).
     $schedule = "$head $(& $ps $installer) -ConfigPath $(& $ps $configFull) -Schedule AtLogOn"
-    $scheduleCmd = "$head $(& $cmd $installer) -ConfigPath $(& $cmd $configFull) -Schedule AtLogOn"
-    $notes.Add('Install-VouchSchedule.ps1 learns -ConfigPath in a later step; until then the schedule command stops with an error. Change -Schedule AtLogOn to -At 07:30 (every weekday) if you prefer a set time.')
+    $scheduleCmd = if ($cmdSafe) { "$head $(& $cmd $installer) -ConfigPath $(& $cmd $configFull) -Schedule AtLogOn" } else { '' }
+    $scheduleNote = 'Install-VouchSchedule.ps1 learns -ConfigPath in a later step; until then this command stops with an error. Change -Schedule AtLogOn to -At 07:30 (every weekday) for a set time.'
 
     return [pscustomobject]@{
         Run            = $run
@@ -1337,6 +1402,7 @@ function Get-VouchCommandLine {
         RunExpandedCmd = $runExpandedCmd
         Schedule       = $schedule
         ScheduleCmd    = $scheduleCmd
+        ScheduleNote   = $scheduleNote
         Switches       = @($included | ForEach-Object { [ordered]@{ name = $_.Name; value = $_.Value } })
         Notes          = $notes.ToArray()
     }
@@ -1464,6 +1530,67 @@ function Get-DesignerPanelProfile {
     return Join-Path -Path "$env:LOCALAPPDATA" -ChildPath 'Vouch\DesignerPanel'
 }
 
+function Get-DesignerAuditProfile {
+    <#
+        The audit browser profile a run would use: a typed -EdgeProfileDir, else the
+        configuration's browser.profileDir (relative to the file's folder), else the
+        engine's default. Never throws: an unreadable file means the default.
+    #>
+    param(
+        [AllowEmptyString()][string]$EdgeProfileDir = '',
+        [AllowNull()][object]$Config = $null,
+        [AllowEmptyString()][string]$ConfigPath = ''
+    )
+    $default = Join-Path -Path "$env:LOCALAPPDATA" -ChildPath 'Vouch\EdgeProfile'
+    if ($EdgeProfileDir) { return Resolve-DesignerPath -Path $EdgeProfileDir }
+    try {
+        if ($null -eq $Config -and $ConfigPath -and [System.IO.File]::Exists($ConfigPath)) { $Config = (Read-DesignerConfigFile -Path $ConfigPath).Config }
+        $found = Get-ConfigValue -Config $Config -Section 'browser' -Key 'profileDir'
+        if ($found.Found -and $found.Value -is [string]) {
+            $base = if ($ConfigPath) { Split-Path -Path $ConfigPath -Parent } else { (Get-Location).ProviderPath }
+            return Resolve-DesignerPath -Path (Resolve-VouchConfigPath -Path $found.Value -BaseDirectory $base)
+        }
+    }
+    catch { Write-Verbose "Audit profile not read from the configuration: $($_.Exception.Message)" }
+    return $default
+}
+
+function Test-DesignerProfileOverlap {
+    <#
+        Why the panel's profile and the audit profile cannot be used together, or ''. The
+        engine finds its Edge by looking for the profile path as text in command lines
+        (Find-EdgeBrowserProcess), so neither path may contain the other: the panel's Edge
+        would be taken for the audit browser, or the other way round.
+    #>
+    param([Parameter(Mandatory)][string]$PanelProfile, [Parameter(Mandatory)][string]$AuditProfile)
+    $panel = (Resolve-DesignerPath -Path $PanelProfile).TrimEnd('\')
+    $audit = (Resolve-DesignerPath -Path $AuditProfile).TrimEnd('\')
+    if (-not $panel -or -not $audit) { return '' }
+    if ($panel.Contains($audit, [System.StringComparison]::OrdinalIgnoreCase) -or $audit.Contains($panel, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return "The Designer window's browser profile ($panel) and the audit browser profile ($audit) overlap: one folder name contains the other, so Vouch could mistake one Edge for the other. Choose an audit profile folder (browser.profileDir or -EdgeProfileDir) whose path does not contain, and is not contained in, $panel."
+    }
+    return ''
+}
+
+function Assert-DesignerProfileSeparate {
+    <#
+        Checks the panel profile against the audit profile in effect and remembers that
+        audit profile in the state. Start-VouchDesigner calls it at the start; later steps
+        call it again whenever the configuration's browser.profileDir changes, before they
+        start or attach to the audit Edge. Throws the plain message from
+        Test-DesignerProfileOverlap.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$State,
+        [Parameter(Mandatory)][string]$AuditProfile,
+        [string]$PanelProfile = ''
+    )
+    if (-not $PanelProfile) { $PanelProfile = if ($State.PanelProfileDir) { $State.PanelProfileDir } else { Get-DesignerPanelProfile } }
+    $problem = Test-DesignerProfileOverlap -PanelProfile $PanelProfile -AuditProfile $AuditProfile
+    if ($problem) { throw $problem }
+    $State.AuditProfileDir = Resolve-DesignerPath -Path $AuditProfile
+}
+
 function Start-DesignerPanel {
     <#
         Opens the panel in its own Edge process. With a profile no other Edge holds, the
@@ -1473,12 +1600,11 @@ function Start-DesignerPanel {
     #>
     param(
         [Parameter(Mandatory)][string]$Url,
-        [string]$ProfileDir = (Get-DesignerPanelProfile)
+        [string]$ProfileDir = (Get-DesignerPanelProfile),
+        [string]$AuditProfileDir = (Get-DesignerAuditProfile)
     )
-    $audit = Join-Path -Path "$env:LOCALAPPDATA" -ChildPath 'Vouch\EdgeProfile'
-    if ($ProfileDir.Contains($audit.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw 'The Designer window must not use the audit browser profile.'
-    }
+    $problem = Test-DesignerProfileOverlap -PanelProfile $ProfileDir -AuditProfile $AuditProfileDir
+    if ($problem) { throw $problem }
     $edge = Find-EdgeExecutable
     if (-not (Test-Path -LiteralPath $ProfileDir)) { [void](New-Item -ItemType Directory -Path $ProfileDir -Force) }
     $existing = Find-EdgeBrowserProcess -ProfileDir $ProfileDir
@@ -1536,43 +1662,63 @@ function Start-DesignerListener {
     throw 'The Designer could not find a free local port to listen on.'
 }
 
-function Read-DesignerRequest {
-    # The listener's request as a New-DesignerRequest object; the body read up to the size limit.
-    param([Parameter(Mandatory)][System.Net.HttpListenerContext]$Context, [Parameter(Mandatory)][object]$State)
-    $request = $Context.Request
-    $headers = @{}
-    foreach ($name in $request.Headers.AllKeys) { if ($name) { $headers[$name] = $request.Headers[$name] } }
-    $text = ''
-    $tooLarge = $false
-    if ($request.HttpMethod -eq 'POST' -and $request.HasEntityBody) {
-        # Past the limit the rest is read and dropped (up to 4 times the limit), so the
-        # client gets its 413 instead of a reset connection; beyond that it is cut off.
-        $memory = [System.IO.MemoryStream]::new()
-        try {
-            $buffer = [byte[]]::new(65536)
-            $total = 0
-            while (($read = $request.InputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-                $total += $read
-                if ($total -gt $State.MaxBodyBytes) { $tooLarge = $true }
-                else { $memory.Write($buffer, 0, $read) }
-                if ($total -gt 4 * $State.MaxBodyBytes) { break }
-            }
-            if (-not $tooLarge) { $text = [System.Text.Encoding]::UTF8.GetString($memory.ToArray()) }
+function Read-DesignerRequestBody {
+    <#
+        Reads a request body up to the limit and no further: one byte past it and the
+        reading stops (TooLarge). Called only after the header checks passed, so only
+        the panel itself can make the server read anything.
+    #>
+    param([Parameter(Mandatory)][System.IO.Stream]$Stream, [Parameter(Mandatory)][long]$Limit)
+    $memory = [System.IO.MemoryStream]::new()
+    try {
+        $buffer = [byte[]]::new(65536)
+        while (($read = $Stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $memory.Write($buffer, 0, $read)
+            if ($memory.Length -gt $Limit) { return [pscustomobject]@{ Text = ''; TooLarge = $true } }
         }
-        finally { $memory.Dispose() }
+        return [pscustomobject]@{ Text = [System.Text.Encoding]::UTF8.GetString($memory.ToArray()); TooLarge = $false }
     }
-    return New-DesignerRequest -Method $request.HttpMethod -Path $request.Url.AbsolutePath -Headers $headers -BodyText $text -BodyTooLarge:$tooLarge
+    finally { $memory.Dispose() }
+}
+
+function Invoke-DesignerExchange {
+    <#
+        One request from arrival to answer, without the socket: header checks first
+        (Host, Origin, Sec-Fetch-Site, method, token, content type, declared length),
+        then the body - read only now, up to the limit - then the body checks, then the
+        router. The tests drive it with a stream that fails if anything reads it.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Method,
+        [Parameter(Mandatory)][string]$Path,
+        [System.Collections.IDictionary]$Headers = @{},
+        [long]$ContentLength = -1,
+        [AllowNull()][System.IO.Stream]$BodyStream = $null,
+        [Parameter(Mandatory)][object]$State
+    )
+    $head = New-DesignerRequest -Method $Method -Path $Path -Headers $Headers -ContentLength $ContentLength
+    $refusal = Test-DesignerRequestHeader -Request $head -State $State
+    if ($null -ne $refusal) { return $refusal }
+    $body = [pscustomobject]@{ Text = ''; TooLarge = $false }
+    if ($head.Method -eq 'POST' -and $null -ne $BodyStream) {
+        $body = Read-DesignerRequestBody -Stream $BodyStream -Limit $State.MaxBodyBytes
+    }
+    $request = New-DesignerRequest -Method $Method -Path $Path -Headers $Headers -ContentLength $ContentLength -BodyText $body.Text -BodyTooLarge:$body.TooLarge
+    $refusal = Test-DesignerRequestBody -Request $request -State $State
+    if ($null -ne $refusal) { return $refusal }
+    return Invoke-DesignerRequest -Method $request.Method -Path $request.Path -Body $request.Body -State $State
 }
 
 function Invoke-DesignerContext {
-    # One request from arrival to answer: read, check, route, send. Nothing here may stop the loop.
+    # One request from the listener: Invoke-DesignerExchange, then send. Nothing here may stop the loop.
     param([Parameter(Mandatory)][System.Net.HttpListenerContext]$Context, [Parameter(Mandatory)][object]$State)
     try {
-        $request = Read-DesignerRequest -Context $Context -State $State
-        $response = Test-DesignerRequest -Request $request -State $State
-        if ($null -eq $response) {
-            $response = Invoke-DesignerRequest -Method $request.Method -Path $request.Path -Body $request.Body -State $State
-        }
+        $request = $Context.Request
+        $headers = @{}
+        foreach ($name in $request.Headers.AllKeys) { if ($name) { $headers[$name] = $request.Headers[$name] } }
+        $length = if ($request.HasEntityBody) { $request.ContentLength64 } else { 0 }
+        $stream = if ($request.HasEntityBody) { $request.InputStream } else { $null }
+        $response = Invoke-DesignerExchange -Method $request.HttpMethod -Path $request.Url.AbsolutePath -Headers $headers -ContentLength $length -BodyStream $stream -State $State
     }
     catch {
         $response = New-DesignerError -Status 500 -Code 'failed' -Message 'Something went wrong in the Designer.' -Detail ([string]$_.Exception.Message)
@@ -1650,7 +1796,9 @@ function Start-VouchDesigner {
         [AllowEmptyString()][string]$Version = '',
         [switch]$NoPanel,
         [string]$ReadyFile = '',
-        [string]$PanelProfileDir = (Get-DesignerPanelProfile)
+        [string]$PanelProfileDir = (Get-DesignerPanelProfile),
+        # A typed -EdgeProfileDir; otherwise the configuration's or the default.
+        [AllowEmptyString()][string]$AuditProfileDir = ''
     )
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
@@ -1662,9 +1810,11 @@ function Start-VouchDesigner {
         $state = New-DesignerState -ScriptPath $ScriptPath -Port $started.Port -Version $Version -DesignerDirectory $designerFolder
         if ($ConfigPath) {
             $full = Resolve-DesignerPath -Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ConfigPath)
-            if ($full -and [System.IO.File]::Exists($full)) { $state.StartupPath = Add-DesignerKnownPath -State $state -Path $full }
+            if ($full -and [System.IO.File]::Exists($full)) { $state.StartupPath = Add-DesignerKnownPath -State $state -Path $full -Kind config }
             else { Write-Host "NOTE: '$ConfigPath' was not found; the Designer starts with a new configuration." -ForegroundColor Yellow }
         }
+        $state.PanelProfileDir = $PanelProfileDir
+        Assert-DesignerProfileSeparate -State $state -AuditProfile (Get-DesignerAuditProfile -EdgeProfileDir $AuditProfileDir -ConfigPath $state.StartupPath)
         $url = "http://localhost:$($state.Port)/?t=$($state.Token)"
         Write-Host "Vouch Designer $Version is running at http://localhost:$($state.Port)/"
         if ($ReadyFile) {
@@ -1673,8 +1823,7 @@ function Start-VouchDesigner {
         }
         if (-not $NoPanel) {
             try {
-                $state.PanelProfileDir = $PanelProfileDir
-                $state.PanelProcess = Start-DesignerPanel -Url $url -ProfileDir $PanelProfileDir
+                $state.PanelProcess = Start-DesignerPanel -Url $url -ProfileDir $PanelProfileDir -AuditProfileDir $state.AuditProfileDir
                 $state.PanelStartedAt = Get-Date
             }
             catch {

@@ -217,8 +217,10 @@
     Open the Vouch Designer instead of capturing: a window beside your screen where you
     add pages, choose what to click and capture, set the report and output options, and
     save a configuration file. Double-clicking Vouch-Designer.cmd does the same. Give
-    -ConfigPath as well to open that file at the start. Needs the designer folder next
-    to vouch.ps1; every other use of vouch.ps1 works without it.
+    -ConfigPath as well to open that file at the start, and -EdgeProfileDir when the audit
+    profile is not the usual one (the Designer keeps its own window's profile apart from
+    it). Needs the designer folder next to vouch.ps1; every other use of vouch.ps1 works
+    without it.
 
 .PARAMETER DesignerPort
     The local port the Designer listens on (only this computer can reach it). Default 0:
@@ -8097,6 +8099,8 @@ function Invoke-DesignerMode {
         [Parameter(Mandatory)][string]$ScriptPath,
         [AllowEmptyString()][string]$ConfigPath = '',
         [int]$Port = 0,
+        # The audit profile the Designer must stay apart from, when typed (-EdgeProfileDir).
+        [AllowEmptyString()][string]$EdgeProfileDir = '',
         [AllowEmptyCollection()][string[]]$IgnoredParameters = @()
     )
     Assert-Environment
@@ -8106,16 +8110,17 @@ function Invoke-DesignerMode {
             'Copy the whole Vouch folder, not only vouch.ps1. Everything else vouch.ps1 does works without it.')
     }
     if ($IgnoredParameters.Count -gt 0) {
-        Write-Host "NOTE: with -Designer only -ConfigPath and -DesignerPort are used; these are ignored: -$($IgnoredParameters -join ', -')" -ForegroundColor Yellow
+        Write-Host "NOTE: with -Designer only -ConfigPath, -DesignerPort and -EdgeProfileDir are used; these are ignored: -$($IgnoredParameters -join ', -')" -ForegroundColor Yellow
     }
     . $designerScript
-    Start-VouchDesigner -ScriptPath $ScriptPath -ConfigPath $ConfigPath -Port $Port -Version $script:ToolVersion
+    Start-VouchDesigner -ScriptPath $ScriptPath -ConfigPath $ConfigPath -Port $Port -Version $script:ToolVersion -AuditProfileDir $EdgeProfileDir
 }
 
 if ($Designer) {
     try {
-        $ignored = @($PSBoundParameters.Keys | Where-Object { $_ -notin 'Designer', 'DesignerPort', 'ConfigPath', 'Verbose', 'Debug' })
-        Invoke-DesignerMode -ScriptPath $PSCommandPath -ConfigPath $ConfigPath -Port $DesignerPort -IgnoredParameters $ignored
+        $ignored = @($PSBoundParameters.Keys | Where-Object { $_ -notin 'Designer', 'DesignerPort', 'ConfigPath', 'EdgeProfileDir', 'Verbose', 'Debug' })
+        $auditProfile = if ($PSBoundParameters.ContainsKey('EdgeProfileDir')) { $EdgeProfileDir } else { '' }
+        Invoke-DesignerMode -ScriptPath $PSCommandPath -ConfigPath $ConfigPath -Port $DesignerPort -EdgeProfileDir $auditProfile -IgnoredParameters $ignored
     }
     catch {
         Write-Host ''

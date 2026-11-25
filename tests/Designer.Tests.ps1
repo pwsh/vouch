@@ -15,6 +15,34 @@ BeforeAll {
     . ([scriptblock]::Create((Get-VouchFunctionSource -Path $script:VouchPath, $script:DesignerPath)))
     $script:SamplePath = Join-Path -Path (Split-Path -Path $script:VouchPath -Parent) -ChildPath 'captures.sample.json'
 
+    # A request body that counts what is read from it, or fails the test if read at all.
+    if (-not ('VouchTest.CountingStream' -as [type])) {
+        Add-Type -TypeDefinition @"
+namespace VouchTest {
+    public class CountingStream : System.IO.Stream {
+        private readonly long length; private long position;
+        public bool FailOnRead; public long BytesRead;
+        public CountingStream(long length, bool failOnRead) { this.length = length; FailOnRead = failOnRead; }
+        public override int Read(byte[] buffer, int offset, int count) {
+            if (FailOnRead) throw new System.InvalidOperationException("The request body was read.");
+            int n = (int)System.Math.Min(count, length - position);
+            for (int i = 0; i < n; i++) buffer[offset + i] = (byte)'a';
+            position += n; BytesRead += n; return n;
+        }
+        public override bool CanRead { get { return true; } }
+        public override bool CanSeek { get { return false; } }
+        public override bool CanWrite { get { return false; } }
+        public override long Length { get { return length; } }
+        public override long Position { get { return position; } set { throw new System.NotSupportedException(); } }
+        public override void Flush() { }
+        public override long Seek(long offset, System.IO.SeekOrigin origin) { throw new System.NotSupportedException(); }
+        public override void SetLength(long value) { throw new System.NotSupportedException(); }
+        public override void Write(byte[] buffer, int offset, int count) { throw new System.NotSupportedException(); }
+    }
+}
+"@
+    }
+
     # No test may open a real Windows dialog.
     Mock Show-DesignerFileDialog { throw 'A test reached a real file dialog; mock Show-DesignerFileDialog.' }
 
@@ -75,7 +103,7 @@ Start-VouchDesigner -ScriptPath $(& $literal $script:VouchPath) -ConfigPath $(& 
         # HttpClient, so headers such as Host and Origin can be set exactly as a hostile page would.
         param(
             [string]$Method = 'GET', [Parameter(Mandatory)][string]$Url, [hashtable]$Headers = @{},
-            [AllowNull()][string]$Body = $null, [string]$ContentType = '', [string]$HostHeader = ''
+            [AllowNull()][string]$Body = $null, [string]$ContentType = '', [string]$HostHeader = '', [switch]$ExpectContinue
         )
         $handler = [System.Net.Http.SocketsHttpHandler]::new()
         $handler.UseProxy = $false
@@ -84,6 +112,7 @@ Start-VouchDesigner -ScriptPath $(& $literal $script:VouchPath) -ConfigPath $(& 
             $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::new($Method), $Url)
             foreach ($key in $Headers.Keys) { [void]$request.Headers.TryAddWithoutValidation($key, [string]$Headers[$key]) }
             if ($HostHeader) { $request.Headers.Host = $HostHeader }
+            if ($ExpectContinue) { $request.Headers.ExpectContinue = $true }
             if ($null -ne $Body) {
                 $request.Content = [System.Net.Http.StringContent]::new($Body, [System.Text.Encoding]::UTF8)
                 $request.Content.Headers.ContentType = if ($ContentType) { [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse($ContentType) } else { $null }
@@ -99,7 +128,7 @@ Start-VouchDesigner -ScriptPath $(& $literal $script:VouchPath) -ConfigPath $(& 
 }
 
 Describe 'Designer request gate (Test-DesignerRequest)' {
-    BeforeAll { $script:Gate = New-TestState; $script:Known = Add-DesignerKnownPath -State $script:Gate -Path (Join-Path $TestDrive 'known.json') }
+    BeforeAll { $script:Gate = New-TestState; $script:Known = Add-DesignerKnownPath -State $script:Gate -Path (Join-Path $TestDrive 'known.json') -Kind config }
 
     It 'lets a request through: <Case>' -ForEach @(
         @{ Case = 'the page itself, without a token'; Method = 'GET'; Path = '/'; Headers = 'host' }
@@ -163,6 +192,34 @@ Describe 'Designer request gate (Test-DesignerRequest)' {
         (ConvertFrom-TestBody $refusal).code | Should -Be 'unknown-path'
         # The router refuses it as well (defence in depth), without opening anything.
         (Invoke-TestRoute POST $_ ([ordered]@{ path = 'C:\Windows\win.ini'; config = [ordered]@{} }) -State $script:Gate).Status | Should -Be 403
+    }
+
+    It 'refuses <Case> before reading a byte of the body' -ForEach @(
+        @{ Case = 'a 4 MB POST without a token'; Status = 403; Change = { param($h) $h.Remove('X-Vouch-Token') }; Length = 4MB }
+        @{ Case = 'a 4 MB POST from another origin'; Status = 403; Change = { param($h) $h['Origin'] = 'https://evil.example' }; Length = 4MB }
+        @{ Case = 'a no-cors text/plain POST'; Status = 415; Change = { param($h) $h['Content-Type'] = 'text/plain' }; Length = 4MB }
+        @{ Case = 'a declared 5 MB body from the panel'; Status = 413; Change = { param($h) }; Length = 5MB }
+    ) {
+        $headers = New-GoodHeaders $script:Gate -Post
+        & $Change $headers
+        $stream = [VouchTest.CountingStream]::new($Length, $true)
+        $response = Invoke-DesignerExchange -Method POST -Path '/api/config/validate' -Headers $headers -ContentLength $Length -BodyStream $stream -State $script:Gate
+        $response.Status | Should -Be $Status
+        $stream.BytesRead | Should -Be 0
+    }
+
+    It 'stops reading a body of unknown length one block past the limit (413)' {
+        $stream = [VouchTest.CountingStream]::new(20MB, $false)
+        $response = Invoke-DesignerExchange -Method POST -Path '/api/config/validate' -Headers (New-GoodHeaders $script:Gate -Post) -ContentLength -1 -BodyStream $stream -State $script:Gate
+        $response.Status | Should -Be 413
+        $stream.BytesRead | Should -BeLessOrEqual ($script:Gate.MaxBodyBytes + 65536)
+    }
+
+    It 'reads, checks and routes an ordinary request from the panel' {
+        $stream = [System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes('{}'))
+        $response = Invoke-DesignerExchange -Method POST -Path '/api/config/new' -Headers (New-GoodHeaders $script:Gate -Post) -ContentLength 2 -BodyStream $stream -State $script:Gate
+        $response.Status | Should -Be 200
+        (Invoke-DesignerExchange -Method GET -Path '/app.css' -Headers @{ Host = $script:Gate.HostHeader } -State $script:Gate).Status | Should -Be 200
     }
 
     It 'compares tokens in constant time and makes long random tokens' {
@@ -257,7 +314,7 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
         It 'opens a file the server knows as written, with no defaults filled in' {
             $path = Join-Path $TestDrive 'partial.json'
             Set-Content -LiteralPath $path -Value '{ "schemaVersion": 1, "Output": { "Dir": "out" }, "pages": [ { "Name": "A", "url": "https://a.example/", "future": { "x": 1 } } ], "extra": true }' -Encoding utf8NoBOM
-            [void](Add-DesignerKnownPath -State $script:State -Path $path)
+            [void](Add-DesignerKnownPath -State $script:State -Path $path -Kind config)
             $r = Invoke-TestRoute POST '/api/config/open' ([ordered]@{ path = $path }) -State $script:State
             $r.Status | Should -Be 200
             $r.Data.path | Should -Be $path
@@ -276,7 +333,7 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
         It 'still opens a file with problems, and lists them in plain words' {
             $path = Join-Path $TestDrive 'bad.json'
             Set-Content -LiteralPath $path -Value '{ "schemaVersion": 1, "output": { "jpegQuality": 0 }, "pages": [ { "name": "A", "url": "ftp://x" } ] }' -Encoding utf8NoBOM
-            [void](Add-DesignerKnownPath -State $script:State -Path $path)
+            [void](Add-DesignerKnownPath -State $script:State -Path $path -Kind config)
             $r = Invoke-TestRoute POST '/api/config/open' ([ordered]@{ path = $path }) -State $script:State
             $r.Status | Should -Be 200
             @($r.Data.errors.path) | Should -Be @('output.jpegQuality', 'pages[0].url')
@@ -286,7 +343,7 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
         It 'refuses a file that is not JSON with 422 and the line of the mistake' {
             $path = Join-Path $TestDrive 'broken.json'
             Set-Content -LiteralPath $path -Value "{`n  `"name`": `"x`"`n  `"pages`": []`n}" -Encoding utf8NoBOM
-            [void](Add-DesignerKnownPath -State $script:State -Path $path)
+            [void](Add-DesignerKnownPath -State $script:State -Path $path -Kind config)
             $r = Invoke-TestRoute POST '/api/config/open' ([ordered]@{ path = $path }) -State $script:State
             $r.Status | Should -Be 422
             $r.Data.detail | Should -Match 'line 3'
@@ -299,7 +356,7 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
             $r = Invoke-TestRoute POST '/api/config/open' -State $script:State
             $r.Status | Should -Be 200
             @($r.Data.config.pages).Count | Should -Be 4
-            Test-DesignerKnownPath -State $script:State -Path $path | Should -BeTrue
+            Test-DesignerKnownPath -State $script:State -Path $path -Kind config | Should -BeTrue
             $global:VouchDialogAnswer = ''
             (Invoke-TestRoute POST '/api/config/open' -State $script:State).Data.cancelled | Should -BeTrue
         }
@@ -307,7 +364,7 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
         It 'says when a file has comments, and the first save says they were not kept (once)' {
             $path = Join-Path $TestDrive 'commented.json'
             Set-Content -LiteralPath $path -Value "{`n  // my note`n  `"schemaVersion`": 1, `"pages`": [],`n}" -Encoding utf8NoBOM
-            [void](Add-DesignerKnownPath -State $script:State -Path $path)
+            [void](Add-DesignerKnownPath -State $script:State -Path $path -Kind config)
             $opened = Invoke-TestRoute POST '/api/config/open' ([ordered]@{ path = $path }) -State $script:State
             $opened.Data.hasComments | Should -BeTrue
             $config = ConvertFrom-VouchJson -Text ([System.IO.File]::ReadAllText($path))
@@ -320,17 +377,21 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
             @($second.Data.notices).Count | Should -Be 0
         }
 
-        It 'gives a preview of the logo the file names' {
-            $folder = Join-Path $TestDrive 'logo'
-            [void](New-Item -ItemType Directory -Path $folder -Force)
-            $bitmap = [System.Drawing.Bitmap]::new(4, 4)
-            try { $bitmap.Save((Join-Path $folder 'logo.png'), [System.Drawing.Imaging.ImageFormat]::Png) } finally { $bitmap.Dispose() }
-            $path = Join-Path $folder 'c.json'
-            Set-Content -LiteralPath $path -Value '{ "schemaVersion": 1, "report": { "logoPath": "logo.png" }, "pages": [] }' -Encoding utf8NoBOM
-            [void](Add-DesignerKnownPath -State $script:State -Path $path)
+        It 'never reads a logo path named inside an opened file (<Case>)' -ForEach @(
+            @{ Case = 'a relative file'; Logo = 'logo.png' }
+            @{ Case = 'a UNC path'; Logo = '\\\\attacker.example\\share\\logo.png' }
+            @{ Case = 'a device path'; Logo = '\\\\.\\COM1' }
+            @{ Case = 'a long-path device form'; Logo = '\\\\?\\UNC\\attacker.example\\share\\x.png' }
+        ) {
+            Mock Get-LogoDataUri { throw 'opening a file must not read its logo' }
+            Mock Test-Path { throw 'opening a file must not probe its logo' } -ParameterFilter { "$LiteralPath$Path" -match 'attacker|COM1|logo\.png' }
+            $path = Join-Path $TestDrive 'logo-open.json'
+            Set-Content -LiteralPath $path -Value ('{ "schemaVersion": 1, "report": { "logoPath": "' + $Logo + '" }, "pages": [] }') -Encoding utf8NoBOM
+            [void](Add-DesignerKnownPath -State $script:State -Path $path -Kind config)
             $r = Invoke-TestRoute POST '/api/config/open' ([ordered]@{ path = $path }) -State $script:State
-            $r.Data.logo.dataUri | Should -BeLike 'data:image/png;base64,*'
-            $r.Data.logo.path | Should -Be (Join-Path $folder 'logo.png')
+            $r.Status | Should -Be 200
+            $r.Data.logo | Should -BeNullOrEmpty
+            Should -Invoke Get-LogoDataUri -Exactly 0
         }
     }
 
@@ -338,7 +399,7 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
         It 'writes the sample back byte for byte after opening it unchanged' {
             $path = Copy-Sample 'roundtrip.json'
             $before = [System.IO.File]::ReadAllBytes($path)
-            [void](Add-DesignerKnownPath -State $script:State -Path $path)
+            [void](Add-DesignerKnownPath -State $script:State -Path $path -Kind config)
             $opened = Invoke-TestRoute POST '/api/config/open' ([ordered]@{ path = $path }) -State $script:State
             $config = (ConvertFrom-VouchJson -Text $opened.Response.Body)['config']
             $saved = Invoke-TestRoute POST '/api/config/save' ([ordered]@{ path = $path; config = $config }) -State $script:State
@@ -351,7 +412,7 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
         It 'refuses a configuration with errors (422) and writes nothing' {
             $path = Copy-Sample 'refused.json'
             $before = [System.IO.File]::ReadAllText($path)
-            [void](Add-DesignerKnownPath -State $script:State -Path $path)
+            [void](Add-DesignerKnownPath -State $script:State -Path $path -Kind config)
             $config = ConvertFrom-VouchJson -Text $before
             $config['pages'][1]['url'] = 'not a url'
             $config['pages'][1]['id'] = 'P001'
@@ -366,7 +427,7 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
         It 'writes atomically: stable key order, unknown keys kept, UTF-8 without BOM, a final line break, one .bak' {
             $path = Join-Path $TestDrive 'order.json'
             Set-Content -LiteralPath $path -Value '{ "old": 1 }' -Encoding utf8NoBOM -NoNewline
-            [void](Add-DesignerKnownPath -State $script:State -Path $path)
+            [void](Add-DesignerKnownPath -State $script:State -Path $path -Kind config)
             $config = [ordered]@{
                 pages = [System.Collections.Generic.List[object]]@([ordered]@{
                         actions = [System.Collections.Generic.List[object]]@([ordered]@{ scroll = [ordered]@{ as = 'single'; mode = 'page' }; label = 'L'; type = 'capture'; later = 'kept' })
@@ -417,7 +478,7 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
         It 'keeps the line ends of an existing LF file' {
             $path = Join-Path $TestDrive 'lf.json'
             [System.IO.File]::WriteAllText($path, "{`n  `"schemaVersion`": 1`n}`n")
-            [void](Add-DesignerKnownPath -State $script:State -Path $path)
+            [void](Add-DesignerKnownPath -State $script:State -Path $path -Kind config)
             [void](Invoke-TestRoute POST '/api/config/save' ([ordered]@{ path = $path; config = [ordered]@{ schemaVersion = 1; name = 'x' } }) -State $script:State)
             [System.IO.File]::ReadAllText($path) | Should -Be "{`n  `"schemaVersion`": 1,`n  `"name`": `"x`"`n}`n"
         }
@@ -435,7 +496,7 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
             $r.Data.backup | Should -Be ''
             $r.Data.config.name | Should -Be 'Q3 ITGC'
             $script:State.ConfigPath | Should -Be $target
-            Test-DesignerKnownPath -State $script:State -Path $target | Should -BeTrue
+            Test-DesignerKnownPath -State $script:State -Path $target -Kind config | Should -BeTrue
             $global:VouchDialogAnswer = ''
             (Invoke-TestRoute POST '/api/config/save' ([ordered]@{ config = $config; saveAs = $true }) -State $script:State).Data.cancelled | Should -BeTrue
         }
@@ -466,7 +527,7 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
         It 'lists the problems of a CSV that cannot be imported' {
             $csv = Join-Path $TestDrive 'bad.csv'
             Set-Content -LiteralPath $csv -Value "Name,Url,Steps,ScrollFullPage,Notes`nA,ftp://x,,N,`n,https://ok.example/,,Q," -Encoding utf8NoBOM
-            [void](Add-DesignerKnownPath -State $script:State -Path $csv)
+            [void](Add-DesignerKnownPath -State $script:State -Path $csv -Kind csv)
             $r = Invoke-TestRoute POST '/api/config/import-csv' ([ordered]@{ path = $csv }) -State $script:State
             $r.Status | Should -Be 422
             @($r.Data.problems).Count | Should -Be 3
@@ -502,7 +563,8 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
             $r = Invoke-TestRoute POST '/api/dialog' ([ordered]@{ kind = 'folder'; title = 'Choose the output folder' }) -State $script:State
             $r.Data.path | Should -Be $inside
             $r.Data.value | Should -Be 'out\evidence'
-            Test-DesignerKnownPath -State $script:State -Path $inside | Should -BeTrue
+            Test-DesignerKnownPath -State $script:State -Path $inside -Kind folder | Should -BeTrue
+            Test-DesignerKnownPath -State $script:State -Path $inside -Kind config | Should -BeFalse
             Should -Invoke Show-DesignerFileDialog -ParameterFilter { $Title -eq 'Choose the output folder' } -Exactly 1
             Mock Show-DesignerFileDialog { 'D:\elsewhere\logo.png' } -ParameterFilter { $Kind -eq 'open' }
             $r = Invoke-TestRoute POST '/api/dialog' ([ordered]@{ kind = 'image' }) -State $script:State
@@ -521,7 +583,7 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
             $none.Data.saved | Should -BeFalse
             $none.Data.run | Should -Be ''
             $path = Copy-Sample 'command.json'
-            [void](Add-DesignerKnownPath -State $script:State -Path $path)
+            [void](Add-DesignerKnownPath -State $script:State -Path $path -Kind config)
             $same = Invoke-TestRoute POST '/api/command' ([ordered]@{ config = $config; path = $path }) -State $script:State
             $same.Data.unsaved | Should -BeFalse
             $same.Data.run | Should -BeLike "pwsh -NoProfile -ExecutionPolicy Bypass -File ""*vouch.ps1"" -ConfigPath ""$path"""
@@ -542,6 +604,30 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
             Should -Invoke Open-ReportFile -Exactly 1 -ParameterFilter { $Path -eq $TestDrive }
             $script:State.OpenTargets['report'] = $script:State.ConfigPath
             (Invoke-TestRoute POST '/api/open' ([ordered]@{ what = 'report' }) -State $script:State).Status | Should -Be 200
+        }
+
+        It 'accepts a handed-out path only for its own kind of file' {
+            $config = Join-Path $TestDrive 'kind.json'; Copy-Item -LiteralPath $script:SamplePath -Destination $config
+            $logo = Join-Path $TestDrive 'kind-logo.png'; [System.IO.File]::WriteAllBytes($logo, [byte[]](1, 2, 3))
+            $csv = Join-Path (Split-Path $script:VouchPath) 'captures.template.csv'
+            $global:VouchDialogAnswer = $logo
+            Mock Show-DesignerFileDialog { $global:VouchDialogAnswer }
+            [void](Invoke-TestRoute POST '/api/dialog' ([ordered]@{ kind = 'image' }) -State $script:State)
+            $global:VouchDialogAnswer = $csv
+            [void](Invoke-TestRoute POST '/api/dialog' ([ordered]@{ kind = 'csv' }) -State $script:State)
+            [void](Add-DesignerKnownPath -State $script:State -Path $config -Kind config)
+            $minimal = [ordered]@{ schemaVersion = 1 }
+            foreach ($case in @(
+                    @('/api/config/save', $logo), @('/api/config/save', $csv), @('/api/config/save', "$config.bak"),
+                    @('/api/config/open', $logo), @('/api/config/open', $csv), @('/api/command', $logo), @('/api/config/import-csv', $config))) {
+                $r = Invoke-TestRoute POST $case[0] ([ordered]@{ path = $case[1]; config = $minimal }) -State $script:State
+                $r.Status | Should -Be 403 -Because "$($case[0]) must refuse $($case[1])"
+                $request = New-DesignerRequest -Method POST -Path $case[0] -Headers (New-GoodHeaders $script:State -Post) -BodyText (@{ path = $case[1]; config = @{} } | ConvertTo-Json)
+                (Test-DesignerRequest -Request $request -State $script:State).Status | Should -Be 403
+            }
+            [System.IO.File]::ReadAllBytes($logo) | Should -Be ([byte[]](1, 2, 3))
+            (Invoke-TestRoute POST '/api/config/import-csv' ([ordered]@{ path = $csv }) -State $script:State).Status | Should -Be 200
+            (Invoke-TestRoute POST '/api/config/open' ([ordered]@{ path = $config }) -State $script:State).Status | Should -Be 200
         }
 
         It 'stops the loop on POST /api/shutdown' {
@@ -574,10 +660,30 @@ Describe 'Command lines (Get-VouchCommandLine)' {
         $argument | Should -Not -BeOfType [System.Management.Automation.Language.ExpandableStringExpressionAst]
     }
 
-    It 'quotes for cmd.exe, doubling backslashes before the closing quote, and gives up on a double quote' {
+    It 'quotes for cmd.exe, doubling backslashes before the closing quote, and gives up on what cmd.exe would change' {
         ConvertTo-DesignerCmdArgument -Value 'C:\R&D (x)\a b.json' | Should -Be '"C:\R&D (x)\a b.json"'
         ConvertTo-DesignerCmdArgument -Value 'C:\out\' | Should -Be '"C:\out\\"'
-        ConvertTo-DesignerCmdArgument -Value 'say "hi"' | Should -BeNullOrEmpty
+        ConvertTo-DesignerCmdArgument -Value 'up ^ caret | pipe <x>' | Should -Be '"up ^ caret | pipe <x>"'
+        foreach ($bad in 'say "hi"', '100% done', '%USERNAME%', 'hello!', "two`nlines", "cr`rhere") {
+            ConvertTo-DesignerCmdArgument -Value $bad | Should -BeNullOrEmpty -Because $bad
+        }
+    }
+
+    It 'leaves values cmd.exe would change out of the cmd.exe line, and gives no cmd.exe line for such a path' {
+        $config = Get-DefaultVouchConfig
+        $config['report']['company']['name'] = '100% %USERNAME% Ltd'
+        $config['report']['origin'] = 'Hello!'
+        $line = Get-VouchCommandLine -Config $config -ConfigPath (Join-Path $TestDrive 'plain\c.json') -ScriptPath $script:VouchPath
+        $line.RunExpanded | Should -Match '-CompanyName "100% %USERNAME% Ltd"'
+        $line.RunExpanded | Should -Match '-Origin "Hello!"'
+        $line.RunExpandedCmd | Should -Not -Match 'CompanyName|Origin'
+        ($line.Notes -join ' ') | Should -Match '-CompanyName is left out of the cmd.exe line'
+        $odd = Get-VouchCommandLine -Config $config -ConfigPath (Join-Path $TestDrive '100% sure\c.json') -ScriptPath $script:VouchPath
+        $odd.Run | Should -Not -BeNullOrEmpty
+        $odd.RunCmd | Should -Be ''
+        $odd.RunExpandedCmd | Should -Be ''
+        $odd.ScheduleCmd | Should -Be ''
+        ($odd.Notes -join ' ') | Should -Match 'no cmd.exe version'
     }
 
     It 'reads the parameter defaults from vouch.ps1 itself' {
@@ -698,7 +804,50 @@ Describe 'Running the command the Designer shows (real script, headless Edge)' -
         $rows.Count | Should -BeGreaterThan 2
         @($rows | Where-Object { -not $_.Ok }).Count | Should -Be 0
     }
-}
+
+    It 'the spelled-out <Shell> command passes every value it writes exactly, and the file supplies the rest' -ForEach @(@{ Shell = 'PowerShell' }, @{ Shell = 'cmd.exe' }) {
+        $title = 'Q3 R&D ''review'' $HOME `n é (draft)'
+        $description = 'He said "yes" & left'
+        $company = '100% %USERNAME% Müller'
+        $config = ConvertFrom-VouchJson -Text ([System.IO.File]::ReadAllText($script:OddConfig))
+        $config['output']['reportName'] = 'expanded'
+        $config['output']['jsonSummary'] = $true
+        $config['report']['title'] = $title
+        $config['report']['description'] = $description
+        $config['report']['company']['name'] = $company
+        $file = Join-Path $script:Odd 'expanded.json'
+        [void](Save-VouchConfig -Config $config -Path $file)
+        $line = Get-VouchCommandLine -Config $config -ConfigPath $file -ScriptPath (Join-Path $script:Odd 'vouch.ps1')
+        # The file now says something else: whatever the run shows from the file was not on the command line.
+        $config['report']['title'] = 'FROM FILE title'
+        $config['report']['description'] = 'FROM FILE description'
+        $config['report']['company']['name'] = 'FROM FILE company'
+        [void](Save-VouchConfig -Config $config -Path $file)
+        $out = Join-Path $script:Odd 'out'
+        if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Recurse -Force }
+        $log = Join-Path $TestDrive "expanded-$Shell.txt"
+        if ($Shell -eq 'PowerShell') {
+            $line.RunExpanded | Should -Match '-Description '
+            $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($line.RunExpanded + '; exit $LASTEXITCODE'))
+            $process = Start-Process -FilePath (Get-Process -Id $PID).Path -NoNewWindow -Wait -PassThru -RedirectStandardOutput $log -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded
+        }
+        else {
+            $line.RunExpandedCmd | Should -Match '-ReportTitle '
+            $line.RunExpandedCmd | Should -Not -Match '-Description |-CompanyName '
+            $process = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -NoNewWindow -Wait -PassThru -RedirectStandardOutput $log -ArgumentList "/d /s /c `"$($line.RunExpandedCmd)`""
+        }
+        $process.ExitCode | Should -Be 0 -Because (Get-Content -Raw -LiteralPath $log)
+        $summary = Get-Content -Raw -LiteralPath (Join-Path $out 'expanded.json') | ConvertFrom-Json
+        $summary.ReportDetails.Title | Should -BeExactly $title
+        if ($Shell -eq 'PowerShell') {
+            $summary.ReportDetails.Description | Should -BeExactly $description
+            $summary.ReportDetails.Company.Name | Should -BeExactly $company
+        }
+        else {
+            $summary.ReportDetails.Description | Should -BeExactly 'FROM FILE description'
+            $summary.ReportDetails.Company.Name | Should -BeExactly 'FROM FILE company'
+        }
+    }}
 
 Describe 'The real listener (child pwsh, real sockets)' -Tag 'Integration' {
     BeforeAll { $script:Live = Start-DesignerTestServer -Name 'live' }
@@ -735,7 +884,10 @@ Describe 'The real listener (child pwsh, real sockets)' -Tag 'Integration' {
         $preflight.Headers.Keys | Where-Object { $_ -like 'Access-Control-*' } | Should -BeNullOrEmpty
         $own = $post + @{ Origin = $script:Live.Base }
         (Invoke-RawRequest -Method POST -Url "$($script:Live.Base)/api/config/new" -Headers $own -Body '{}' -ContentType 'text/plain').Status | Should -Be 415
-        (Invoke-RawRequest -Method POST -Url "$($script:Live.Base)/api/config/validate" -Headers $own -Body ('{"x":"' + ('a' * 5MB) + '"}') -ContentType 'application/json').Status | Should -Be 413
+        # Refused on the declared length alone; with Expect: 100-continue the client sends
+        # the body only if the server asks for it, which it never does here.
+        (Invoke-RawRequest -Method POST -Url "$($script:Live.Base)/api/config/validate" -Headers $own -Body ('{"x":"' + ('a' * 5MB) + '"}') -ContentType 'application/json' -ExpectContinue).Status | Should -Be 413
+        (Invoke-RawRequest -Method POST -Url "$($script:Live.Base)/api/config/validate" -Headers @{ 'X-Vouch-Token' = 'wrong'; Origin = $script:Live.Base } -Body ('{"x":"' + ('a' * 5MB) + '"}') -ContentType 'application/json' -ExpectContinue).Status | Should -Be 403
         $ok = Invoke-RawRequest -Method POST -Url "$($script:Live.Base)/api/config/new" -Headers $own -Body '{}' -ContentType 'application/json'
         $ok.Status | Should -Be 200
         ($ok.Body | ConvertFrom-Json).config.schemaVersion | Should -Be 1
@@ -994,7 +1146,7 @@ return { q: o.jpegQuality, zip: o.zip, embed: o.embedImages, log: o.captureLog, 
 D.setTab('run');
 await D.refreshCommand();
 const box = document.querySelector('#command-box');
-return { text: box.textContent, codes: Array.from(box.querySelectorAll('pre code')).map(c => c.textContent), warning: !!box.querySelector('.callout-warning'),
+return { text: box.textContent, codes: [S.command.run], warning: !!box.querySelector('.callout-warning'),
   later: document.querySelector('.later-note') ? document.querySelector('.later-note').textContent : '' };
 '@
         $r.warning | Should -BeTrue
@@ -1024,6 +1176,131 @@ return { ok, dirty: D.isDirty(), marker: !document.querySelector('#dirty-marker'
         ($r.config | ConvertTo-Json -Depth 64 -Compress) | Should -Be (($saved | ConvertTo-Json -Depth 64 -Compress))
         $r.expanded | Should -Match '-JpegQuality 70'
         "$($script:PanelConfig).bak" | Should -Exist
+    }
+
+    It 'shows each command one switch per line, and Copy gives the exact one-line command' {
+        $r = Invoke-Panel @'
+D.setTab('run');
+await D.refreshCommand();
+let copied = null;
+Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: text => { copied = text; return Promise.resolve(); } } });
+Array.from(document.querySelectorAll('#command-box button')).find(b => b.dataset.fkey === 'copy:expanded').click();
+await new Promise(r => setTimeout(r, 50));
+const pre = document.querySelectorAll('#command-box pre.command-text')[1];
+const lines = Array.from(pre.querySelectorAll('.cmd-line')).map(e => e.textContent);
+const box = document.querySelector('#command-box');
+return { copied, api: S.command.runExpanded, lines, schedule: S.command.schedule, shown: box.textContent,
+  later: document.querySelector('#panel-run .later-note').textContent };
+'@
+        $r.copied | Should -BeExactly $r.api
+        ($r.lines -join ' ') | Should -BeExactly $r.api
+        $r.lines[0] | Should -Be 'pwsh -NoProfile -ExecutionPolicy Bypass'
+        $r.lines[1] | Should -BeLike '-File *vouch.ps1"'
+        foreach ($line in $r.lines | Select-Object -Skip 1) { $line | Should -Match '^-[A-Za-z]+( |$)' }
+        $r.lines | Should -Contain '-SaveImages'
+        $r.schedule | Should -Not -BeNullOrEmpty
+        $r.shown | Should -Not -Match 'Install-VouchSchedule'
+        $r.shown | Should -Match 'on a schedule comes in a later step'
+        $r.later | Should -Match 'copy the command below'
+    }
+
+    It 'keeps edits made while a save is on its way, and leaves them marked unsaved' {
+        $r = Invoke-Panel @'
+D.setTab('pages'); D.selectPage(0);
+const saving = D.save(false);
+__type('pages[0].notes', 'typed while saving');
+const ok = await saving;
+return { ok, notes: __cfg().pages[0].notes, dirty: D.isDirty(), marker: !document.querySelector('#dirty-marker').hidden, field: __field('pages[0].notes').value };
+'@
+        $r.ok | Should -BeTrue
+        $r.notes | Should -Be 'typed while saving'
+        $r.field | Should -Be 'typed while saving'
+        $r.dirty | Should -BeTrue
+        $r.marker | Should -BeTrue
+        $saved = ConvertFrom-VouchJson -Text ([System.IO.File]::ReadAllText($script:PanelConfig))
+        $saved['pages'][0]['notes'] | Should -Not -Be 'typed while saving'
+    }
+
+    It 'blocks the panel while a server-side file dialog is open' {
+        $r = Invoke-Panel @'
+let release;
+const pending = D.whileServerDialog(() => new Promise(r => { release = r; }));
+await new Promise(r => setTimeout(r, 30));
+const busy = document.querySelector('#busy');
+const open = busy.open;
+const before = JSON.stringify(__cfg());
+document.dispatchEvent(new KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true }));
+busy.dispatchEvent(new Event('cancel', { cancelable: true }));
+const stillOpen = busy.open;
+const after = JSON.stringify(__cfg());
+release('answer');
+const value = await pending;
+return { open, stillOpen, unchanged: before === after, value, closed: !busy.open, title: document.querySelector('#busy-title').textContent };
+'@
+        $r.open | Should -BeTrue
+        $r.stillOpen | Should -BeTrue
+        $r.unchanged | Should -BeTrue
+        $r.value | Should -Be 'answer'
+        $r.closed | Should -BeTrue
+        $r.title | Should -Be 'Waiting for the file dialog…'
+    }
+
+    It 'leaves no empty strings or empty overrides behind, but keeps empties the file already had' {
+        $r = Invoke-Panel @'
+D.addPage();
+const n = __cfg().pages.length - 1;
+const newKeys = Object.keys(__cfg().pages[n]);
+const captureKeys = Object.keys(__cfg().pages[n].actions[0]);
+__type('pages[' + n + '].notes', 'n');
+__type('pages[' + n + '].notes', '');
+const notesKept = 'notes' in __cfg().pages[n];
+D.deletePage(n);
+D.selectPage(3); S.overridesOpen = true; D.setTab('pages');
+Array.from(document.querySelectorAll('button')).find(b => b.dataset.fkey === 'reset:pages[3].overrides.maxScrollSegments').click();
+const overridesKept = 'overrides' in __cfg().pages[3];
+D.undo();
+D.selectPage(0); S.overridesOpen = true; D.setTab('pages');
+__type('pages[0].overrides.zoomPercent', '90');
+__type('pages[0].overrides.zoomPercent', '');
+const emptyOverridesKept = JSON.stringify(__cfg().pages[0].overrides);
+D.setTab('report');
+__type('report.origin', 'x');
+__type('report.origin', '');
+const origin = __cfg().report.origin;
+__type('report.company.name', '');
+const company = 'name' in __cfg().report.company;
+return { newKeys, captureKeys, notesKept, overridesKept, emptyOverridesKept, origin, company };
+'@
+        $r.newKeys | Should -Be @('id', 'name', 'url', 'enabled', 'actions')
+        $r.captureKeys | Should -Be @('type', 'scroll')
+        $r.notesKept | Should -BeFalse
+        $r.overridesKept | Should -BeFalse
+        $r.emptyOverridesKept | Should -Be '{}'
+        $r.origin | Should -Be ''
+        $r.company | Should -BeFalse
+    }
+
+    It 'keeps what was typed when switching a click between words and selector' {
+        $r = Invoke-Panel @'
+D.setTab('pages'); D.selectPage(1); S.openAction = 0; D.setTab('pages');
+const path = 'pages[1].actions[0]';
+const start = JSON.stringify(__cfg().pages[1].actions[0]);
+__radio(path + '.type', 'click');
+const asClick = JSON.stringify(__cfg().pages[1].actions[0]);
+__type(path + '.selector', '#tab-audit');
+__radio(path + '.type', 'clickText');
+const back = JSON.stringify(__cfg().pages[1].actions[0]);
+__radio(path + '.type', 'click');
+const again = JSON.stringify(__cfg().pages[1].actions[0]);
+S.openAction = -1; D.setTab('pages');
+const stash = S.clickStash;
+return { start, asClick, back, again, stash };
+'@
+        $r.start | Should -Be '{"type":"clickText","text":"Audit Log"}'
+        $r.asClick | Should -Be '{"type":"click","selector":""}'
+        $r.back | Should -Be '{"type":"clickText","text":"Audit Log"}'
+        $r.again | Should -Be '{"type":"click","selector":"#tab-audit"}'
+        $r.stash | Should -BeNullOrEmpty
     }
 
     It 'shows the later-step buttons as unavailable, with an explanation instead of an action' {
@@ -1097,7 +1374,34 @@ Describe 'Designer mode in vouch.ps1 and the panel window' {
         $profile = Get-DesignerPanelProfile
         $profile | Should -Be (Join-Path $env:LOCALAPPDATA 'Vouch\DesignerPanel')
         $profile.Contains((Join-Path $env:LOCALAPPDATA 'Vouch\EdgeProfile'), [System.StringComparison]::OrdinalIgnoreCase) | Should -BeFalse
-        { Start-DesignerPanel -Url 'http://localhost:5/' -ProfileDir (Join-Path $env:LOCALAPPDATA 'Vouch\EdgeProfile\x') } | Should -Throw '*audit browser profile*'
+        { Start-DesignerPanel -Url 'http://localhost:5/' -ProfileDir (Join-Path $env:LOCALAPPDATA 'Vouch\EdgeProfile\x') } | Should -Throw '*overlap*'
+    }
+
+    It 'keeps the panel profile and the audit profile apart: <Case>' -ForEach @(
+        @{ Case = 'audit profile whose name starts with the panel''s'; Audit = 'C:\P\Vouch\DesignerPanel2'; Bad = $true }
+        @{ Case = 'audit profile inside the panel profile'; Audit = 'C:\P\Vouch\DesignerPanel\audit'; Bad = $true }
+        @{ Case = 'panel profile inside the audit profile'; Audit = 'C:\P\Vouch'; Bad = $true }
+        @{ Case = 'the same folder, other capitals'; Audit = 'c:\p\vouch\designerpanel\'; Bad = $true }
+        @{ Case = 'separate folders'; Audit = 'C:\P\Vouch\EdgeProfile'; Bad = $false }
+    ) {
+        $problem = Test-DesignerProfileOverlap -PanelProfile 'C:\P\Vouch\DesignerPanel' -AuditProfile $Audit
+        if ($Bad) { $problem | Should -Match 'overlap' } else { $problem | Should -Be '' }
+    }
+
+    It 'finds the audit profile in effect and checks it at start' {
+        $folder = Join-Path $TestDrive 'audit'
+        [void](New-Item -ItemType Directory -Path $folder -Force)
+        $config = Join-Path $folder 'c.json'
+        Set-Content -LiteralPath $config -Value '{ "schemaVersion": 1, "browser": { "profileDir": "profiles\\DesignerPanel-copy" }, "pages": [] }' -Encoding utf8NoBOM
+        Get-DesignerAuditProfile -ConfigPath $config | Should -Be (Join-Path $folder 'profiles\DesignerPanel-copy')
+        Get-DesignerAuditProfile -EdgeProfileDir 'C:\typed' -ConfigPath $config | Should -Be 'C:\typed'
+        Get-DesignerAuditProfile | Should -Be (Join-Path $env:LOCALAPPDATA 'Vouch\EdgeProfile')
+        $state = New-TestState
+        $state.PanelProfileDir = Join-Path $folder 'profiles\DesignerPanel'
+        { Assert-DesignerProfileSeparate -State $state -AuditProfile (Get-DesignerAuditProfile -ConfigPath $config) } | Should -Throw '*overlap*'
+        Assert-DesignerProfileSeparate -State $state -AuditProfile 'C:\elsewhere\EdgeProfile'
+        $state.AuditProfileDir | Should -Be 'C:\elsewhere\EdgeProfile'
+        { Start-VouchDesigner -ScriptPath $script:VouchPath -ConfigPath $config -NoPanel -PanelProfileDir (Join-Path $folder 'profiles\DesignerPanel') 6>$null } | Should -Throw '*overlap*'
     }
 
     It 'puts the panel about 480 px wide at the right of the working area, full height' {
