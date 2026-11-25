@@ -344,6 +344,7 @@ select.input { padding-right: var(--s5); }
 .command-text { white-space: normal; }
 .cmd-line { display: block; padding-left: 2ch; text-indent: -2ch; white-space: pre-wrap; overflow-wrap: anywhere; }
 .busy { width: min(380px, calc(100vw - 2 * var(--s4))); }
+.busy p + p { margin-top: var(--s2); }
 .cmd-variant summary { cursor: pointer; color: var(--muted); font-weight: 600; padding: var(--s1) 0; }
 .cmd-variant[open] { display: grid; gap: var(--s2); }
 .notes { margin: 0; padding-left: var(--s5); color: var(--muted); font-size: 0.93rem; display: grid; gap: var(--s1); }

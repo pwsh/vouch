@@ -1853,8 +1853,12 @@ Describe 'Browser link and picker in headless Edge (functions called directly)' 
 (function () {
   var el = ($Element); el.scrollIntoView({ block: 'nearest' });
   var r = el.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2, w = el.ownerDocument.defaultView;
-  while (w.frameElement) { var f = w.frameElement.getBoundingClientRect(); x += f.left + w.frameElement.clientLeft; y += f.top + w.frameElement.clientTop; w = w.parent; }
-  return { x: x, y: y };
+  while (w.frameElement) {
+    var fe = w.frameElement, f = fe.getBoundingClientRect(), cs = w.parent.getComputedStyle(fe);
+    x += f.left + parseFloat(cs.borderLeftWidth) + parseFloat(cs.paddingLeft); y += f.top + parseFloat(cs.borderTopWidth) + parseFloat(cs.paddingTop); w = w.parent;
+  }
+  // A tall element's centre can be below the window: stay inside it.
+  return { x: Math.min(Math.max(x, 5), window.innerWidth - 5), y: Math.min(Math.max(y, 5), window.innerHeight - 5) };
 })()
 "@
         }
@@ -2170,23 +2174,6 @@ Describe 'Browser link and picker in headless Edge (functions called directly)' 
         $r.result.candidates[0].value | Should -Be 'Reports'
     }
 
-    It 'picks with the keyboard (Enter on a focused control) without activating it: <Case>' -ForEach @(
-        @{ Case = 'a button'; Focus = "document.getElementById('fav')"; Value = '#fav' }
-        @{ Case = 'a field in a form with no submit button (no implicit submission)'; Focus = "document.getElementById('q')"; Value = '#q' }
-        @{ Case = 'a button inside the same-site frame'; Focus = "document.getElementById('sameframe').contentDocument.getElementById('framebtn')"; Value = '#framebtn' }
-    ) {
-        Open-TestPage "/pickme?x=$($script:Web2)"
-        $before = Get-PageTrace
-        [void](Invoke-CdpEval -Expression "($Focus).focus(); true")
-        [void](Start-ElementPick -State $script:B -Mode click)
-        Send-TestKey -Key 'Enter' -Code 13
-        $r = Wait-TestPick
-        $r.state | Should -Be 'done' -Because $r['message']
-        @($r.result.candidates | ForEach-Object { $_.value }) | Should -Contain $Value
-        Assert-SiteUntouched
-        (Get-PageTrace) | Should -BeExactly $before
-    }
-
     It 'keeps scrolling possible during a pick: the wheel reaches the panel, the frame and the page under the pointer' {
         Open-TestPage "/pickme?x=$($script:Web2)"
         [void](Start-ElementPick -State $script:B -Mode click)
@@ -2200,9 +2187,194 @@ Describe 'Browser link and picker in headless Edge (functions called directly)' 
             Start-Sleep -Milliseconds 300
             [double](Invoke-CdpEval -Expression $case.Probe) | Should -BeGreaterThan $was -Because "$($case.El) must scroll"
         }
+        # Sideways too; the site's own wheel listeners do not see a wheel the picker handled.
+        $p = Get-TestPoint "document.getElementById('hscroll')"
+        [void](Send-CdpCommand -Method 'Input.dispatchMouseEvent' -Params @{ type = 'mouseWheel'; x = [double]$p.x; y = [double]$p.y; deltaX = 120; deltaY = 0 })
+        Start-Sleep -Milliseconds 300
+        [double](Invoke-CdpEval -Expression "document.getElementById('hscroll').scrollLeft") | Should -BeGreaterThan 0
+        Invoke-CdpEval -Expression 'window.__wheels.length' | Should -Be 0
+        # Ctrl+wheel (the browser's zoom) is left alone: not prevented and seen by the site.
+        # (Headless Edge has no browser zoom, so its own default action scrolls; a window does not.)
+        $p = Get-TestPoint "document.getElementById('spacer')"
+        $width = Invoke-CdpEval -Expression 'window.innerWidth'
+        [void](Send-CdpCommand -Method 'Input.dispatchMouseEvent' -Params @{ type = 'mouseWheel'; x = [double]$p.x; y = [double]$p.y; deltaX = 0; deltaY = 120; modifiers = 2 })
+        Start-Sleep -Milliseconds 300
+        $wheels = Invoke-CdpEval -Expression 'JSON.stringify(window.__wheels)'
+        $wheels | Should -Be '[{"ctrl":true,"prevented":false}]'
         (Get-ElementPickResult -State $script:B).state | Should -Be 'picking'
         [void](Invoke-TestRoute POST '/api/pick/cancel' -State $script:B)
         Assert-SiteUntouched
+        Invoke-CdpEval -Expression 'window.innerWidth' | Should -Be $width
+    }
+
+    It 'keeps every key from the page: focus is parked, Enter/Space/Tab/letters do nothing, scroll keys scroll, Esc cancels' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        $before = Get-PageTrace
+        # The page has a control focused when the pick starts, and focuses another one mid-pick.
+        [void](Invoke-CdpEval -Expression "document.getElementById('fav').focus(); true")
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Invoke-CdpEval -Expression 'document.activeElement.tagName' | Should -Be 'VOUCH-PICKER-UI'
+        [void](Invoke-CdpEval -Expression "setTimeout(function () { document.querySelector('[data-testid=save-settings]').focus(); }, 50); true")
+        Start-Sleep -Milliseconds 300
+        Invoke-CdpEval -Expression 'document.activeElement.tagName' | Should -Be 'VOUCH-PICKER-UI'
+        [void](Send-CdpCommand -Method 'Input.dispatchMouseEvent' -Params @{ type = 'mouseMoved'; x = 600.0; y = 700.0 })
+        $scrolled = [double](Invoke-CdpEval -Expression 'window.scrollY')
+        Send-TestKey -Key 'Enter' -Code 13
+        Send-TestKey -Key 'Tab' -Code 9
+        Send-TestKey -Key 'a' -Code 65
+        Send-TestKey -Key ' ' -Code 32
+        Start-Sleep -Milliseconds 300
+        (Get-ElementPickResult -State $script:B).state | Should -Be 'picking'
+        [double](Invoke-CdpEval -Expression 'window.scrollY') | Should -BeGreaterThan $scrolled
+        $p = Get-TestPoint "document.querySelector('#leftpanel div')"
+        [void](Send-CdpCommand -Method 'Input.dispatchMouseEvent' -Params @{ type = 'mouseMoved'; x = [double]$p.x; y = [double]$p.y })
+        Send-TestKey -Key 'ArrowDown' -Code 40
+        Start-Sleep -Milliseconds 200
+        [double](Invoke-CdpEval -Expression "document.getElementById('leftpanel').scrollTop") | Should -BeGreaterThan 0
+        $targets = @(Invoke-CdpEval -Expression 'window.__keyTargets')
+        $targets.Count | Should -BeGreaterThan 0
+        foreach ($t in $targets) { $t | Should -BeIn 'VOUCH-PICKER-UI', 'BODY' }
+        Assert-SiteUntouched
+        Send-TestKey -Key 'Escape' -Code 27
+        $r = Wait-TestPick
+        $r.state | Should -Be 'cancelled'
+        [void](Invoke-CdpEval -Expression "window.scrollTo(0, 0); document.getElementById('leftpanel').scrollTop = 0; true")
+        (Get-PageTrace) | Should -BeExactly $before
+    }
+
+    It 'keeps Enter, Space and Tab from a control focused inside a frame from another site' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        # A real click focuses the other site's button (and counts once in that page).
+        Send-TestClick (Get-TestPoint "document.getElementById('otherframe')")
+        Start-Sleep -Milliseconds 200
+        $readClicks = {
+            $tree = Send-CdpCommand -Method 'Page.getFrameTree'
+            $frame = @($tree.frameTree.childFrames | Where-Object { $_.frame.url -like "*:$($script:Web2)/*" })[0]
+            $world = Send-CdpCommand -Method 'Page.createIsolatedWorld' -Params @{ frameId = $frame.frame.id; worldName = 'vouch-test' }
+            (Send-CdpCommand -Method 'Runtime.evaluate' -Params @{ expression = "document.body.getAttribute('data-clicks') + '|' + (document.activeElement && document.activeElement.id)"; contextId = $world.executionContextId; returnByValue = $true }).result.value
+        }
+        $start = & $readClicks
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 400
+        Send-TestKey -Key 'Enter' -Code 13
+        Send-TestKey -Key ' ' -Code 32
+        Send-TestKey -Key 'Tab' -Code 9
+        Start-Sleep -Milliseconds 300
+        $after = & $readClicks
+        ($after -split '\|')[0] | Should -Be (($start -split '\|')[0]) -Because "the other site's button had focus ($start) and must not activate"
+        $r = Get-ElementPickResult -State $script:B
+        $r.state | Should -BeIn 'picking', 'error'
+        if ($r.state -eq 'error') { $r.code | Should -Be 'focus' }
+        else { Invoke-CdpEval -Expression 'document.activeElement.tagName' | Should -Be 'VOUCH-PICKER-UI' }
+        [void](Invoke-TestRoute POST '/api/pick/cancel' -State $script:B)
+    }
+
+    It 'picks inside top-layer content: <Case>' -ForEach @(
+        @{ Case = 'a modal dialog open before the pick'; Page = '&dialog=1'; Open = ''; El = "document.getElementById('dlgbtn')"; Text = 'Dialog action'; Hit = 'dialog' }
+        @{ Case = 'a modal dialog opened during the pick'; Page = ''; Open = "document.getElementById('dlg').showModal()"; El = "document.getElementById('dlgbtn')"; Text = 'Dialog action'; Hit = 'dialog' }
+        @{ Case = 'a popover'; Page = '&popover=1'; Open = ''; El = "document.getElementById('popbtn')"; Text = 'Popover action'; Hit = 'popover' }
+    ) {
+        $page = "/pickme?x=$($script:Web2)$Page"
+        Open-TestPage $page
+        [void](Start-ElementPick -State $script:B -Mode click)
+        if ($Open) { [void](Invoke-CdpEval -Expression "$Open; true"); Start-Sleep -Milliseconds 400 }
+        Send-TestClick (Get-TestPoint $El)
+        $r = Wait-TestPick
+        $r.state | Should -Be 'done' -Because "$($r['message']) $($r['notice'])"
+        Assert-SiteUntouched
+        $r.result.candidates[0].action.text | Should -Be $Text
+        Open-TestPage "/pickme?x=$($script:Web2)&$(if ($Hit -eq 'dialog') { 'dialog=1' } else { 'popover=1' })"
+        (Invoke-PageAction -Action (ConvertTo-TestAction $r.result.candidates[0].action) -Settings $script:Replay).Ok | Should -BeTrue
+        Invoke-CdpEval -Expression 'JSON.stringify(window.__hits)' | Should -Be "[`"$Hit`"]"
+    }
+
+    It 'never picks when the page opens a dialog at the press or changes what is under the pointer: <Case>' -ForEach @(
+        @{ Case = 'a modal dialog opened at the press'; Query = '&openOnDown=1'; Notice = 'changed under the pointer' }
+        @{ Case = 'the element swapped between press and release'; Query = '&swapOnUp=1'; Notice = 'changed under the pointer' }
+    ) {
+        Open-TestPage "/pickme?x=$($script:Web2)$Query"
+        $point = Get-TestPoint "document.getElementById('reports-a')"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Send-TestClick $point
+        Start-Sleep -Milliseconds 500
+        $r = Get-ElementPickResult -State $script:B
+        $r.state | Should -Be 'picking'
+        $r.notice | Should -Match $Notice
+        Invoke-CdpEval -Expression 'JSON.stringify(window.__hits)' | Should -Be '[]'
+        Invoke-CdpEval -Expression 'document.title' | Should -Be 'Pick me'
+        [void](Invoke-TestRoute POST '/api/pick/cancel' -State $script:B)
+        Invoke-CdpEval -Expression "typeof window.__vouchPicker + '|' + document.querySelectorAll('vouch-picker-ui').length" | Should -Be 'undefined|0'
+    }
+
+    It 'puts the picking layer back when the page removes it, and picks safely afterwards' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        $before = Get-PageTrace
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Invoke-CdpEval -Expression "document.querySelector('vouch-picker-ui').remove(); document.querySelectorAll('vouch-picker-ui').length" | Should -Be 0
+        Start-Sleep -Milliseconds 100
+        Invoke-CdpEval -Expression "document.querySelectorAll('vouch-picker-ui').length" | Should -Be 1
+        Send-TestClick (Get-TestPoint "document.querySelector('[data-testid=save-settings]')")
+        $r = Wait-TestPick
+        $r.state | Should -Be 'done'
+        Assert-SiteUntouched
+        (Get-PageTrace) | Should -BeExactly $before
+    }
+
+    It 'keeps covering the window when <html> is transformed (or ends the pick safely)' {
+        Open-TestPage "/pickme?x=$($script:Web2)&transform=1"
+        [void](Invoke-CdpEval -Expression 'window.scrollTo(0, 200); true')
+        [void](Start-ElementPick -State $script:B -Mode scroll)
+        Start-Sleep -Milliseconds 400
+        # The layer is in the top layer, whose box the transform of <html> does not move.
+        $r = Get-ElementPickResult -State $script:B
+        $r.state | Should -Be 'picking'
+        Send-TestClick (Get-TestPoint "document.querySelector('#leftpanel div:nth-child(3)')")
+        $r = Wait-TestPick
+        $r.state | Should -Be 'done'
+        $r.result.candidates[0].value | Should -Be '#leftpanel'
+        Assert-SiteUntouched
+    }
+
+    It 'picks in a padded frame, and refuses a scaled one' {
+        Open-TestPage '/framegeom'
+        $before = Get-PageTrace
+        $r = Invoke-TestPick 'click' "document.getElementById('padframe').contentDocument.getElementById('framebtn')"
+        $r.state | Should -Be 'done' -Because $r['message']
+        @($r.result.candidates | ForEach-Object { $_.value }) | Should -Contain '#framebtn'
+        (Get-PageTrace) | Should -BeExactly $before
+        Open-TestPage '/framegeom'
+        (Invoke-PageAction -Action (ConvertTo-TestAction $r.result.candidates[0].action) -Settings $script:Replay).Ok | Should -BeTrue
+        Invoke-CdpEval -Expression "document.getElementById('padframe').contentDocument.body.getAttribute('data-clicks')" | Should -Be '1'
+        Open-TestPage '/framegeom'
+        $before = Get-PageTrace
+        $r = Invoke-TestPick 'click' "document.getElementById('scaledframe')"
+        $r.state | Should -Be 'error'
+        $r.code | Should -Be 'transformed'
+        $r.message | Should -Match 'scaled or turned'
+        (Get-PageTrace) | Should -BeExactly $before
+        Invoke-CdpEval -Expression "document.getElementById('scaledframe').contentDocument.body.getAttribute('data-clicks')" | Should -BeNullOrEmpty
+    }
+
+    It 'refuses a full-screen element plainly (it stays above the picking layer), and the site never sees the click' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        $entered = Invoke-CdpEval -Expression "document.getElementById('leftpanel').requestFullscreen().then(() => !!document.fullscreenElement, () => false)"
+        if (-not $entered) { Set-ItResult -Skipped -Because 'this headless Edge does not enter full screen'; return }
+        try {
+            Start-Sleep -Milliseconds 300
+            $point = Get-TestPoint "document.querySelector('#leftpanel div:nth-child(2)')"
+            [void](Start-ElementPick -State $script:B -Mode scroll)
+            Start-Sleep -Milliseconds 400
+            Send-TestClick $point
+            Start-Sleep -Milliseconds 500
+            $r = Get-ElementPickResult -State $script:B
+            $r.state | Should -Be 'picking'
+            $r.notice | Should -Match 'shown full screen above everything else, so it cannot be picked by pointing'
+            Assert-SiteUntouched
+        }
+        finally {
+            [void](Invoke-TestRoute POST '/api/pick/cancel' -State $script:B)
+            [void](Invoke-CdpEval -Expression 'document.fullscreenElement ? document.exitFullscreen().then(() => true, () => true) : true')
+        }
     }
 
     It 'tests one action at a time through the engine: <Case>' -ForEach @(

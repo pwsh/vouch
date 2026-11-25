@@ -189,7 +189,9 @@ iframe{width:260px;height:110px;border:1px solid #888} #spacer{height:2500px;bac
 </div>
 <div class="row"><div><div><div><div><div><em onclick="hit('deep')">Deep target</em></div></div></div></div></div></div>
 <div class="row"><iframe id="sameframe" name="sameframe" src="/pickframe"></iframe><iframe id="otherframe" src="http://localhost:$other/pickframe"></iframe><div id="shadowhost"></div></div>
-<div><div class="panel" id="leftpanel">$rows</div> <div class="panel" id="rightpanel">$rows</div> <div id="clipbox"><div style="height:400px">Clipped content</div></div></div>
+<div><div class="panel" id="leftpanel">$rows</div> <div class="panel" id="rightpanel">$rows</div> <div id="clipbox"><div style="height:400px">Clipped content</div></div> <div id="hscroll" style="width:200px;overflow-x:auto;display:inline-block;vertical-align:top"><div style="width:1200px;height:60px">Wide content</div></div></div>
+<dialog id="dlg"><p>A dialog</p><button id="dlgbtn" onclick="hit('dialog')">Dialog action</button></dialog>
+<div popover="manual" id="pop"><button id="popbtn" onclick="hit('popover')">Popover action</button></div>
 <form id="lonely" action="/ok" onsubmit="window.__submits++; document.title = 'SUBMITTED'; return false;"><input id="q" name="q" value="find"></form>
 <div id="spacer">The rest of a tall page</div>
 <script>
@@ -205,6 +207,17 @@ window.__hits = []; window.__downs = 0; window.__keys = 0; window.__submits = 0;
 function hit(n) { window.__hits.push(n); document.title = 'HIT ' + n; return false; }
 document.addEventListener('mousedown', function () { window.__downs++; });
 document.addEventListener('keydown', function () { window.__keys++; });
+window.__keyTargets = []; window.__wheels = [];
+window.addEventListener('keydown', function (e) { window.__keyTargets.push(e.target && e.target.tagName); }, true);
+window.addEventListener('wheel', function (e) { window.__wheels.push({ ctrl: e.ctrlKey, prevented: e.defaultPrevented }); });
+var q = new URLSearchParams(location.search);
+if (q.get('dialog') === '1') { document.getElementById('dlg').showModal(); }
+if (q.get('popover') === '1') { document.getElementById('pop').showPopover(); }
+if (q.get('transform') === '1') { document.documentElement.style.transform = 'translateX(0px)'; }
+// A page that opens a modal dialog at the press, or rebuilds what is under the pointer
+// between press and release - both from capture listeners on window, before any picker.
+if (q.get('openOnDown') === '1') { window.addEventListener('pointerdown', function () { var d = document.getElementById('dlg'); if (!d.open) { d.showModal(); } }, true); }
+if (q.get('swapOnUp') === '1') { window.addEventListener('pointerup', function () { var a = document.getElementById('reports-a'); if (a) { var s = document.createElement('span'); s.id = 'swapped'; s.textContent = 'Swapped'; a.replaceWith(s); } }, true); }
 var shadowRoot = document.getElementById('shadowhost').attachShadow({ mode: 'open' });
 var shadowButton = document.createElement('button'); shadowButton.id = 'shadowbtn'; shadowButton.textContent = 'Shadow button';
 shadowButton.onclick = function () { hit('shadow'); }; shadowRoot.appendChild(shadowButton);
@@ -214,10 +227,16 @@ shadowButton.onclick = function () { hit('shadow'); }; shadowRoot.appendChild(sh
             }
             '^/pickframe$' {
                 $rows = (1..8 | ForEach-Object { "<div style='height:50px'>Frame row $_</div>" }) -join ''
-                $body = "<button id='framebtn' onclick=""try { top.__hits.push('frame'); top.document.title = 'HIT frame'; } catch (e) { document.title = 'HIT other frame'; }"">Frame action</button>$rows" +
+                $body = "<button id='framebtn' onclick=""document.body.setAttribute('data-clicks', String((+document.body.getAttribute('data-clicks') || 0) + 1)); try { top.__hits.push('frame'); top.document.title = 'HIT frame'; } catch (e) { document.title = 'HIT other frame'; }"">Frame action</button>$rows" +
                     "<script>['click', 'mousedown', 'pointerdown'].forEach(function (type) { window.addEventListener(type, function (e) { var t = e.target;" +
                     " if (t && t.closest && t.closest('button')) { try { top.__winHits.push('frame-' + type + ':' + t.id); } catch (x) { } } }, true); });</script>"
                 Send-Response $context 200 (Page 'Pick frame' $body)
+            }
+            '^/framegeom$' {
+                # A frame with a thick border and padding, and one shown scaled.
+                $body = "<iframe id='padframe' src='/pickframe' style='width:300px;height:150px;border:6px solid #888;padding:24px'></iframe>" +
+                    "<iframe id='scaledframe' src='/pickframe' style='width:300px;height:150px;border:0;transform:scale(0.8);transform-origin:0 0'></iframe>"
+                Send-Response $context 200 (Page 'Frame geometry' $body)
             }
             '^/slow$' {
                 $seconds = if ($query['s']) { [int]$query['s'] } else { 10 }

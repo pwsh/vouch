@@ -2795,12 +2795,37 @@ function Get-DesignerPickerText {
     return [ordered]@{
         banner      = $banner
         crossorigin = 'This part is a frame from another site: Vouch cannot record anything inside it.'
+        transformed = 'This frame is shown scaled or turned, so Vouch cannot tell exactly what you point at in it.'
         shadow      = 'This is inside a page component (shadow DOM) that Vouch cannot look into.'
+        changed     = (Get-DesignerPickNote -Code 'changed')
+        uncovered   = (Get-DesignerPickNote -Code 'uncovered')
+        'uncovered-dialog'     = (Get-DesignerPickNote -Code 'uncovered-dialog')
+        'uncovered-popup'      = (Get-DesignerPickNote -Code 'uncovered-popup')
+        'uncovered-fullscreen' = (Get-DesignerPickNote -Code 'uncovered-fullscreen')
         page        = 'The whole page'
         nothing     = 'Nothing here scrolls. Point inside the area with the scroll bar.'
         climbed     = 'part of it'
         checking    = 'Checking that Vouch can replay this…'
     }
+}
+
+function Get-DesignerPickNote {
+    <#
+        The words for a short note the picker reports by code while picking goes on: the
+        page changed between press and release, or the click landed on something the page
+        shows above the picking layer. Codes only come from the page, so an unknown one
+        gives ''.
+    #>
+    param([AllowEmptyString()][string]$Code)
+    $type = 'Type its words or selector in the Designer instead.'
+    switch -CaseSensitive ($Code) {
+        'changed' { return 'The page changed under the pointer between press and release, so nothing was picked. Click again.' }
+        'uncovered' { return "That part of the page is shown above Vouch's picking layer, so it cannot be picked by pointing. $type" }
+        'uncovered-dialog' { return "That is in a pop-up dialog the page shows above everything else, so it cannot be picked by pointing. $type" }
+        'uncovered-popup' { return "That is in a pop-up the page shows above everything else, so it cannot be picked by pointing. $type" }
+        'uncovered-fullscreen' { return "That is in a part of the page shown full screen above everything else, so it cannot be picked by pointing. $type" }
+    }
+    return ''
 }
 
 function Get-DesignerPickerScript {
@@ -2819,7 +2844,7 @@ function Get-DesignerPickerScript {
     if (-not [System.IO.File]::Exists($file)) { throw "A file of the Designer is missing: picker.js is not in $($State.DesignerDirectory). Copy the whole Vouch folder again." }
     $source = [System.IO.File]::ReadAllText($file)
     $texts = Get-DesignerPickerText -Mode $Mode
-    $pairs = foreach ($key in $texts.Keys) { "${key}: $(ConvertTo-JsLiteral -Value $texts[$key])" }
+    $pairs = foreach ($key in $texts.Keys) { "$(ConvertTo-JsLiteral -Value $key): $(ConvertTo-JsLiteral -Value $texts[$key])" }
     $config = "{ mode: $(ConvertTo-JsLiteral -Value $Mode), token: $(ConvertTo-JsLiteral -Value $Token), texts: { $($pairs -join ', ') } }"
     return "(function () {`n$(Get-FrameDocsScript)`nreturn ($source`n)($config);`n})()"
 }
@@ -3214,17 +3239,31 @@ function Update-ElementPick {
         return
     }
     $phase = [string](Get-DesignerValue -Object $status -Name 'phase')
+    $code = [string](Get-DesignerValue -Object $status -Name 'code')
     switch ($phase) {
-        'picking' { return }
+        'picking' {
+            # A short note while picking goes on (the page changed, or the click landed on
+            # something above the picking layer): known codes only, words from here.
+            $note = Get-DesignerPickNote -Code ([string](Get-DesignerValue -Object $status -Name 'note'))
+            if ($note) { $pick.Notice = $note }
+            return
+        }
         'picked' { Complete-ElementPick -State $State }
         'cancelled' { Close-ElementPick -State $State -Outcome cancelled -Code 'esc' -Message 'You cancelled picking in the browser (Esc).' }
         'blocked' {
-            $code = [string](Get-DesignerValue -Object $status -Name 'code')
-            $message = if ($code -eq 'crossorigin') {
-                'This cannot be recorded: it is inside a frame from another site, which Vouch cannot look into or click in. Open that frame''s address as a page of its own, or pick something outside the frame.'
+            switch ($code) {
+                'crossorigin' { $message = 'This cannot be recorded: it is inside a frame from another site, which Vouch cannot look into or click in. Open that frame''s address as a page of its own, or pick something outside the frame.' }
+                'transformed' { $message = 'This cannot be recorded by pointing: it is inside a frame the page shows scaled or turned, so Vouch cannot tell exactly what you point at. Pick something outside it, or type a selector in the Designer.' }
+                default { $code = 'shadow'; $message = 'This cannot be recorded: it is inside a page component (shadow DOM) that Vouch cannot look into, so a run could not find it. Pick something outside it, or use a wait instead.' }
             }
-            else { 'This cannot be recorded: it is inside a page component (shadow DOM) that Vouch cannot look into, so a run could not find it. Pick something outside it, or use a wait instead.' }
-            Close-ElementPick -State $State -Outcome error -Code $(if ($code -eq 'crossorigin') { 'crossorigin' } else { 'shadow' }) -Message $message
+            Close-ElementPick -State $State -Outcome error -Code $code -Message $message
+        }
+        'error' {
+            switch ($code) {
+                'focus' { Close-ElementPick -State $State -Outcome error -Code 'focus' -Message 'Picking stopped: the keyboard focus stayed inside a frame from another site, where Vouch cannot keep keys from acting on the page. Click outside that frame in Edge, then pick again.' }
+                'coverage' { Close-ElementPick -State $State -Outcome error -Code 'coverage' -Message 'Picking stopped: this page is built in a way that lets clicks past the picking layer (for example it replaces or transforms the whole page), so picking could not go on safely. Type the words or selector in the Designer instead.' }
+                default { Close-ElementPick -State $State -Outcome error -Code 'picker' -Message 'Picking stopped unexpectedly in the page. Pick again.' }
+            }
         }
         default { Close-ElementPick -State $State -Outcome error -Code 'picker' -Message 'Picking stopped unexpectedly in the page. Pick again.' }
     }
