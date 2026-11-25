@@ -217,10 +217,11 @@
     Open the Vouch Designer instead of capturing: a window beside your screen where you
     add pages, choose what to click and capture, set the report and output options, and
     save a configuration file. Double-clicking Vouch-Designer.cmd does the same. Give
-    -ConfigPath as well to open that file at the start, and -EdgeProfileDir when the audit
-    profile is not the usual one (the Designer keeps its own window's profile apart from
-    it). Needs the designer folder next to vouch.ps1; every other use of vouch.ps1 works
-    without it.
+    -ConfigPath as well to open that file at the start, and -EdgeProfileDir / -DebugPort
+    when the audit profile or port is not the usual one (the Designer opens or reuses that
+    Edge, and keeps its own window's profile apart from it); -KeepBrowserOpen leaves an
+    Edge the Designer opened open when it stops. Needs the designer folder next to
+    vouch.ps1; every other use of vouch.ps1 works without it.
 
 .PARAMETER DesignerPort
     The local port the Designer listens on (only this computer can reach it). Default 0:
@@ -4027,14 +4028,16 @@ function Get-ElementDescriptionScript {
     <#
         Browser-side helper for the find-only scripts: what a person needs to recognise
         an element (tag, id, its visible text, the frame it is in). The Designer's picker
-        compares this with the element that was picked, so a recorded step is only kept
-        when replaying it would hit the same element.
+        marks the element the person picked with a temporary property holding a one-time
+        token; "mark" returns it, so a recorded step is only kept when THIS search lands
+        on that very element - not merely on one that looks the same.
     #>
     return @'
 function vouchDescribe(entry, el, exact) {
   var text = String(el.innerText || el.textContent || el.value || '').replace(/\s+/g, ' ').trim();
+  var mark = typeof el.__vouchPickMark === 'string' ? el.__vouchPickMark.substring(0, 64) : '';
   return { found: true, tag: el.tagName.toLowerCase(), id: el.id || '', text: text.substring(0, 200),
-    frame: entry.frame ? vouchFrameName(entry.frame) : '', exact: exact, visible: vouchVisible(entry, el) };
+    frame: entry.frame ? vouchFrameName(entry.frame) : '', exact: exact, visible: vouchVisible(entry, el), mark: mark };
 }
 '@
 }
@@ -8101,6 +8104,9 @@ function Invoke-DesignerMode {
         [int]$Port = 0,
         # The audit profile the Designer must stay apart from, when typed (-EdgeProfileDir).
         [AllowEmptyString()][string]$EdgeProfileDir = '',
+        # The audit Edge's port when typed (-DebugPort); 0 = the configuration's, else 9222.
+        [int]$DebugPort = 0,
+        [switch]$KeepBrowserOpen,
         [AllowEmptyCollection()][string[]]$IgnoredParameters = @()
     )
     Assert-Environment
@@ -8110,17 +8116,20 @@ function Invoke-DesignerMode {
             'Copy the whole Vouch folder, not only vouch.ps1. Everything else vouch.ps1 does works without it.')
     }
     if ($IgnoredParameters.Count -gt 0) {
-        Write-Host "NOTE: with -Designer only -ConfigPath, -DesignerPort and -EdgeProfileDir are used; these are ignored: -$($IgnoredParameters -join ', -')" -ForegroundColor Yellow
+        Write-Host "NOTE: with -Designer only -ConfigPath, -DesignerPort, -EdgeProfileDir, -DebugPort and -KeepBrowserOpen are used; these are ignored: -$($IgnoredParameters -join ', -')" -ForegroundColor Yellow
     }
     . $designerScript
-    Start-VouchDesigner -ScriptPath $ScriptPath -ConfigPath $ConfigPath -Port $Port -Version $script:ToolVersion -AuditProfileDir $EdgeProfileDir
+    Start-VouchDesigner -ScriptPath $ScriptPath -ConfigPath $ConfigPath -Port $Port -Version $script:ToolVersion -AuditProfileDir $EdgeProfileDir `
+        -DebugPort $DebugPort -KeepBrowserOpen:$KeepBrowserOpen
 }
 
 if ($Designer) {
     try {
-        $ignored = @($PSBoundParameters.Keys | Where-Object { $_ -notin 'Designer', 'DesignerPort', 'ConfigPath', 'EdgeProfileDir', 'Verbose', 'Debug' })
+        $ignored = @($PSBoundParameters.Keys | Where-Object { $_ -notin 'Designer', 'DesignerPort', 'ConfigPath', 'EdgeProfileDir', 'DebugPort', 'KeepBrowserOpen', 'Verbose', 'Debug' })
         $auditProfile = if ($PSBoundParameters.ContainsKey('EdgeProfileDir')) { $EdgeProfileDir } else { '' }
-        Invoke-DesignerMode -ScriptPath $PSCommandPath -ConfigPath $ConfigPath -Port $DesignerPort -EdgeProfileDir $auditProfile -IgnoredParameters $ignored
+        $auditPort = if ($PSBoundParameters.ContainsKey('DebugPort')) { $DebugPort } else { 0 }
+        Invoke-DesignerMode -ScriptPath $PSCommandPath -ConfigPath $ConfigPath -Port $DesignerPort -EdgeProfileDir $auditProfile `
+            -DebugPort $auditPort -KeepBrowserOpen:$KeepBrowserOpen -IgnoredParameters $ignored
     }
     catch {
         Write-Host ''

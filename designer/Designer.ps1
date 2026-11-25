@@ -76,7 +76,69 @@ function New-DesignerState {
         ParameterInfo        = $null
         Schema               = $null
         MaxBodyBytes         = 4MB
+        # How long a request body may take to arrive once its headers are in: the loop
+        # serves one request at a time, so a sender that stalls must not hold it up.
+        BodyTimeoutMs        = 5000
+        # The link to the audit Edge (Connect-DesignerBrowser) and the pick in progress.
+        Browser              = New-DesignerBrowserState
+        Pick                 = New-DesignerPickState
         StartedAt            = Get-Date
+    }
+}
+
+function New-DesignerBrowserState {
+    <#
+        What the Designer knows about the audit Edge. The DevTools socket itself is the
+        engine's ($script:CdpSocket), because the engine's own functions (clicks, waits,
+        zoom) are what the Designer uses on the page; this object says which tab that
+        socket is attached to and why it is or is not connected.
+    #>
+    return [pscustomobject]@{
+        Connected          = $false
+        Connecting         = $false
+        # Connect at the first loop turn (Start-VouchDesigner), after the panel has loaded.
+        ConnectPending     = $false
+        # Plumbing for tests: attach to an Edge already listening, never start one.
+        AllowLaunch        = $true
+        # -DebugPort / -EdgeProfileDir / -KeepBrowserOpen typed on the command line (0/''/$false: not typed).
+        TypedPort          = 0
+        TypedProfileDir    = ''
+        TypedKeepOpen      = $false
+        Port               = 0
+        ProfileDir         = ''
+        KeepOpen           = $false
+        TabId              = ''
+        Url                = ''
+        Title              = ''
+        Tabs               = @()
+        LaunchedByDesigner = $false
+        LaunchedPid        = 0
+        BrowserWsUrl       = ''
+        Problem            = $null
+        Notice             = ''
+        # The zoom shown for a page opened with Go (100 = none), and that page's name.
+        ZoomPercent        = 100
+        ZoomPage           = ''
+        LastCheck          = [datetime]::MinValue
+        LastProbe          = [datetime]::MinValue
+    }
+}
+
+function New-DesignerPickState {
+    # The pick in progress or last finished (Start-ElementPick, Get-ElementPickResult).
+    return [pscustomobject]@{
+        State     = 'idle'
+        Mode      = ''
+        Token     = ''
+        TabId     = ''
+        Result    = $null
+        Message   = ''
+        Code      = ''
+        Notice    = ''
+        Reinjects = 0
+        Failures  = 0
+        StartedAt = [datetime]::MinValue
+        LastPoll  = [datetime]::MinValue
     }
 }
 
@@ -414,15 +476,8 @@ function Get-DesignerLaterRoute {
         Endpoints that later steps implement (browser link, picker, runs). They exist now
         and answer 501 with a plain message, so the panel can be built against them.
     #>
-    $browser = 'The link to the browser (opening pages and picking what to click) comes in a later step of the Designer.'
     $run = 'Running and testing from the Designer comes in a later step. Until then, copy the command from the Run tab into a PowerShell window.'
     return [ordered]@{
-        'POST /api/browser/navigate' = $browser
-        'GET /api/browser/current'   = $browser
-        'POST /api/pick/start'       = $browser
-        'GET /api/pick'              = $browser
-        'POST /api/pick/cancel'      = $browser
-        'POST /api/action/test'      = $browser
         'POST /api/run'              = $run
         'GET /api/run'               = $run
         'POST /api/run/stop'         = $run
@@ -471,6 +526,16 @@ function Invoke-DesignerRequest {
             'POST /api/dialog'             { return Invoke-DesignerDialog -Body $Body -State $State }
             'POST /api/command'            { return Invoke-DesignerCommand -Body $Body -State $State }
             'POST /api/open'               { return Invoke-DesignerOpenTarget -Body $Body -State $State }
+            'GET /api/browser/current'     { return Invoke-DesignerBrowserCurrent -State $State }
+            'POST /api/browser/connect'    { return Invoke-DesignerBrowserConnect -State $State }
+            'POST /api/browser/navigate'   { return Invoke-DesignerNavigate -Body $Body -State $State }
+            'POST /api/browser/layout'     { return Invoke-DesignerLayoutRequest -State $State }
+            'POST /api/browser/zoom-off'   { return Invoke-DesignerZoomOff -State $State }
+            'POST /api/page/from-current'  { return Invoke-DesignerPageFromCurrent -State $State }
+            'POST /api/pick/start'         { return Invoke-DesignerPickStart -Body $Body -State $State }
+            'GET /api/pick'                { return New-DesignerJsonResponse -Data (Get-ElementPickResult -State $State) }
+            'POST /api/pick/cancel'        { return Invoke-DesignerPickCancel -State $State }
+            'POST /api/action/test'        { return Invoke-DesignerActionTest -Body $Body -State $State }
             'POST /api/shutdown' {
                 $State.Running = $false
                 $State.StopReason = 'The Designer was closed from its window.'
@@ -487,7 +552,9 @@ function Invoke-DesignerRequest {
             return New-DesignerError -Status 501 -Code 'later' -Message 'Not available yet.' -Detail 'Previews of a run come in a later step of the Designer.'
         }
         foreach ($known in @('/api/state', '/api/config/new', '/api/config/open', '/api/config/save', '/api/config/import-csv', '/api/config/validate',
-                '/api/dialog', '/api/command', '/api/open', '/api/shutdown') + @($later.Keys | ForEach-Object { ($_ -split ' ', 2)[1] })) {
+                '/api/dialog', '/api/command', '/api/open', '/api/shutdown', '/api/browser/current', '/api/browser/connect', '/api/browser/navigate',
+                '/api/browser/layout', '/api/browser/zoom-off', '/api/page/from-current', '/api/pick/start', '/api/pick', '/api/pick/cancel',
+                '/api/action/test') + @($later.Keys | ForEach-Object { ($_ -split ' ', 2)[1] })) {
             if ($known -ceq $Path) { return New-DesignerError -Status 405 -Code 'method' -Message 'This kind of request is not supported here.' -Detail "$Method is not used for $Path." }
         }
         return New-DesignerError -Status 404 -Code 'not-found' -Message 'There is nothing at this address.' -Detail $Path
@@ -560,19 +627,23 @@ function Get-DesignerSchema {
 function Get-DesignerStateData {
     <#
         GET /api/state: facts about the server, not about the configuration (the panel owns
-        that). browser/run/capabilities are placeholders until the later steps fill them.
+        that): the link to the audit browser as last seen (no browser call is made here;
+        the loop keeps it current), and what the panel may offer. run is a placeholder
+        until the run step fills it.
     #>
     param([Parameter(Mandatory)][object]$State)
     if ($null -eq $State.Schema) { $State.Schema = Get-DesignerSchema }
+    $connected = [bool]$State.Browser.Connected
     return [ordered]@{
         version      = $State.Version
         port         = $State.Port
         configPath   = $State.ConfigPath
         startupPath  = $State.StartupPath
         scriptFolder = (Split-Path -Path $State.ScriptPath -Parent)
-        browser      = [ordered]@{ connected = $false; url = ''; title = ''; message = 'The link to the browser comes in a later step of the Designer.' }
+        browser      = (Get-DesignerBrowserData -State $State)
+        pick         = [ordered]@{ state = $State.Pick.State }
         run          = [ordered]@{ state = 'idle' }
-        capabilities = [ordered]@{ browser = $false; pick = $false; test = $false; run = $false }
+        capabilities = [ordered]@{ browser = $connected; pick = $connected; test = $connected; run = $false }
         schema       = $State.Schema
         defaults     = Get-DefaultVouchConfig
     }
@@ -1630,6 +1701,1530 @@ function Stop-DesignerPanel {
 
 #endregion
 
+#region Browser link -------------------------------------------------------------------
+
+function Get-DesignerValue {
+    <#
+        One field of an object that came from the page or a request, or $null. Such data
+        can have any shape (a page can even replace the picker's functions), and StrictMode
+        throws on a missing property.
+    #>
+    param([AllowNull()][object]$Object, [Parameter(Mandatory)][string]$Name)
+    if ($null -eq $Object) { return $null }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) { return $Object[$Name] }
+        return $null
+    }
+    if ($Object -is [string] -or $Object -is [ValueType]) { return $null }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -ne $property) { return $property.Value }
+    return $null
+}
+
+function ConvertTo-DesignerText {
+    <#
+        Text that came from a web page (a title, an address, an element's words) made safe
+        to pass on as data: a string without control characters, at most -Max characters.
+        Anything that is not text (a page can return any shape) becomes ''. The panel
+        shows such text with textContent only.
+    #>
+    param([AllowNull()][object]$Value, [int]$Max = 200)
+    if ($Value -isnot [string]) { return '' }
+    $text = $Value -replace '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', ' '
+    if ($text.Length -gt $Max) { $text = $text.Substring(0, $Max - 1) + [char]0x2026 }
+    return $text
+}
+
+function Get-DesignerBodyNumber {
+    # A whole number from a request body, or -1 when missing or not a number.
+    param([AllowNull()][object]$Body, [Parameter(Mandatory)][string]$Name)
+    $value = Get-DesignerValue -Object $Body -Name $Name
+    if ($value -is [ValueType] -and $value -isnot [bool]) {
+        try { return [int]$value } catch { return -1 }
+    }
+    return -1
+}
+
+function Get-DesignerBrowserSetting {
+    <#
+        The audit Edge a run of the open configuration would use: the port and profile
+        typed with -Designer, else the configuration file's browser section, else the
+        engine's defaults. Read from the file as saved, because that is what a run reads;
+        the panel says when it differs from the Edge the Designer is connected to.
+    #>
+    param([Parameter(Mandatory)][object]$State)
+    $browser = $State.Browser
+    $config = $null
+    if ($State.ConfigPath -and [System.IO.File]::Exists($State.ConfigPath)) {
+        try { $config = (Read-DesignerConfigFile -Path $State.ConfigPath).Config }
+        catch { Write-Verbose "Browser settings not read from the configuration: $($_.Exception.Message)" }
+    }
+    $port = 9222
+    if ($browser.TypedPort -gt 0) { $port = [int]$browser.TypedPort }
+    else {
+        $found = Get-ConfigValue -Config $config -Section 'browser' -Key 'debugPort'
+        if ($found.Found -and $found.Value -is [ValueType] -and $found.Value -isnot [bool]) {
+            $value = [int]$found.Value
+            if ($value -ge 1024 -and $value -le 65535) { $port = $value }
+        }
+    }
+    $keep = [bool]$browser.TypedKeepOpen
+    if (-not $keep) {
+        $found = Get-ConfigValue -Config $config -Section 'browser' -Key 'keepBrowserOpen'
+        $keep = ($found.Found -and $found.Value -eq $true)
+    }
+    $configPath = if ($null -ne $config) { $State.ConfigPath } else { '' }
+    $profileDir = Get-DesignerAuditProfile -EdgeProfileDir $browser.TypedProfileDir -Config $config -ConfigPath $configPath
+    return [pscustomobject]@{ Port = $port; ProfileDir = $profileDir; KeepOpen = $keep }
+}
+
+function Get-EdgeDebugPolicy {
+    <#
+        Whether an organisation policy decides Edge's remote debugging: $false when the
+        policy RemoteDebuggingAllowed is 0 (Edge then never opens the port, whatever Vouch
+        does), $true when it allows it, $null when no policy is set. Machine policy first:
+        it wins over the user's.
+    #>
+    foreach ($root in 'HKLM:', 'HKCU:') {
+        try {
+            $item = Get-ItemProperty -LiteralPath "$root\SOFTWARE\Policies\Microsoft\Edge" -Name 'RemoteDebuggingAllowed' -ErrorAction Stop
+            return ([int]$item.RemoteDebuggingAllowed -ne 0)
+        }
+        catch { Write-Verbose "No RemoteDebuggingAllowed policy under $root." }
+    }
+    return $null
+}
+
+function Test-DesignerPortBusy {
+    # Whether something already accepts connections on the port (used when it is not Edge's DevTools).
+    param([Parameter(Mandatory)][int]$Port)
+    $client = [System.Net.Sockets.TcpClient]::new()
+    try { return [bool]$client.ConnectAsync('127.0.0.1', $Port).Wait(500) }
+    catch { return $false }
+    finally { $client.Dispose() }
+}
+
+function Get-DesignerBrowserProblem {
+    <#
+        Why the Designer is not connected to the audit Edge, in words for the panel's
+        first screen: what happened, and what the person can do (causes). A port that
+        never opens has three usual reasons; when the organisation's policy is known to
+        forbid remote debugging, that one is named for certain.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Code,
+        [int]$Port = 0,
+        [AllowEmptyString()][string]$ProfileDir = '',
+        [AllowEmptyString()][string]$Detail = ''
+    )
+    $causes = @()
+    switch ($Code) {
+        'profile' {
+            $message = $Detail
+        }
+        'noedge' {
+            $message = 'Microsoft Edge was not found on this computer, so the Designer cannot open pages.'
+            if ($Detail) { $causes = @($Detail) }
+        }
+        'notrunning' {
+            $message = "No Edge is waiting for Vouch on port $Port."
+            $causes = @('Start the audit Edge with that port, then press Retry.')
+        }
+        'portbusy' {
+            $message = "Another program is using port $Port, which Vouch needs to control Edge."
+            $causes = @('Close that program and press Retry, or choose another port: Output tab, Advanced, "Browser connection port". Save, then press Retry.')
+        }
+        'profile-open' {
+            $message = 'Edge is already open with the audit profile, but without the connection Vouch needs.'
+            $causes = @("Close every Edge window that uses $ProfileDir (look on the taskbar and on other desktops), then press Retry. Vouch opens it again with the connection.")
+        }
+        'policy' {
+            $message = 'Your organisation has switched off remote debugging in Edge (the Edge policy RemoteDebuggingAllowed), and Vouch needs it to control the browser.'
+            $causes = @('Ask your IT department to allow it on this computer. Until then Vouch cannot open or capture pages; you can still edit and save configurations here.')
+        }
+        'noport' {
+            $message = "Edge did not open the connection Vouch needs (port $Port)."
+            $causes = @(
+                "Edge may already be open with the audit profile without that connection, for example a window left from -LoginSetup: close every Edge window that uses $ProfileDir, then press Retry.",
+                'Your organisation may have switched off remote debugging in Edge (the Edge policy RemoteDebuggingAllowed). If so, ask your IT department to allow it.',
+                "Another program may be using port ${Port}: choose another port (Output tab, Advanced, ""Browser connection port""), save, then press Retry.")
+        }
+        'gone' {
+            $message = 'The audit Edge window was closed.'
+            $causes = @('Press Retry to open it again.')
+        }
+        'notab' {
+            $message = 'The audit Edge has no web page open.'
+            $causes = @('Open a page in the Edge window (or press Retry).')
+        }
+        default {
+            $message = if ($Detail) { $Detail } else { 'The Designer is not connected to the audit Edge.' }
+        }
+    }
+    return [ordered]@{ code = $Code; message = $message; causes = @($causes) }
+}
+
+function Get-DesignerWebTab {
+    <#
+        The tabs of the audit Edge the Designer may attach to: web pages only - never
+        Edge's own pages, DevTools or extensions (Get-PageTargetKind) - and never the
+        Designer panel itself, should someone open its address in the audit Edge.
+    #>
+    param([Parameter(Mandatory)][object]$State, [AllowNull()][object[]]$Targets)
+    $list = [System.Collections.Generic.List[object]]::new()
+    foreach ($target in @($Targets)) {
+        if ($null -eq $target) { continue }
+        if ([string](Get-DesignerValue -Object $target -Name 'type') -ne 'page') { continue }
+        if (-not [string](Get-DesignerValue -Object $target -Name 'webSocketDebuggerUrl')) { continue }
+        if ((Get-PageTargetKind -Target $target) -ne 'web') { continue }
+        $url = [string](Get-DesignerValue -Object $target -Name 'url')
+        $panel = $false
+        foreach ($prefix in "http://localhost:$($State.Port)/", "http://127.0.0.1:$($State.Port)/", "http://[::1]:$($State.Port)/") {
+            if ($url.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { $panel = $true }
+        }
+        if (-not $panel) { $list.Add($target) }
+    }
+    return , $list
+}
+
+function Use-DesignerProbeSocket {
+    <#
+        Runs -Script with a short-lived DevTools connection to another tab, then puts the
+        engine's connection back exactly as it was. The engine keeps one socket in script
+        variables; the zoom and the fall-back target are cleared while probing so that a
+        reconnect inside the probe can neither zoom nor attach to some other tab.
+    #>
+    param([Parameter(Mandatory)][string]$WebSocketUrl, [Parameter(Mandatory)][scriptblock]$Script)
+    $saved = @{
+        Socket = $script:CdpSocket; Url = $script:CdpWebSocketUrl; Id = $script:CdpMessageId
+        Port = $script:CdpPort; Zoom = $script:PageZoomPercent; Tab = $script:CdpTabId
+    }
+    $script:CdpSocket = $null
+    $script:CdpPort = 0
+    $script:PageZoomPercent = 100
+    $script:CdpTabId = ''
+    try {
+        Connect-CdpSocket -WebSocketUrl $WebSocketUrl -TimeoutSec 3
+        return (& $Script)
+    }
+    finally {
+        Close-CdpSocket
+        $script:CdpSocket = $saved.Socket
+        $script:CdpWebSocketUrl = $saved.Url
+        $script:CdpMessageId = $saved.Id
+        $script:CdpPort = $saved.Port
+        $script:PageZoomPercent = $saved.Zoom
+        $script:CdpTabId = $saved.Tab
+    }
+}
+
+function Get-DesignerTabVisibility {
+    # 'visible' or 'hidden' for one tab (document.visibilityState), '' when it cannot be asked.
+    param([Parameter(Mandatory)][object]$Target)
+    try {
+        return [string](Use-DesignerProbeSocket -WebSocketUrl ([string](Get-DesignerValue -Object $Target -Name 'webSocketDebuggerUrl')) -Script {
+                Invoke-CdpEval -Expression 'document.visibilityState' -TimeoutSec 2 })
+    }
+    catch { return '' }
+}
+
+function Find-DesignerVisibleTab {
+    <#
+        The tab the person is looking at: the one whose document is "visible" (spike 3;
+        Edge shows one tab per window). The attached tab is asked over the open socket,
+        the others over a short socket each. $null when none is visible - a minimised
+        window has every tab hidden, and the Designer then stays where it is.
+    #>
+    param([Parameter(Mandatory)][object]$State, [AllowNull()][object[]]$Tabs, [string]$Skip = '')
+    foreach ($tab in @($Tabs)) {
+        if ($null -eq $tab) { continue }
+        $id = [string](Get-DesignerValue -Object $tab -Name 'id')
+        if ($Skip -and $id -eq $Skip) { continue }
+        $visibility = ''
+        if ($State.Browser.Connected -and $id -eq $State.Browser.TabId -and $null -ne $script:CdpSocket) {
+            try { $visibility = [string](Invoke-CdpEval -Expression 'document.visibilityState' -TimeoutSec 2) }
+            catch { $visibility = '' }
+        }
+        else { $visibility = Get-DesignerTabVisibility -Target $tab }
+        if ($visibility -eq 'visible') { return $tab }
+    }
+    return $null
+}
+
+function Set-DesignerTabInfo {
+    # Address, title and the tab list as the panel shows them (page text: capped, never trusted).
+    param([Parameter(Mandatory)][object]$State, [AllowNull()][object[]]$Tabs)
+    $browser = $State.Browser
+    $list = [System.Collections.Generic.List[object]]::new()
+    foreach ($tab in @($Tabs) | Select-Object -First 20) {
+        $id = [string](Get-DesignerValue -Object $tab -Name 'id')
+        $entry = [ordered]@{
+            id      = (ConvertTo-DesignerText -Value $id -Max 100)
+            url     = (ConvertTo-DesignerText -Value (Get-DesignerValue -Object $tab -Name 'url') -Max 2000)
+            title   = (ConvertTo-DesignerText -Value (Get-DesignerValue -Object $tab -Name 'title') -Max 300)
+            current = ($id -eq $browser.TabId)
+        }
+        if ($entry.current) { $browser.Url = $entry.url; $browser.Title = $entry.title }
+        $list.Add($entry)
+    }
+    $browser.Tabs = $list.ToArray()
+}
+
+function Connect-DesignerTab {
+    <#
+        Attaches the engine's connection to one tab. A zoom preview belongs to the
+        connection that set it (spike 1), so it ends here; the panel is told why.
+    #>
+    param([Parameter(Mandatory)][object]$State, [Parameter(Mandatory)][object]$Target)
+    $browser = $State.Browser
+    $wasConnected = $browser.Connected
+    if ($null -ne $script:CdpSocket) { Close-CdpSocket }
+    if ($wasConnected -and $browser.ZoomPercent -ne 100) { $browser.Notice = 'The zoom preview ended because another tab came to the front.' }
+    $browser.ZoomPercent = 100
+    $browser.ZoomPage = ''
+    $script:PageZoomPercent = 100
+    $script:PageZoomLost = 0
+    $browser.Connected = $false
+    Connect-CdpSocket -WebSocketUrl ([string](Get-DesignerValue -Object $Target -Name 'webSocketDebuggerUrl')) -TimeoutSec 5
+    $script:CdpTabId = [string](Get-DesignerValue -Object $Target -Name 'id')
+    $browser.TabId = $script:CdpTabId
+    $browser.Url = ConvertTo-DesignerText -Value (Get-DesignerValue -Object $Target -Name 'url') -Max 2000
+    $browser.Title = ConvertTo-DesignerText -Value (Get-DesignerValue -Object $Target -Name 'title') -Max 300
+    $browser.Connected = $true
+    $browser.Problem = $null
+}
+
+function Disconnect-DesignerBrowser {
+    <#
+        Marks the link as lost and says why. The socket is closed; whatever was being
+        picked ends with a message. An Edge the Designer started that is gone is no
+        longer the Designer's to close.
+    #>
+    param([Parameter(Mandatory)][object]$State, [Parameter(Mandatory)][string]$Code, [AllowEmptyString()][string]$Detail = '')
+    $browser = $State.Browser
+    if ($null -ne $script:CdpSocket) { Close-CdpSocket }
+    $script:PageZoomPercent = 100
+    $browser.Connected = $false
+    $browser.TabId = ''
+    $browser.Url = ''
+    $browser.Title = ''
+    $browser.Tabs = @()
+    $browser.ZoomPercent = 100
+    $browser.ZoomPage = ''
+    $browser.Problem = Get-DesignerBrowserProblem -Code $Code -Port $browser.Port -ProfileDir $browser.ProfileDir -Detail $Detail
+    if ($browser.LaunchedPid -gt 0 -and $null -eq (Get-Process -Id $browser.LaunchedPid -ErrorAction SilentlyContinue)) {
+        $browser.LaunchedByDesigner = $false
+        $browser.LaunchedPid = 0
+    }
+    if ($State.Pick.State -eq 'picking') {
+        $State.Pick.State = 'error'
+        $State.Pick.Code = 'browser'
+        $State.Pick.Message = "Picking stopped: $($browser.Problem['message'])"
+    }
+}
+
+function Connect-DesignerBrowser {
+    <#
+        Connects the Designer to the audit Edge: the profile and port a run of the open
+        configuration would use (Get-DesignerBrowserSetting), checked against the panel's
+        profile first (Assert-DesignerProfileSeparate). An Edge already listening on the
+        port is reused (Start-EdgeDebug's own rule) and never closed by the Designer; one
+        the Designer starts is closed when it stops, unless keepBrowserOpen is set.
+        Attaches to the tab the person is looking at. Never throws: a failure leaves the
+        reason in State.Browser.Problem for the panel's first screen.
+        Blocks while Edge starts (at most about 15 seconds, Start-EdgeDebug's limit).
+    #>
+    param([Parameter(Mandatory)][object]$State)
+    $browser = $State.Browser
+    $browser.Connecting = $true
+    $browser.ConnectPending = $false
+    $browser.Notice = ''
+    try {
+        $setting = Get-DesignerBrowserSetting -State $State
+        $browser.Port = $setting.Port
+        $browser.ProfileDir = $setting.ProfileDir
+        $browser.KeepOpen = $setting.KeepOpen
+        if ($State.Pick.State -eq 'picking') { Stop-ElementPick -State $State -Message 'Picking stopped because the browser was connected again.' }
+        if ($null -ne $script:CdpSocket) { Close-CdpSocket }
+        $browser.Connected = $false
+        $browser.ZoomPercent = 100
+        $browser.ZoomPage = ''
+        $script:PageZoomPercent = 100
+        try { Assert-DesignerProfileSeparate -State $State -AuditProfile $setting.ProfileDir }
+        catch { Disconnect-DesignerBrowser -State $State -Code 'profile' -Detail $_.Exception.Message; return }
+
+        $script:CdpPort = $setting.Port
+        $script:CdpTabId = ''
+        $info = Get-DebugEndpointInfo -Port $setting.Port -TimeoutSec 2
+        $launched = $false
+        if ($null -eq $info) {
+            if (-not $browser.AllowLaunch) { Disconnect-DesignerBrowser -State $State -Code 'notrunning'; return }
+            if (Test-DesignerPortBusy -Port $setting.Port) { Disconnect-DesignerBrowser -State $State -Code 'portbusy'; return }
+            if ((Get-EdgeDebugPolicy) -eq $false) { Disconnect-DesignerBrowser -State $State -Code 'policy'; return }
+            $edgePath = ''
+            try { $edgePath = Find-EdgeExecutable }
+            catch { Disconnect-DesignerBrowser -State $State -Code 'noedge' -Detail $_.Exception.Message; return }
+            try {
+                $info = Start-EdgeDebug -EdgePath $edgePath -ProfileDir $setting.ProfileDir -Port $setting.Port
+                $launched = [bool]$script:LaunchedEdge
+            }
+            catch {
+                $code = if ($_.Exception.Message -like '*already running with the audit profile*') { 'profile-open' } else { 'noport' }
+                Disconnect-DesignerBrowser -State $State -Code $code -Detail $_.Exception.Message
+                return
+            }
+        }
+        else {
+            $script:ReusedEdge = $true
+            $script:LaunchedEdge = $false
+            $script:EdgeProcess = Find-EdgeBrowserProcess -Port $setting.Port
+            $script:BrowserWsUrl = Get-BrowserWebSocketUrl -VersionInfo $info
+        }
+        $edgeId = if ($null -ne $script:EdgeProcess) { $script:EdgeProcess.Id } else { 0 }
+        if ($launched) {
+            $browser.LaunchedByDesigner = $true
+            $browser.LaunchedPid = $edgeId
+            $browser.BrowserWsUrl = $script:BrowserWsUrl
+        }
+        elseif (-not ($browser.LaunchedPid -gt 0 -and $browser.LaunchedPid -eq $edgeId)) {
+            $browser.LaunchedByDesigner = $false
+            $browser.LaunchedPid = 0
+        }
+
+        # A freshly started Edge lists its first tab a moment after the port opens.
+        $tabs = [System.Collections.Generic.List[object]]::new()
+        $deadline = (Get-Date).AddSeconds(5)
+        do {
+            try { $tabs = Get-DesignerWebTab -State $State -Targets @(Get-DevToolsTargetList -Port $setting.Port) }
+            catch { Write-Verbose "No tab list yet: $($_.Exception.Message)" }
+            if ($tabs.Count -gt 0) { break }
+            Start-Sleep -Milliseconds 300
+        } while ((Get-Date) -lt $deadline)
+        $target = Find-DesignerVisibleTab -State $State -Tabs $tabs
+        if ($null -eq $target -and $tabs.Count -gt 0) { $target = $tabs[0] }
+        if ($null -eq $target) {
+            try { $target = Get-CdpPageTarget -Port $setting.Port -TabId '' }
+            catch { Disconnect-DesignerBrowser -State $State -Code 'notab'; return }
+        }
+        Connect-DesignerTab -State $State -Target $target
+        Set-DesignerTabInfo -State $State -Tabs $tabs
+    }
+    catch {
+        Disconnect-DesignerBrowser -State $State -Code 'failed' -Detail "The Designer could not connect to Edge: $($_.Exception.Message)"
+    }
+    finally {
+        $browser.Connecting = $false
+        $browser.LastCheck = Get-Date
+    }
+}
+
+function Update-DesignerBrowser {
+    <#
+        Follows the audit Edge between requests (about once a second): the tab the person
+        looks at (they may open others; the Designer moves to the visible one), a closed
+        tab, a closed Edge. Never attaches to Edge's own pages or to the panel. While a
+        pick runs, the tab stays the same: the pick belongs to it.
+        When not connected it only looks, every few seconds, whether an Edge is back on
+        the port (started by the person); starting one is left to Retry.
+    #>
+    param([Parameter(Mandatory)][object]$State, [switch]$Force)
+    $browser = $State.Browser
+    if (-not $Force -and ((Get-Date) - $browser.LastCheck).TotalMilliseconds -lt 1000) { return }
+    $browser.LastCheck = Get-Date
+    if ($browser.Connecting -or $browser.ConnectPending) { return }
+    if (-not $browser.Connected) {
+        $code = if ($null -ne $browser.Problem) { [string]$browser.Problem['code'] } else { '' }
+        if ($browser.Port -gt 0 -and $code -in 'gone', 'notrunning', 'notab' -and ((Get-Date) - $browser.LastProbe).TotalSeconds -ge 3) {
+            $browser.LastProbe = Get-Date
+            if ($null -ne (Get-DebugEndpointInfo -Port $browser.Port -TimeoutSec 1)) {
+                $allow = $browser.AllowLaunch
+                $browser.AllowLaunch = $false
+                try { Connect-DesignerBrowser -State $State } finally { $browser.AllowLaunch = $allow }
+            }
+        }
+        return
+    }
+    $targets = $null
+    try { $targets = @(Get-DevToolsTargetList -Port $browser.Port) }
+    catch { Disconnect-DesignerBrowser -State $State -Code 'gone'; return }
+    $tabs = Get-DesignerWebTab -State $State -Targets $targets
+    $current = $tabs | Where-Object { [string](Get-DesignerValue -Object $_ -Name 'id') -eq $browser.TabId } | Select-Object -First 1
+    if ($State.Pick.State -eq 'picking') { Set-DesignerTabInfo -State $State -Tabs $tabs; return }
+    if ($null -eq $current) {
+        $next = Find-DesignerVisibleTab -State $State -Tabs $tabs
+        if ($null -eq $next -and $tabs.Count -gt 0) { $next = $tabs[0] }
+        if ($null -eq $next) { Disconnect-DesignerBrowser -State $State -Code 'notab'; return }
+        try { Connect-DesignerTab -State $State -Target $next; $browser.Notice = 'The tab the Designer was using was closed; it now uses the one in front.' }
+        catch { Disconnect-DesignerBrowser -State $State -Code 'gone'; return }
+    }
+    else {
+        $visibility = ''
+        try { $visibility = [string](Invoke-CdpEval -Expression 'document.visibilityState' -TimeoutSec 2) }
+        catch { $visibility = '' }
+        if ($visibility -eq 'hidden') {
+            $next = Find-DesignerVisibleTab -State $State -Tabs $tabs -Skip $browser.TabId
+            if ($null -ne $next) {
+                try { Connect-DesignerTab -State $State -Target $next }
+                catch { Disconnect-DesignerBrowser -State $State -Code 'gone'; return }
+            }
+        }
+    }
+    Set-DesignerTabInfo -State $State -Tabs $tabs
+}
+
+function Get-DesignerBrowserData {
+    # The link to the audit Edge as the panel shows it (GET /api/state "browser").
+    param([Parameter(Mandatory)][object]$State)
+    $browser = $State.Browser
+    $different = $false
+    if ($browser.Connected) {
+        try {
+            $setting = Get-DesignerBrowserSetting -State $State
+            $different = ($setting.Port -ne $browser.Port) -or -not [string]::Equals($setting.ProfileDir, $browser.ProfileDir, [System.StringComparison]::OrdinalIgnoreCase)
+        }
+        catch { $different = $false }
+    }
+    $message = if ($browser.Connected) { 'Connected to the audit Edge.' }
+    elseif ($browser.Connecting -or $browser.ConnectPending) { 'Connecting to the audit Edge…' }
+    elseif ($null -ne $browser.Problem) { [string]$browser.Problem['message'] }
+    else { 'Not connected to the audit Edge.' }
+    return [ordered]@{
+        connected          = [bool]$browser.Connected
+        connecting         = [bool]($browser.Connecting -or $browser.ConnectPending)
+        tabId              = $browser.TabId
+        url                = $browser.Url
+        title              = $browser.Title
+        port               = $browser.Port
+        profileDir         = $browser.ProfileDir
+        launchedByDesigner = [bool]$browser.LaunchedByDesigner
+        problem            = $browser.Problem
+        zoom               = [ordered]@{ percent = [int]$browser.ZoomPercent; page = $browser.ZoomPage }
+        settingsChanged    = $different
+        notice             = $browser.Notice
+        message            = $message
+    }
+}
+
+function Close-DesignerBrowser {
+    <#
+        At the end of the Designer: ends a pick, takes the zoom preview off, closes the
+        socket, and closes the audit Edge only if the Designer started it and the
+        configuration does not ask to keep it open. An Edge it merely reused is the
+        person's and stays.
+    #>
+    param([Parameter(Mandatory)][object]$State)
+    $browser = $State.Browser
+    if ($State.Pick.State -eq 'picking') { Stop-ElementPick -State $State -Message 'The Designer stopped.' -NoLayout }
+    if ($browser.Connected -and $browser.ZoomPercent -ne 100) {
+        try { Clear-PageZoom } catch { Write-Verbose "The zoom preview could not be cleared: $($_.Exception.Message)" }
+    }
+    if ($null -ne $script:CdpSocket) { Close-CdpSocket }
+    $browser.Connected = $false
+    $keep = $browser.KeepOpen
+    try { $keep = (Get-DesignerBrowserSetting -State $State).KeepOpen } catch { Write-Verbose 'keepBrowserOpen not read again.' }
+    if ($browser.LaunchedByDesigner -and -not $keep -and $browser.LaunchedPid -gt 0) {
+        $process = Get-Process -Id $browser.LaunchedPid -ErrorAction SilentlyContinue
+        if ($null -ne $process) {
+            $script:LaunchedEdge = $true
+            $script:EdgeProcess = $process
+            $script:BrowserWsUrl = $browser.BrowserWsUrl
+            Stop-EdgeProcess
+        }
+    }
+    $script:LaunchedEdge = $false
+}
+
+function Invoke-DesignerBrowserTick {
+    <#
+        The browser's share of each loop turn: the first connection (after the panel has
+        loaded), the pick in progress (polled with short evaluations, so the loop never
+        waits on the person), and following the visible tab.
+    #>
+    param([Parameter(Mandatory)][object]$State)
+    $browser = $State.Browser
+    if ($browser.ConnectPending) {
+        Connect-DesignerBrowser -State $State
+        [void](Set-DesignerLayout -State $State -Focus panel)
+        return
+    }
+    if ($State.Pick.State -eq 'picking') { Update-ElementPick -State $State }
+    Update-DesignerBrowser -State $State
+}
+
+function Get-DesignerBrowserRefusal {
+    # 409 when a request needs the audit Edge and there is none, with the reason; $null when connected.
+    param([Parameter(Mandatory)][object]$State)
+    if ($State.Browser.Connected) { return $null }
+    $why = if ($null -ne $State.Browser.Problem) { [string]$State.Browser.Problem['message'] } else { 'The Designer is still connecting to Edge.' }
+    return New-DesignerError -Status 409 -Code 'no-browser' -Message 'The audit browser is not connected.' -Detail $why
+}
+
+function Test-DesignerUrl {
+    <#
+        Why an address cannot be opened, or ''. The rule of the configuration check
+        (http:// or https:// and something after it), plus a parse, so nothing but a web
+        page ever reaches Page.navigate (no file:, javascript: or edge: address).
+    #>
+    param([AllowEmptyString()][string]$Url)
+    $text = $Url.Trim()
+    if (-not $text) { return 'Enter the address of the page first.' }
+    if ($text.Length -gt 4000) { return 'The address is too long.' }
+    if ($text -notmatch '^(?i)https?://\S') { return 'The address must start with http:// or https://.' }
+    $uri = $null
+    if (-not [Uri]::TryCreate($text, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -notin 'http', 'https' -or -not $uri.Host) {
+        return 'This is not an address Edge can open.'
+    }
+    return ''
+}
+
+function Get-DesignerPageSetting {
+    <#
+        The settings a run would use for one page of the configuration the panel shows
+        (saved or not), made by the engine's own Complete-VouchConfig, Resolve-RunSettings
+        and Get-PageSettings - so Go zooms as the run will, and a tested click waits as
+        long as the run would. A configuration that cannot be read that far gives the
+        defaults.
+    #>
+    param([AllowNull()][object]$Config, [int]$PageIndex = -1)
+    $name = ''
+    try {
+        if ($Config -isnot [System.Collections.IDictionary]) { throw 'no configuration' }
+        $completed = Complete-VouchConfig -Config (Copy-VouchConfig -Config (Repair-VouchConfigKeyCase -Config $Config))
+        $run = Resolve-RunSettings -BoundParameters @{} -Defaults @{} -Config $completed
+        $pages = @($completed['pages'])
+        $page = if ($PageIndex -ge 0 -and $PageIndex -lt $pages.Count) { $pages[$PageIndex] } else { $null }
+        $overrides = if ($page -is [System.Collections.IDictionary] -and $page['overrides'] -is [System.Collections.IDictionary]) { $page['overrides'] } else { $null }
+        if ($page -is [System.Collections.IDictionary] -and $page['name'] -is [string]) { $name = ConvertTo-DesignerText -Value $page['name'] -Max 120 }
+        $settings = Get-PageSettings -Settings $run -Definition ([pscustomobject]@{ Overrides = $overrides }) -Config $completed
+        return [pscustomobject]@{ Settings = $settings; Name = $name }
+    }
+    catch {
+        $completed = Complete-VouchConfig -Config (Get-DefaultVouchConfig)
+        $run = Resolve-RunSettings -BoundParameters @{} -Defaults @{} -Config $completed
+        $settings = Get-PageSettings -Settings $run -Definition ([pscustomobject]@{ Overrides = $null }) -Config $completed
+        return [pscustomobject]@{ Settings = $settings; Name = $name }
+    }
+}
+
+function Set-DesignerZoomPreview {
+    <#
+        Shows the page at the zoom the run will use (Set-PageZoom: nothing is stored in
+        Edge, and it ends with the Designer's connection), or takes it off at 100.
+        Returns '' or why the zoom could not be shown.
+    #>
+    param([Parameter(Mandatory)][object]$State, [int]$Percent = 100, [AllowEmptyString()][string]$PageName = '')
+    $browser = $State.Browser
+    if ($Percent -eq 100) {
+        if ($browser.ZoomPercent -ne 100 -or $script:PageZoomPercent -ne 100) {
+            try { Clear-PageZoom } catch { Write-Verbose "The zoom preview could not be cleared: $($_.Exception.Message)" }
+        }
+        $browser.ZoomPercent = 100
+        $browser.ZoomPage = ''
+        return ''
+    }
+    try {
+        Set-PageZoom -Percent $Percent
+        $browser.ZoomPercent = $Percent
+        $browser.ZoomPage = $PageName
+        return ''
+    }
+    catch {
+        $browser.ZoomPercent = 100
+        $browser.ZoomPage = ''
+        return "The page could not be shown at $Percent%: $($_.Exception.Message)"
+    }
+}
+
+function Update-DesignerZoomPreview {
+    # After the window changed size: the zoom is worked out from the window's size, so set it again.
+    param([Parameter(Mandatory)][object]$State)
+    $browser = $State.Browser
+    if (-not $browser.Connected -or $browser.ZoomPercent -eq 100) { return }
+    Start-Sleep -Milliseconds 300
+    try { Set-PageZoom -Percent $browser.ZoomPercent }
+    catch { $browser.ZoomPercent = 100; $browser.ZoomPage = ''; $browser.Notice = 'The zoom preview was lost when the window changed size.' }
+}
+
+function ConvertTo-DesignerPageName {
+    <#
+        A page name from a tab's title: one line, no control characters, at most 80
+        characters (cut at a word). An empty title gives the site's host name.
+    #>
+    param([AllowEmptyString()][string]$Title = '', [AllowEmptyString()][string]$Url = '')
+    $name = ($Title -replace '[\x00-\x1F\x7F]', ' ' -replace '\s+', ' ').Trim()
+    if ($name.Length -gt 80) {
+        $cut = $name.Substring(0, 80)
+        $space = $cut.LastIndexOf(' ')
+        $name = $(if ($space -ge 40) { $cut.Substring(0, $space) } else { $cut }).TrimEnd(' ', '-', '|', ',', ':') + [char]0x2026
+    }
+    if (-not $name) {
+        $uri = $null
+        if ([Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri) -and $uri.Host) { $name = $uri.Host } else { $name = 'New page' }
+    }
+    return $name
+}
+
+function Invoke-DesignerBrowserCurrent {
+    # GET /api/browser/current: the attached tab, looked at now, and the other web tabs.
+    param([Parameter(Mandatory)][object]$State)
+    Update-DesignerBrowser -State $State -Force
+    $browser = $State.Browser
+    return New-DesignerJsonResponse -Data ([ordered]@{
+            connected          = [bool]$browser.Connected
+            tabId              = $browser.TabId
+            url                = $browser.Url
+            title              = $browser.Title
+            tabs               = @($browser.Tabs)
+            launchedByDesigner = [bool]$browser.LaunchedByDesigner
+        })
+}
+
+function Invoke-DesignerBrowserConnect {
+    # POST /api/browser/connect: the panel's Retry / Reconnect - connect (or start Edge) now, then tidy the windows.
+    param([Parameter(Mandatory)][object]$State)
+    Connect-DesignerBrowser -State $State
+    if ($State.Browser.Connected) { [void](Set-DesignerLayout -State $State -Focus panel) }
+    return New-DesignerJsonResponse -Data (Get-DesignerBrowserData -State $State)
+}
+
+function Invoke-DesignerLayoutRequest {
+    # POST /api/browser/layout: "Tidy windows".
+    param([Parameter(Mandatory)][object]$State)
+    $layout = Set-DesignerLayout -State $State -Focus panel
+    return New-DesignerJsonResponse -Data ([ordered]@{ ok = [bool]$layout.Ok; message = $layout.Message })
+}
+
+function Invoke-DesignerZoomOff {
+    # POST /api/browser/zoom-off: show the page at 100% again.
+    param([Parameter(Mandatory)][object]$State)
+    $refusal = Get-DesignerBrowserRefusal -State $State
+    if ($null -ne $refusal) { return $refusal }
+    [void](Set-DesignerZoomPreview -State $State -Percent 100)
+    return New-DesignerJsonResponse -Data (Get-DesignerBrowserData -State $State)
+}
+
+function Invoke-DesignerPageFromCurrent {
+    # POST /api/page/from-current: a name (from the tab's title) and the address of the page in front.
+    param([Parameter(Mandatory)][object]$State)
+    Update-DesignerBrowser -State $State -Force
+    $refusal = Get-DesignerBrowserRefusal -State $State
+    if ($null -ne $refusal) { return $refusal }
+    $url = $State.Browser.Url
+    if (Test-DesignerUrl -Url $url) {
+        return New-DesignerError -Status 409 -Code 'no-page' -Message 'The tab in front shows no web page.' -Detail 'Open the page in the audit Edge window first (sign in if needed), then add it.'
+    }
+    return New-DesignerJsonResponse -Data ([ordered]@{ name = (ConvertTo-DesignerPageName -Title $State.Browser.Title -Url $url); url = $url })
+}
+
+function Invoke-DesignerNavigate {
+    <#
+        POST /api/browser/navigate {url, config?, pageIndex?}: opens the page in the
+        attached tab and waits for it with the engine's own wait (Wait-PageReady). With
+        the configuration and the page's position, the page is shown at the zoom the run
+        will use (or at 100% again).
+    #>
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Body, [Parameter(Mandatory)][object]$State)
+    $url = (Get-DesignerBodyText -Body $Body -Name 'url').Trim()
+    $problem = Test-DesignerUrl -Url $url
+    if ($problem) { return New-DesignerError -Status 400 -Code 'url' -Message $problem -Detail 'Correct the address of the page, then press Go again.' }
+    $refusal = Get-DesignerBrowserRefusal -State $State
+    if ($null -ne $refusal) { return $refusal }
+    if ($State.Pick.State -eq 'picking') { Stop-ElementPick -State $State -Message 'Picking stopped because another page was opened.' -NoLayout }
+    $page = Get-DesignerPageSetting -Config $Body['config'] -PageIndex (Get-DesignerBodyNumber -Body $Body -Name 'pageIndex')
+    $zoom = (Get-PageCaptureMode -Settings $page.Settings).ZoomPercent
+    $zoomProblem = Set-DesignerZoomPreview -State $State -Percent $zoom -PageName $page.Name
+    $status = 'loaded'
+    $message = ''
+    try {
+        Set-NavigationMarker
+        $navigation = Send-CdpCommand -Method 'Page.navigate' -Params @{ url = $url } -TimeoutSec 30
+        $errorText = [string](Get-DesignerValue -Object $navigation -Name 'errorText')
+        if ($errorText) {
+            $status = 'error'
+            $message = "Edge could not open the page ($(ConvertTo-DesignerText -Value $errorText -Max 120))."
+        }
+        elseif (-not (Wait-PageReady -TimeoutSec ([int]$page.Settings.NavigationTimeoutSec))) {
+            $status = 'slow'
+            $message = "The page had not finished loading after $([int]$page.Settings.NavigationTimeoutSec) seconds; it is shown as far as it got."
+        }
+    }
+    catch {
+        Update-DesignerBrowser -State $State -Force
+        return New-DesignerError -Status 502 -Code 'navigate' -Message 'The browser could not open the page.' -Detail ([string]$_.Exception.Message)
+    }
+    $title = ''
+    $final = $url
+    try {
+        $title = ConvertTo-DesignerText -Value (Invoke-CdpEval -Expression 'document.title' -TimeoutSec 5) -Max 300
+        $final = ConvertTo-DesignerText -Value (Invoke-CdpEval -Expression 'location.href' -TimeoutSec 5) -Max 2000
+    }
+    catch { Write-Verbose "The page's title could not be read: $($_.Exception.Message)" }
+    $State.Browser.Url = $final
+    $State.Browser.Title = $title
+    if (-not $message) { $message = 'Opened.' }
+    if ($zoomProblem) { $message += " $zoomProblem" }
+    return New-DesignerJsonResponse -Data ([ordered]@{
+            url     = $final
+            title   = $title
+            status  = $status
+            message = $message
+            zoom    = [ordered]@{ percent = [int]$State.Browser.ZoomPercent; page = $State.Browser.ZoomPage }
+        })
+}
+
+function Invoke-DesignerActionTest {
+    <#
+        POST /api/action/test {action, config?, pageIndex?}: runs ONE action on the page
+        in front, through the engine's own Invoke-PageAction with the settings the run
+        would use for that page - so it really clicks. Captures and pauses belong to a
+        page test (they need the whole page run). Waits are capped at 15 seconds here so
+        the Designer does not sit still for minutes; the answer says so.
+    #>
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Body, [Parameter(Mandatory)][object]$State)
+    $action = $Body['action']
+    if ($action -isnot [System.Collections.IDictionary]) {
+        return New-DesignerError -Status 400 -Code 'action' -Message 'There was no action to test.' -Detail 'The request did not hold an action.'
+    }
+    $type = Get-VouchActionType -Type $action['type']
+    if ($type -in 'capture', 'pause') {
+        return New-DesignerJsonResponse -Data ([ordered]@{
+                ok = $false; navigated = $false; url = $State.Browser.Url
+                message = $(if ($type -eq 'capture') { 'A capture is tried with "Test this page", which takes the screenshots the way the run will.' } else { 'A pause is tried with "Test this page": it needs the run''s Vouch dialog.' })
+            })
+    }
+    if ($type -notin 'click', 'clickText', 'wait', 'waitFor') {
+        return New-DesignerError -Status 400 -Code 'action' -Message 'This kind of action cannot be tested.' -Detail 'Only clicks, waits and wait-fors can be tried one by one.'
+    }
+    $copy = [ordered]@{ type = $type }
+    $note = ''
+    switch ($type) {
+        'click' {
+            $copy['selector'] = [string](Get-DesignerValue -Object $action -Name 'selector')
+            if (-not $copy['selector'].Trim()) { return New-DesignerError -Status 400 -Code 'action' -Message 'Enter the selector of what to click first.' }
+        }
+        'clickText' {
+            $copy['text'] = [string](Get-DesignerValue -Object $action -Name 'text')
+            if (-not $copy['text'].Trim()) { return New-DesignerError -Status 400 -Code 'action' -Message 'Enter the words to click first.' }
+        }
+        'wait' {
+            $seconds = Get-DesignerValue -Object $action -Name 'seconds'
+            if ($seconds -isnot [ValueType] -or $seconds -is [bool] -or [double]$seconds -lt 0) { return New-DesignerError -Status 400 -Code 'action' -Message 'Enter the number of seconds to wait first.' }
+            $copy['seconds'] = [Math]::Min([double]$seconds, 15)
+            if ([double]$seconds -gt 15) { $note = ' (A test waits at most 15 seconds; the run waits the full time.)' }
+        }
+        'waitFor' {
+            $copy['selector'] = [string](Get-DesignerValue -Object $action -Name 'selector')
+            if (-not $copy['selector'].Trim()) { return New-DesignerError -Status 400 -Code 'action' -Message 'Enter the selector of the element to wait for first.' }
+        }
+    }
+    $refusal = Get-DesignerBrowserRefusal -State $State
+    if ($null -ne $refusal) { return $refusal }
+    if ($State.Pick.State -eq 'picking') { Stop-ElementPick -State $State -Message 'Picking stopped because an action was tested.' -NoLayout }
+    $page = Get-DesignerPageSetting -Config $Body['config'] -PageIndex (Get-DesignerBodyNumber -Body $Body -Name 'pageIndex')
+    $settings = $page.Settings
+    if ($type -eq 'waitFor') {
+        $timeout = Get-DesignerValue -Object $action -Name 'timeoutSec'
+        $limit = if ($timeout -is [ValueType] -and $timeout -isnot [bool] -and [double]$timeout -gt 0) { [double]$timeout } else { [double]$settings.NavigationTimeoutSec }
+        $copy['timeoutSec'] = [Math]::Min($limit, 15)
+        if ($limit -gt 15) { $note = ' (A test waits at most 15 seconds; the run waits up to the full time limit.)' }
+    }
+    $before = ''
+    try { $before = [string](Invoke-CdpEval -Expression 'location.href' -TimeoutSec 5) } catch { $before = '' }
+    $entry = Invoke-PageAction -Action $copy -Settings $settings
+    $after = $before
+    $newDocument = $false
+    try {
+        $after = [string](Invoke-CdpEval -Expression 'location.href' -TimeoutSec 5)
+        $newDocument = $type -in 'click', 'clickText' -and [bool](Invoke-CdpEval -Expression "typeof window.__vouchMark === 'undefined'" -TimeoutSec 5)
+    }
+    catch { Write-Verbose "The page after the test could not be read: $($_.Exception.Message)" }
+    $navigated = ($after -ne $before) -or $newDocument
+    $after = ConvertTo-DesignerText -Value $after -Max 2000
+    $State.Browser.Url = $after
+    if ($entry.Ok) {
+        $message = switch ($type) {
+            'click' { if ($navigated) { "Clicked. The browser then showed $after." } else { 'Clicked. The page stayed where it was.' } }
+            'clickText' { if ($navigated) { "Clicked. The browser then showed $after." } else { 'Clicked. The page stayed where it was.' } }
+            'wait' { "Waited $(([double]$copy['seconds']).ToString([System.Globalization.CultureInfo]::InvariantCulture)) second(s)." }
+            'waitFor' { 'Found: the element is on the page and visible.' }
+        }
+    }
+    else { $message = "Did not work: $(ConvertTo-DesignerText -Value ([string]$entry.Message) -Max 400)" }
+    [void](Set-DesignerLayout -State $State -Focus panel)
+    return New-DesignerJsonResponse -Data ([ordered]@{ ok = [bool]$entry.Ok; message = $message + $note; navigated = $navigated; url = $after })
+}
+
+#endregion
+
+#region Windows ------------------------------------------------------------------------
+
+function Initialize-DesignerWindowInterop {
+    <#
+        Moving and sizing the two windows. A type of its own (Vouch.DesignerWindow): a
+        PowerShell session keeps a compiled type, so members cannot be added to
+        Vouch.DesignerNative in a session that already loaded it.
+    #>
+    if (-not ('Vouch.DesignerWindow' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace Vouch
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DesignerRect { public int Left; public int Top; public int Right; public int Bottom; }
+
+    public static class DesignerWindow
+    {
+        [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetWindowPos(IntPtr hWnd, IntPtr insertAfter, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetWindowRect(IntPtr hWnd, out DesignerRect rect);
+        [DllImport("dwmapi.dll")]
+        public static extern int DwmGetWindowAttribute(IntPtr hWnd, int attribute, out DesignerRect rect, int size);
+        [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsIconic(IntPtr hWnd);
+        [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsZoomed(IntPtr hWnd);
+        [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool ShowWindow(IntPtr hWnd, int command);
+        [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")]
+        public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    }
+}
+'@ -Language CSharp
+    }
+}
+
+function Get-DesignerWindowHandle {
+    # The main window of a process, looked up afresh (Process caches it), or zero: never waits.
+    param([int]$ProcessId = 0)
+    if ($ProcessId -le 0) { return [IntPtr]::Zero }
+    try { return (Get-Process -Id $ProcessId -ErrorAction Stop).MainWindowHandle }
+    catch { return [IntPtr]::Zero }
+}
+
+function Get-DesignerLayoutPlan {
+    <#
+        Where the two windows go (pure): the panel at the right edge of the working area,
+        the audit Edge filling the rest, both full height and not maximised. The panel
+        keeps its current width when that is sensible (the person may have widened it),
+        never more than half the screen.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Drawing.Rectangle]$WorkingArea,
+        [int]$PanelWidth = 0,
+        [int]$DefaultWidth = 480
+    )
+    $width = if ($PanelWidth -ge 320) { $PanelWidth } else { $DefaultWidth }
+    $width = [Math]::Max(1, [Math]::Min($width, [int][Math]::Floor($WorkingArea.Width / 2)))
+    return [pscustomobject]@{
+        Edge  = [System.Drawing.Rectangle]::new($WorkingArea.Left, $WorkingArea.Top, $WorkingArea.Width - $width, $WorkingArea.Height)
+        Panel = [System.Drawing.Rectangle]::new($WorkingArea.Right - $width, $WorkingArea.Top, $width, $WorkingArea.Height)
+    }
+}
+
+function Get-DesignerWindowFrame {
+    <#
+        A window's visible bounds (DWM extended frame bounds: what is drawn) and its outer
+        bounds (GetWindowRect, with the invisible resize borders), so a window can be put
+        exactly where its visible edge should be.
+    #>
+    param([Parameter(Mandatory)][IntPtr]$Handle)
+    $outer = [Vouch.DesignerRect]::new()
+    if (-not [Vouch.DesignerWindow]::GetWindowRect($Handle, [ref]$outer)) { return $null }
+    $visible = [Vouch.DesignerRect]::new()
+    $size = [System.Runtime.InteropServices.Marshal]::SizeOf([type][Vouch.DesignerRect])
+    if ([Vouch.DesignerWindow]::DwmGetWindowAttribute($Handle, 9, [ref]$visible, $size) -ne 0) { $visible = $outer }
+    return [pscustomobject]@{
+        Outer   = [System.Drawing.Rectangle]::FromLTRB($outer.Left, $outer.Top, $outer.Right, $outer.Bottom)
+        Visible = [System.Drawing.Rectangle]::FromLTRB($visible.Left, $visible.Top, $visible.Right, $visible.Bottom)
+    }
+}
+
+function Move-DesignerWindow {
+    <#
+        Puts a window's visible edges on -Bounds. A minimised or maximised window is
+        restored first (a maximised window ignores a new size), and the invisible borders
+        are added back so no gap or overlap shows between the two windows.
+    #>
+    param([Parameter(Mandatory)][IntPtr]$Handle, [Parameter(Mandatory)][System.Drawing.Rectangle]$Bounds)
+    if (-not [Vouch.DesignerWindow]::IsWindow($Handle)) { return $false }
+    if ([Vouch.DesignerWindow]::IsIconic($Handle) -or [Vouch.DesignerWindow]::IsZoomed($Handle)) {
+        [void][Vouch.DesignerWindow]::ShowWindow($Handle, 9)   # SW_RESTORE
+        Start-Sleep -Milliseconds 150
+    }
+    $frame = Get-DesignerWindowFrame -Handle $Handle
+    if ($null -eq $frame) { return $false }
+    $left = $frame.Visible.Left - $frame.Outer.Left
+    $top = $frame.Visible.Top - $frame.Outer.Top
+    $right = $frame.Outer.Right - $frame.Visible.Right
+    $bottom = $frame.Outer.Bottom - $frame.Visible.Bottom
+    # SWP_NOZORDER | SWP_NOACTIVATE
+    return [bool][Vouch.DesignerWindow]::SetWindowPos($Handle, [IntPtr]::Zero, $Bounds.Left - $left, $Bounds.Top - $top,
+        $Bounds.Width + $left + $right, $Bounds.Height + $top + $bottom, 0x0014)
+}
+
+function Set-DesignerForegroundWindow {
+    <#
+        Brings a window to the front. Windows refuses SetForegroundWindow to a process
+        that did not send the last input; a synthetic Alt press and release (as the
+        engine's Set-EdgeForeground does) satisfies the rule without typing anything.
+    #>
+    param([Parameter(Mandatory)][IntPtr]$Handle)
+    if ([Vouch.DesignerWindow]::SetForegroundWindow($Handle) -and [Vouch.DesignerWindow]::GetForegroundWindow() -eq $Handle) { return $true }
+    [Vouch.DesignerWindow]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+    [Vouch.DesignerWindow]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+    [void][Vouch.DesignerWindow]::SetForegroundWindow($Handle)
+    return ([Vouch.DesignerWindow]::GetForegroundWindow() -eq $Handle)
+}
+
+function Set-DesignerLayout {
+    <#
+        The audit Edge on the left and the panel on the right of the primary screen's
+        working area, neither maximised (Get-DesignerLayoutPlan); -Focus panel then brings
+        the panel to the front. Safe when either window is missing (no panel, a headless
+        or closed Edge) or minimised: it does what it can and says what it did.
+        The process is made DPI-aware first (Initialize-NativeInterop), so the screen and
+        every window are measured and placed in the same physical pixels; the panel was
+        launched before that, at its --window-size in the units Edge expects.
+    #>
+    param([Parameter(Mandatory)][object]$State, [ValidateSet('panel', 'none')][string]$Focus = 'none')
+    $panelId = if ($null -ne $State.PanelProcess) { try { $State.PanelProcess.Id } catch { 0 } } else { 0 }
+    $edgeId = if ($State.Browser.Connected -and $null -ne $script:EdgeProcess) { try { $script:EdgeProcess.Id } catch { 0 } } else { 0 }
+    $panel = Get-DesignerWindowHandle -ProcessId $panelId
+    $edge = Get-DesignerWindowHandle -ProcessId $edgeId
+    if ($panel -eq [IntPtr]::Zero -or $edge -eq [IntPtr]::Zero) {
+        $missing = if ($panel -eq [IntPtr]::Zero -and $edge -eq [IntPtr]::Zero) { 'Neither the Designer window nor an audit Edge window was found' }
+        elseif ($panel -eq [IntPtr]::Zero) { 'The Designer window was not found' } else { 'No audit Edge window was found' }
+        return [pscustomobject]@{ Ok = $false; Message = "$missing, so the windows were left as they are." }
+    }
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+        Initialize-NativeInterop
+        Initialize-DesignerWindowInterop
+        $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        $scale = 1.0
+        $graphics = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+        try { $scale = $graphics.DpiX / 96.0 } finally { $graphics.Dispose() }
+        $width = 0
+        if (-not [Vouch.DesignerWindow]::IsIconic($panel) -and -not [Vouch.DesignerWindow]::IsZoomed($panel)) {
+            $frame = Get-DesignerWindowFrame -Handle $panel
+            if ($null -ne $frame) { $width = $frame.Visible.Width }
+        }
+        $plan = Get-DesignerLayoutPlan -WorkingArea $area -PanelWidth $width -DefaultWidth ([int][Math]::Round(480 * $scale))
+        $edgeMoved = Move-DesignerWindow -Handle $edge -Bounds $plan.Edge
+        $panelMoved = Move-DesignerWindow -Handle $panel -Bounds $plan.Panel
+        if ($Focus -eq 'panel') { [void](Set-DesignerForegroundWindow -Handle $panel) }
+        Update-DesignerZoomPreview -State $State
+        if ($edgeMoved -and $panelMoved) { return [pscustomobject]@{ Ok = $true; Message = 'The browser is on the left and the Designer on the right.' } }
+        return [pscustomobject]@{ Ok = $false; Message = 'Windows did not let the Designer move every window.' }
+    }
+    catch {
+        return [pscustomobject]@{ Ok = $false; Message = "The windows could not be arranged: $($_.Exception.Message)" }
+    }
+}
+
+function Show-DesignerAuditWindow {
+    <#
+        Brings the audit Edge to the front for a pick, maximised - the size the run sees
+        the page at (Set-EdgeForeground, as a screen capture does), because many sites lay
+        out differently at the narrower tiled width and a selector picked there could miss
+        at run time. The zoom preview is worked out again for the new size.
+    #>
+    param([Parameter(Mandatory)][object]$State)
+    $edgeId = if ($null -ne $script:EdgeProcess) { try { $script:EdgeProcess.Id } catch { 0 } } else { 0 }
+    if ((Get-DesignerWindowHandle -ProcessId $edgeId) -eq [IntPtr]::Zero) { return }
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        Initialize-NativeInterop
+        [void](Set-EdgeForeground -TimeoutSec 2)
+        Update-DesignerZoomPreview -State $State
+    }
+    catch { Write-Verbose "The browser could not be brought to the front: $($_.Exception.Message)" }
+}
+
+#endregion
+
+#region Picker ---------------------------------------------------------------------------
+
+function Get-DesignerPickerText {
+    # The words the picker shows in the page, per mode (passed in as data, never as code).
+    param([Parameter(Mandatory)][ValidateSet('click', 'scroll', 'waitFor')][string]$Mode)
+    $banner = switch ($Mode) {
+        'click' { 'Vouch: click what Vouch should click. Esc cancels.' }
+        'scroll' { 'Vouch: click inside the area Vouch should scroll. Esc cancels.' }
+        'waitFor' { 'Vouch: click the element Vouch should wait for. Esc cancels.' }
+    }
+    return [ordered]@{
+        banner      = $banner
+        crossorigin = 'This part is a frame from another site: Vouch cannot record anything inside it.'
+        shadow      = 'This is inside a page component (shadow DOM) that Vouch cannot look into.'
+        page        = 'The whole page'
+        nothing     = 'Nothing here scrolls. Point inside the area with the scroll bar.'
+        climbed     = 'part of it'
+        checking    = 'Checking that Vouch can replay this…'
+    }
+}
+
+function Get-DesignerPickerScript {
+    <#
+        The picker (designer\picker.js) as one expression for Invoke-CdpEval, inside a
+        closure that holds the engine's own frame helpers (Get-FrameDocsScript), so the
+        picker walks exactly the documents a click searches. Mode, token and texts go in
+        through ConvertTo-JsLiteral; picker.js is never served to the panel.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$State,
+        [Parameter(Mandatory)][ValidateSet('click', 'scroll', 'waitFor')][string]$Mode,
+        [Parameter(Mandatory)][string]$Token
+    )
+    $file = Join-Path -Path $State.DesignerDirectory -ChildPath 'picker.js'
+    if (-not [System.IO.File]::Exists($file)) { throw "A file of the Designer is missing: picker.js is not in $($State.DesignerDirectory). Copy the whole Vouch folder again." }
+    $source = [System.IO.File]::ReadAllText($file)
+    $texts = Get-DesignerPickerText -Mode $Mode
+    $pairs = foreach ($key in $texts.Keys) { "${key}: $(ConvertTo-JsLiteral -Value $texts[$key])" }
+    $config = "{ mode: $(ConvertTo-JsLiteral -Value $Mode), token: $(ConvertTo-JsLiteral -Value $Token), texts: { $($pairs -join ', ') } }"
+    return "(function () {`n$(Get-FrameDocsScript)`nreturn ($source`n)($config);`n})()"
+}
+
+function Test-DesignerGeneratedId {
+    <#
+        Whether an id looks made up afresh by a program (so it would differ on the next
+        visit and must not be recorded): long digit runs, UUIDs, hash-like hex, letters
+        and digits shuffled together, and the numbered prefixes common frameworks use.
+    #>
+    param([AllowEmptyString()][string]$Id)
+    if ([string]::IsNullOrWhiteSpace($Id)) { return $true }
+    if ($Id.Length -gt 64) { return $true }
+    if ($Id -match '\d{4,}' -or $Id -match '^\d' -or $Id -match '[:«»]') { return $true }
+    if ($Id -match '(?i)[0-9a-f]{8}-[0-9a-f]{4}') { return $true }
+    foreach ($run in [regex]::Matches($Id, '(?i)[0-9a-f]{8,}')) {
+        if ($run.Value -match '\d' -and $run.Value -match '(?i)[a-f]') { return $true }
+    }
+    if ($Id -match '(?i)^(ember|ext-gen|ext-comp|yui_|ui-id-|mui-|react-|radix-|headlessui-|rc-|gwt-uid-|j_id|jsx-|__next)\S*\d') { return $true }
+    if ($Id -cmatch '[A-Za-z]+\d+[A-Za-z]+\d+[A-Za-z]+\d') { return $true }
+    return $false
+}
+
+function Test-DesignerShadowHost {
+    <#
+        Whether the picked element hosts a shadow root, open or closed. The picker sees
+        into open ones itself; a closed one hides where the click really landed. Neither
+        the engine's selectors nor its words reach inside, so such a pick cannot be
+        recorded. DOM.describeNode sees both kinds (no DOM.enable needed).
+    #>
+    $objectId = ''
+    try {
+        $answer = Send-CdpCommand -Method 'Runtime.evaluate' -TimeoutSec 5 -Params @{
+            expression = '(window.__vouchPicker && typeof window.__vouchPicker.element === "function") ? window.__vouchPicker.element() : null'
+            returnByValue = $false
+        }
+        $objectId = [string](Get-DesignerValue -Object (Get-DesignerValue -Object $answer -Name 'result') -Name 'objectId')
+        if (-not $objectId) { return $false }
+        $described = Send-CdpCommand -Method 'DOM.describeNode' -Params @{ objectId = $objectId; depth = 1 } -TimeoutSec 5
+        $roots = Get-DesignerValue -Object (Get-DesignerValue -Object $described -Name 'node') -Name 'shadowRoots'
+        return (@($roots | Where-Object { $null -ne $_ }).Count -gt 0)
+    }
+    catch { return $false }
+    finally {
+        if ($objectId) {
+            try { [void](Send-CdpCommand -Method 'Runtime.releaseObject' -Params @{ objectId = $objectId } -TimeoutSec 5) }
+            catch { Write-Verbose 'The picked element could not be released.' }
+        }
+    }
+}
+
+function Test-ElementPickProposal {
+    <#
+        The proof behind every candidate: the ENGINE's own scripts, run on the live page,
+        must resolve the proposal to the very element the person picked (the picker
+        marked it with this pick's token). Text: the clicktext search in find-only mode.
+        Selector: the click's search (first match in the page, then its same-site frames).
+        Wait-for: that, and Wait-PageElement finds a visible match now. Scroll area: that,
+        and the scroll search in "area" mode takes it with no fallback; the whole page:
+        the scroll search in "page" mode finds the window scrolling.
+        Returns { Ok; Exact }.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('click', 'scroll', 'waitFor')][string]$Mode,
+        [Parameter(Mandatory)][string]$Kind,
+        [AllowEmptyString()][string]$Value,
+        [Parameter(Mandatory)][string]$Token,
+        [string]$ScrollKind = ''
+    )
+    $no = [pscustomobject]@{ Ok = $false; Exact = $false }
+    try {
+        if ($Mode -eq 'scroll' -and $Kind -eq 'page') {
+            $target = Invoke-CdpEval -Expression (Get-ScrollTargetScript -Mode page) -TimeoutSec 10
+            return [pscustomobject]@{ Ok = ([string](Get-DesignerValue -Object $target -Name 'kind') -eq 'window'); Exact = $true }
+        }
+        if ($Kind -eq 'text') {
+            if ($Mode -ne 'click') { return $no }
+            $found = Invoke-CdpEval -Expression (Get-ClickTextScript -Text $Value -FindOnly) -TimeoutSec 10
+            $hit = ((Get-DesignerValue -Object $found -Name 'found') -eq $true) -and ([string](Get-DesignerValue -Object $found -Name 'mark') -ceq $Token)
+            return [pscustomobject]@{ Ok = $hit; Exact = ((Get-DesignerValue -Object $found -Name 'exact') -eq $true) }
+        }
+        $found = Invoke-CdpEval -Expression (Get-ClickSelectorScript -Selector $Value -FindOnly) -TimeoutSec 10
+        $hit = ((Get-DesignerValue -Object $found -Name 'found') -eq $true) -and ([string](Get-DesignerValue -Object $found -Name 'mark') -ceq $Token)
+        if (-not $hit) { return $no }
+        if ($Mode -eq 'waitFor') { return [pscustomobject]@{ Ok = [bool](Wait-PageElement -Selector $Value -TimeoutSec 0); Exact = $true } }
+        if ($Mode -eq 'scroll') {
+            $target = Invoke-CdpEval -Expression (Get-ScrollTargetScript -Mode area -Selector $Value) -TimeoutSec 10
+            $ok = ([string](Get-DesignerValue -Object $target -Name 'fallback') -eq '') -and ([string](Get-DesignerValue -Object $target -Name 'kind') -eq $ScrollKind)
+            return [pscustomobject]@{ Ok = $ok; Exact = $true }
+        }
+        return [pscustomobject]@{ Ok = $true; Exact = $true }
+    }
+    catch {
+        # An invalid selector, or a page that went away: not offered.
+        return $no
+    }
+}
+
+function New-ElementPickCandidate {
+    <#
+        One verified candidate as the panel offers it: what is recorded (the action, the
+        scroll settings or the selector), a plain description built here from capped page
+        text, and how robust it is.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Mode,
+        [Parameter(Mandatory)][string]$Kind,
+        [AllowEmptyString()][string]$Value,
+        [bool]$Exact = $true,
+        [AllowEmptyString()][string]$Attr = '',
+        [AllowEmptyString()][string]$AttrValue = '',
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Element
+    )
+    $q = { param($t) [char]0x2018 + (ConvertTo-DesignerText -Value ([string]$t) -Max 60) + [char]0x2019 }
+    $noun = [string]$Element['noun']
+    if ($Mode -eq 'scroll') { $noun = if ($Element['kind'] -eq 'frame') { 'frame' } else { 'scrolling area' } }
+    $where = if ($Element['frame']) { " in the frame $(& $q $Element['frame'])" } else { '' }
+    $short = ConvertTo-DesignerText -Value $AttrValue -Max 60
+    switch ($Kind) {
+        'page' { $description = 'the whole page (its own scroll bar)'; $robustness = 'best'; $note = 'Scrolls the page itself from top to bottom.' }
+        'text' {
+            if ($Exact) { $description = "the $(& $q $Value) $noun$where"; $robustness = 'best'; $note = 'Clicks what shows exactly these words, so it keeps working when the page''s design changes.' }
+            else { $description = "the $noun showing $(& $q $Value)$where"; $robustness = 'fair'; $note = 'Less robust: it matches only part of the words on it, so a change on the page could make Vouch click something else.' }
+        }
+        'testid' { $description = "the $noun with the test id $short$where"; $robustness = 'good'; $note = 'Test ids are put there by the site''s developers and usually stay the same.' }
+        'id' { $description = "the $noun with the id $short$where"; $robustness = 'good'; $note = 'Keeps working as long as the page keeps this id.' }
+        'attribute' {
+            $description = switch ($Attr) {
+                'aria-label' { "the $noun labelled $(& $q $AttrValue)$where" }
+                'name' { "the $noun named $(& $q $AttrValue)$where" }
+                default { "the $noun with the hint $(& $q $AttrValue)$where" }
+            }
+            $robustness = 'fair'; $note = 'Changes when the site changes this wording.'
+        }
+        default { $description = "the $noun at this place in the page's layout$where"; $robustness = 'fragile'; $note = 'Fragile: it depends on the page''s layout and breaks when that changes. Use it only when nothing better is offered.' }
+    }
+    $candidate = [ordered]@{ kind = $Kind; value = $Value; description = $description; robustness = $robustness; note = $note }
+    switch ($Mode) {
+        'click' { $candidate['action'] = if ($Kind -eq 'text') { [ordered]@{ type = 'clickText'; text = $Value } } else { [ordered]@{ type = 'click'; selector = $Value } } }
+        'scroll' { $candidate['scroll'] = if ($Kind -eq 'page') { [ordered]@{ mode = 'page' } } else { [ordered]@{ mode = 'area'; selector = $Value } } }
+        'waitFor' { $candidate['selector'] = $Value }
+    }
+    return $candidate
+}
+
+function Get-ElementPickCandidate {
+    <#
+        The picker's proposals turned into what may be recorded, in the order of
+        preference (words, test id, stable id, label/name/hint, layout path): each kept
+        only when Test-ElementPickProposal proves the engine replays it onto the picked
+        element. At most one text and three candidates; generated-looking ids are never
+        offered, nor paths anchored on them. Proposal values are page data: only strings
+        of a sane length are even tried.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('click', 'scroll', 'waitFor')][string]$Mode,
+        [Parameter(Mandatory)][string]$Token,
+        [AllowNull()][object[]]$Proposals,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Element
+    )
+    $list = [System.Collections.Generic.List[object]]::new()
+    $values = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $haveText = $false
+    foreach ($proposal in @($Proposals) | Select-Object -First 16) {
+        if ($list.Count -ge 3) { break }
+        $kind = [string](Get-DesignerValue -Object $proposal -Name 'kind')
+        $value = Get-DesignerValue -Object $proposal -Name 'value'
+        if ($kind -notin 'text', 'testid', 'id', 'attribute', 'path', 'page') { continue }
+        if ($value -isnot [string] -or $value.Length -gt 300) { continue }
+        if ($kind -ne 'page' -and -not $value.Trim()) { continue }
+        if ($kind -eq 'text' -and $haveText) { continue }
+        if ($values.Contains("$kind|$value")) { continue }
+        $attr = ConvertTo-DesignerText -Value (Get-DesignerValue -Object $proposal -Name 'attr') -Max 40
+        $attrValue = ConvertTo-DesignerText -Value (Get-DesignerValue -Object $proposal -Name 'attrValue') -Max 120
+        if ($kind -eq 'id' -and (Test-DesignerGeneratedId -Id $attrValue)) { continue }
+        $anchor = Get-DesignerValue -Object $proposal -Name 'anchorId'
+        if ($kind -eq 'path' -and $anchor -is [string] -and $anchor -and (Test-DesignerGeneratedId -Id $anchor)) { continue }
+        $check = Test-ElementPickProposal -Mode $Mode -Kind $kind -Value $value -Token $Token -ScrollKind ([string]$Element['kind'])
+        if (-not $check.Ok) { continue }
+        if ($kind -eq 'text') { $haveText = $true }
+        [void]$values.Add("$kind|$value")
+        $list.Add((New-ElementPickCandidate -Mode $Mode -Kind $kind -Value $value -Exact $check.Exact -Attr $attr -AttrValue $attrValue -Element $Element))
+    }
+    return , $list
+}
+
+function ConvertTo-ElementPickInfo {
+    # What the picker says about the picked element, reduced to capped strings and known words.
+    param([AllowNull()][object]$Info, [Parameter(Mandatory)][string]$Mode)
+    $nouns = 'link', 'button', 'tab', 'menu item', 'checkbox', 'choice', 'field', 'list', 'table', 'picture', 'frame', 'element', 'area', 'page'
+    $noun = [string](Get-DesignerValue -Object $Info -Name 'noun')
+    if ($noun -notin $nouns) { $noun = 'element' }
+    $kind = [string](Get-DesignerValue -Object $Info -Name 'kind')
+    if ($kind -notin 'element', 'frame', 'window') { $kind = 'element' }
+    $climbed = ConvertTo-DesignerText -Value (Get-DesignerValue -Object $Info -Name 'climbedFrom') -Max 20
+    $element = [ordered]@{
+        kind        = $kind
+        tag         = (ConvertTo-DesignerText -Value (Get-DesignerValue -Object $Info -Name 'tag') -Max 20)
+        id          = (ConvertTo-DesignerText -Value (Get-DesignerValue -Object $Info -Name 'id') -Max 120)
+        noun        = $noun
+        text        = (ConvertTo-DesignerText -Value (Get-DesignerValue -Object $Info -Name 'text') -Max 120)
+        frame       = (ConvertTo-DesignerText -Value (Get-DesignerValue -Object $Info -Name 'frame') -Max 200)
+        climbedFrom = $climbed
+        climbedNote = ''
+    }
+    if ($climbed -and $Mode -eq 'click') {
+        $part = if ($climbed -in 'svg', 'path', 'use', 'g', 'circle', 'rect', 'line', 'polyline', 'polygon', 'i') { 'an icon inside it' }
+        elseif ($climbed -eq 'img') { 'a picture inside it' } else { "a part of it (a $climbed element)" }
+        $element['climbedNote'] = "You pointed at $part; Vouch records the whole $noun, which is what the page responds to."
+    }
+    return $element
+}
+
+function Start-ElementPick {
+    <#
+        Starts a pick in the attached tab: injects the picker, makes the tab the one Edge
+        shows, brings Edge to the front maximised (Show-DesignerAuditWindow) and returns
+        at once. The person's click is collected later by Update-ElementPick, from the
+        loop, with short evaluations - the server never waits for the person.
+    #>
+    param([Parameter(Mandatory)][object]$State, [Parameter(Mandatory)][ValidateSet('click', 'scroll', 'waitFor')][string]$Mode)
+    if ($State.Pick.State -eq 'picking') { Stop-ElementPick -State $State -Message 'A new pick replaced this one.' -NoLayout }
+    $pick = New-DesignerPickState
+    $pick.Mode = $Mode
+    $pick.Token = (New-DesignerToken).Substring(0, 22)
+    $pick.TabId = $State.Browser.TabId
+    $pick.StartedAt = Get-Date
+    $pick.LastPoll = Get-Date
+    $State.Pick = $pick
+    try {
+        [void](Invoke-CdpEval -Expression (Get-DesignerPickerScript -State $State -Mode $Mode -Token $pick.Token) -TimeoutSec 10)
+    }
+    catch {
+        $pick.State = 'error'
+        $pick.Code = 'inject'
+        $pick.Message = "Picking could not start in this page: $($_.Exception.Message)"
+        return $pick
+    }
+    $pick.State = 'picking'
+    try { [void](Send-CdpCommand -Method 'Page.bringToFront' -TimeoutSec 5) } catch { Write-Verbose "Page.bringToFront: $($_.Exception.Message)" }
+    Show-DesignerAuditWindow -State $State
+    return $pick
+}
+
+function Close-ElementPick {
+    <#
+        Ends a pick: the picker removes everything it put into the page, the result is
+        kept for the panel, and the windows go back side by side with the panel in front.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$State,
+        [Parameter(Mandatory)][ValidateSet('done', 'cancelled', 'error')][string]$Outcome,
+        [AllowEmptyString()][string]$Code = '',
+        [AllowEmptyString()][string]$Message = '',
+        [AllowNull()][object]$Result = $null,
+        [switch]$NoLayout
+    )
+    $pick = $State.Pick
+    if ($State.Browser.Connected) {
+        try { [void](Invoke-CdpEval -Expression '(window.__vouchPicker && typeof window.__vouchPicker.stop === "function") ? window.__vouchPicker.stop() : false' -TimeoutSec 3) }
+        catch { Write-Verbose "The picker could not be removed from the page: $($_.Exception.Message)" }
+    }
+    $pick.State = $Outcome
+    $pick.Code = $Code
+    $pick.Message = $Message
+    $pick.Result = $Result
+    if (-not $NoLayout) { [void](Set-DesignerLayout -State $State -Focus panel) }
+}
+
+function Stop-ElementPick {
+    # Cancels the pick in progress (the panel's Cancel, a new pick, a navigation, the end of the Designer).
+    param([Parameter(Mandatory)][object]$State, [AllowEmptyString()][string]$Message = 'Picking was cancelled.', [switch]$NoLayout)
+    if ($State.Pick.State -ne 'picking') { return }
+    Close-ElementPick -State $State -Outcome cancelled -Code 'stopped' -Message $Message -NoLayout:$NoLayout
+}
+
+function Complete-ElementPick {
+    <#
+        The person clicked: reads what the picker proposes, has the engine prove each
+        proposal (Get-ElementPickCandidate), puts back the scroll positions the engine's
+        checks moved, and ends the pick with the candidates - or with a plain reason why
+        nothing can be recorded.
+    #>
+    param([Parameter(Mandatory)][object]$State)
+    $pick = $State.Pick
+    $info = $null
+    $proposals = @()
+    try {
+        $info = Invoke-CdpEval -Expression 'window.__vouchPicker.info()' -TimeoutSec 5
+        $proposals = @(Invoke-CdpEval -Expression 'window.__vouchPicker.proposals()' -TimeoutSec 5)
+    }
+    catch {
+        Close-ElementPick -State $State -Outcome error -Code 'read' -Message "What you picked could not be read from the page: $($_.Exception.Message)"
+        return
+    }
+    $element = ConvertTo-ElementPickInfo -Info $info -Mode $pick.Mode
+    if ($pick.Mode -ne 'scroll' -and (Test-DesignerShadowHost)) {
+        Close-ElementPick -State $State -Outcome error -Code 'shadow' -Message 'This cannot be recorded: it is inside a page component (shadow DOM) that Vouch cannot look into, so a run could not find it. Pick something outside it, or use a wait instead.'
+        return
+    }
+    $candidates = Get-ElementPickCandidate -Mode $pick.Mode -Token $pick.Token -Proposals $proposals -Element $element
+    try { [void](Invoke-CdpEval -Expression '(window.__vouchPicker && typeof window.__vouchPicker.restore === "function") ? window.__vouchPicker.restore() : false' -TimeoutSec 5) }
+    catch { Write-Verbose "Scroll positions not restored: $($_.Exception.Message)" }
+    if ($candidates.Count -eq 0) {
+        $what = switch ($pick.Mode) { 'scroll' { 'scroll this area' } 'waitFor' { 'find this element' } default { 'click this' } }
+        Close-ElementPick -State $State -Outcome error -Code 'nocandidate' -Message "Vouch found no way to $what that it can replay exactly. Pick another part of it, or type a selector yourself."
+        return
+    }
+    $result = [ordered]@{
+        mode       = $pick.Mode
+        element    = $element
+        candidates = $candidates.ToArray()
+        url        = $State.Browser.Url
+        title      = $State.Browser.Title
+    }
+    Close-ElementPick -State $State -Outcome done -Result $result
+}
+
+function Update-ElementPick {
+    <#
+        One look at the pick in progress (from the loop, at most every 200 ms): a short
+        evaluation reads the picker's state. A page that navigated or reloaded lost the
+        picker and gets it again; a closed tab or a gone Edge ends the pick with a
+        message; a click is checked and turned into candidates (Complete-ElementPick).
+    #>
+    param([Parameter(Mandatory)][object]$State, [switch]$Force)
+    $pick = $State.Pick
+    if ($pick.State -ne 'picking') { return }
+    if (-not $Force -and ((Get-Date) - $pick.LastPoll).TotalMilliseconds -lt 200) { return }
+    $pick.LastPoll = Get-Date
+    if (-not $State.Browser.Connected) {
+        Close-ElementPick -State $State -Outcome error -Code 'browser' -Message 'Picking stopped: the browser is not connected.'
+        return
+    }
+    $status = $null
+    try {
+        $status = Invoke-CdpEval -Expression '(window.__vouchPicker && typeof window.__vouchPicker.status === "function") ? window.__vouchPicker.status() : null' -TimeoutSec 3
+        $pick.Failures = 0
+    }
+    catch {
+        $pick.Failures++
+        $tabs = $null
+        try { $tabs = Get-DesignerWebTab -State $State -Targets @(Get-DevToolsTargetList -Port $State.Browser.Port) }
+        catch {
+            Disconnect-DesignerBrowser -State $State -Code 'gone'
+            Close-ElementPick -State $State -Outcome error -Code 'browser' -Message 'Picking stopped: the audit Edge window was closed.'
+            return
+        }
+        $still = @($tabs | Where-Object { [string](Get-DesignerValue -Object $_ -Name 'id') -eq $pick.TabId }).Count -gt 0
+        if (-not $still -or $pick.Failures -ge 3) {
+            $State.Browser.LastCheck = [datetime]::MinValue
+            $pick.State = 'error'
+            $pick.Code = 'tab'
+            $pick.Message = if ($still) { 'Picking stopped: the tab stopped answering. Pick again.' } else { 'Picking stopped: the tab you were picking in was closed.' }
+            [void](Set-DesignerLayout -State $State -Focus panel)
+            Update-DesignerBrowser -State $State -Force
+        }
+        return
+    }
+    if ($null -eq $status) {
+        # The page navigated or reloaded and took the picker with it: put it back.
+        $pick.Reinjects++
+        if ($pick.Reinjects -gt 20) {
+            Close-ElementPick -State $State -Outcome error -Code 'navigated' -Message 'Picking stopped: the page kept changing. Wait until it has loaded, then pick again.'
+            return
+        }
+        try {
+            [void](Invoke-CdpEval -Expression (Get-DesignerPickerScript -State $State -Mode $pick.Mode -Token $pick.Token) -TimeoutSec 5)
+            $pick.Notice = 'The page changed while you were picking; picking goes on in the new page.'
+        }
+        catch { Write-Verbose "The picker could not be put back yet (the page may still be loading): $($_.Exception.Message)" }
+        return
+    }
+    $phase = [string](Get-DesignerValue -Object $status -Name 'phase')
+    switch ($phase) {
+        'picking' { return }
+        'picked' { Complete-ElementPick -State $State }
+        'cancelled' { Close-ElementPick -State $State -Outcome cancelled -Code 'esc' -Message 'You cancelled picking in the browser (Esc).' }
+        'blocked' {
+            $code = [string](Get-DesignerValue -Object $status -Name 'code')
+            $message = if ($code -eq 'crossorigin') {
+                'This cannot be recorded: it is inside a frame from another site, which Vouch cannot look into or click in. Open that frame''s address as a page of its own, or pick something outside the frame.'
+            }
+            else { 'This cannot be recorded: it is inside a page component (shadow DOM) that Vouch cannot look into, so a run could not find it. Pick something outside it, or use a wait instead.' }
+            Close-ElementPick -State $State -Outcome error -Code $(if ($code -eq 'crossorigin') { 'crossorigin' } else { 'shadow' }) -Message $message
+        }
+        default { Close-ElementPick -State $State -Outcome error -Code 'picker' -Message 'Picking stopped unexpectedly in the page. Pick again.' }
+    }
+}
+
+function Get-ElementPickResult {
+    <#
+        GET /api/pick: the pick's state - picking (with the words to show), done (with the
+        verified candidates), cancelled or error (with a plain reason). Looks at the page
+        first, so the answer is current.
+    #>
+    param([Parameter(Mandatory)][object]$State)
+    Update-ElementPick -State $State
+    $pick = $State.Pick
+    $data = [ordered]@{ state = $pick.State; mode = $pick.Mode }
+    switch ($pick.State) {
+        'picking' { $data['message'] = 'Waiting for you to click in the browser… (Esc there cancels.)'; $data['notice'] = $pick.Notice }
+        'done' { $data['result'] = $pick.Result }
+        'cancelled' { $data['message'] = $pick.Message; $data['code'] = $pick.Code }
+        'error' { $data['message'] = $pick.Message; $data['code'] = $pick.Code }
+    }
+    return $data
+}
+
+function Invoke-DesignerPickStart {
+    # POST /api/pick/start {mode: click|scroll|waitFor}.
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Body, [Parameter(Mandatory)][object]$State)
+    $mode = Get-DesignerBodyText -Body $Body -Name 'mode'
+    if ($mode -cnotin 'click', 'scroll', 'waitFor') {
+        return New-DesignerError -Status 400 -Code 'mode' -Message 'This kind of pick does not exist.' -Detail 'mode must be click, scroll or waitFor.'
+    }
+    Update-DesignerBrowser -State $State -Force
+    $refusal = Get-DesignerBrowserRefusal -State $State
+    if ($null -ne $refusal) { return $refusal }
+    $pick = Start-ElementPick -State $State -Mode $mode
+    if ($pick.State -eq 'error') {
+        return New-DesignerError -Status 502 -Code 'pick' -Message 'Picking could not start in this page.' -Detail $pick.Message
+    }
+    return New-DesignerJsonResponse -Data (Get-ElementPickResult -State $State)
+}
+
+function Invoke-DesignerPickCancel {
+    # POST /api/pick/cancel: the panel's Cancel.
+    param([Parameter(Mandatory)][object]$State)
+    Stop-ElementPick -State $State -Message 'You cancelled picking.'
+    return New-DesignerJsonResponse -Data (Get-ElementPickResult -State $State)
+}
+
+#endregion
+
 #region Listener and loop -------------------------------------------------------------
 
 function Get-DesignerFreePort {
@@ -1667,16 +3262,31 @@ function Read-DesignerRequestBody {
         Reads a request body up to the limit and no further: one byte past it and the
         reading stops (TooLarge). Called only after the header checks passed, so only
         the panel itself can make the server read anything.
+        The whole body must arrive within -TimeoutMs (TimedOut otherwise): the server
+        handles one request at a time, and a sender that sends its headers and then
+        stalls would otherwise hold every other request for http.sys's two minutes. The
+        read is asynchronous so the wait can end; the stream is abandoned, not read on.
     #>
-    param([Parameter(Mandatory)][System.IO.Stream]$Stream, [Parameter(Mandatory)][long]$Limit)
+    param(
+        [Parameter(Mandatory)][System.IO.Stream]$Stream,
+        [Parameter(Mandatory)][long]$Limit,
+        [int]$TimeoutMs = 5000
+    )
     $memory = [System.IO.MemoryStream]::new()
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
     try {
         $buffer = [byte[]]::new(65536)
-        while (($read = $Stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+        while ($true) {
+            $left = [int][Math]::Ceiling(($deadline - (Get-Date)).TotalMilliseconds)
+            if ($left -le 0) { return [pscustomobject]@{ Text = ''; TooLarge = $false; TimedOut = $true } }
+            $task = $Stream.ReadAsync($buffer, 0, $buffer.Length)
+            if (-not $task.Wait($left)) { return [pscustomobject]@{ Text = ''; TooLarge = $false; TimedOut = $true } }
+            $read = $task.Result
+            if ($read -le 0) { break }
             $memory.Write($buffer, 0, $read)
-            if ($memory.Length -gt $Limit) { return [pscustomobject]@{ Text = ''; TooLarge = $true } }
+            if ($memory.Length -gt $Limit) { return [pscustomobject]@{ Text = ''; TooLarge = $true; TimedOut = $false } }
         }
-        return [pscustomobject]@{ Text = [System.Text.Encoding]::UTF8.GetString($memory.ToArray()); TooLarge = $false }
+        return [pscustomobject]@{ Text = [System.Text.Encoding]::UTF8.GetString($memory.ToArray()); TooLarge = $false; TimedOut = $false }
     }
     finally { $memory.Dispose() }
 }
@@ -1699,9 +3309,12 @@ function Invoke-DesignerExchange {
     $head = New-DesignerRequest -Method $Method -Path $Path -Headers $Headers -ContentLength $ContentLength
     $refusal = Test-DesignerRequestHeader -Request $head -State $State
     if ($null -ne $refusal) { return $refusal }
-    $body = [pscustomobject]@{ Text = ''; TooLarge = $false }
+    $body = [pscustomobject]@{ Text = ''; TooLarge = $false; TimedOut = $false }
     if ($head.Method -eq 'POST' -and $null -ne $BodyStream) {
-        $body = Read-DesignerRequestBody -Stream $BodyStream -Limit $State.MaxBodyBytes
+        $body = Read-DesignerRequestBody -Stream $BodyStream -Limit $State.MaxBodyBytes -TimeoutMs $State.BodyTimeoutMs
+        if ($body.TimedOut) {
+            return New-DesignerError -Status 408 -Code 'timeout' -Message 'The request did not arrive in time.' -Detail "Its content did not arrive within $([int]($State.BodyTimeoutMs / 1000)) seconds, so the Designer stopped waiting for it."
+        }
     }
     $request = New-DesignerRequest -Method $Method -Path $Path -Headers $Headers -ContentLength $ContentLength -BodyText $body.Text -BodyTooLarge:$body.TooLarge
     $refusal = Test-DesignerRequestBody -Request $request -State $State
@@ -1788,6 +3401,10 @@ function Start-VouchDesigner {
         listener and the panel are always closed on the way out.
         -NoPanel and -ReadyFile are for tests and for programs that start the Designer:
         no window, and a JSON file { port, token, url, pid } once the server listens.
+        The audit Edge is connected at the first loop turn, so the panel loads at once and
+        shows "Connecting"; -NoBrowser leaves it unconnected until Retry, -NoBrowserLaunch
+        only ever attaches to an Edge already listening (both plumbing for tests). On the
+        way out the audit Edge is closed only if the Designer started it.
     #>
     param(
         [Parameter(Mandatory)][string]$ScriptPath,
@@ -1798,7 +3415,12 @@ function Start-VouchDesigner {
         [string]$ReadyFile = '',
         [string]$PanelProfileDir = (Get-DesignerPanelProfile),
         # A typed -EdgeProfileDir; otherwise the configuration's or the default.
-        [AllowEmptyString()][string]$AuditProfileDir = ''
+        [AllowEmptyString()][string]$AuditProfileDir = '',
+        # A typed -DebugPort (0: the configuration's, else 9222) and -KeepBrowserOpen.
+        [int]$DebugPort = 0,
+        [switch]$KeepBrowserOpen,
+        [switch]$NoBrowser,
+        [switch]$NoBrowserLaunch
     )
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
@@ -1815,6 +3437,13 @@ function Start-VouchDesigner {
         }
         $state.PanelProfileDir = $PanelProfileDir
         Assert-DesignerProfileSeparate -State $state -AuditProfile (Get-DesignerAuditProfile -EdgeProfileDir $AuditProfileDir -ConfigPath $state.StartupPath)
+        $state.ConfigPath = $state.StartupPath
+        $state.Browser.TypedPort = $DebugPort
+        $state.Browser.TypedProfileDir = $AuditProfileDir
+        $state.Browser.TypedKeepOpen = [bool]$KeepBrowserOpen
+        $state.Browser.AllowLaunch = -not $NoBrowserLaunch
+        $state.Browser.ConnectPending = -not $NoBrowser
+        $state.TickHandlers.Add({ param($s) Invoke-DesignerBrowserTick -State $s })
         $url = "http://localhost:$($state.Port)/?t=$($state.Token)"
         Write-Host "Vouch Designer $Version is running at http://localhost:$($state.Port)/"
         if ($ReadyFile) {
@@ -1837,6 +3466,10 @@ function Start-VouchDesigner {
     }
     finally {
         try { $listener.Stop(); $listener.Close() } catch { Write-Verbose 'The listener was already closed.' }
+        if ($null -ne $state) {
+            try { Close-DesignerBrowser -State $state }
+            catch { Write-Host "The audit Edge could not be closed: $($_.Exception.Message)" -ForegroundColor Yellow }
+        }
         if ($null -ne $state -and $null -ne $state.PanelProcess) { Stop-DesignerPanel -Process $state.PanelProcess }
         Write-Host 'Vouch Designer stopped.'
     }
