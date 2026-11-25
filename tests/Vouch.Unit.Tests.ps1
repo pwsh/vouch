@@ -543,6 +543,15 @@ Describe 'Configuration file' {
                Change = { param($c) $c['pages'][0].Remove('id'); $c['pages'].Add([ordered]@{ id = 'p001'; name = 'B'; url = 'https://b.example/' }) } }
             @{ Case = 'a bad page override'; Path = 'pages[0].overrides.zoomPercent'; Pattern = '*from 25 to 500*'
                Change = { param($c) $c['pages'][0]['overrides']['zoomPercent'] = 10 } }
+            # Get-PageCaptureMode would quietly read these as screen / 100%, so the file must refuse them.
+            @{ Case = 'an unknown capture area'; Path = 'defaults.captureArea'; Pattern = '*"screen", "window", "page"*found "full"*'
+               Change = { param($c) $c['defaults']['captureArea'] = 'full' } }
+            @{ Case = 'an unknown page capture area'; Path = 'pages[0].overrides.captureArea'; Pattern = '*"screen", "window", "page"*found "full"*'
+               Change = { param($c) $c['pages'][0]['overrides']['captureArea'] = 'full' } }
+            @{ Case = 'a zoom above the range'; Path = 'defaults.zoomPercent'; Pattern = '*from 25 to 500*found 600*'
+               Change = { param($c) $c['defaults']['zoomPercent'] = 600 } }
+            @{ Case = 'a page zoom above the range'; Path = 'pages[0].overrides.zoomPercent'; Pattern = '*from 25 to 500*found 600*'
+               Change = { param($c) $c['pages'][0]['overrides']['zoomPercent'] = 600 } }
             @{ Case = 'a newer schemaVersion'; Path = 'schemaVersion'; Pattern = '*newer version of Vouch*'
                Change = { param($c) $c['schemaVersion'] = 2 } }
             @{ Case = 'schemaVersion 0'; Path = 'schemaVersion'; Pattern = '*must be 1*'
@@ -1228,6 +1237,40 @@ Describe 'Page zoom: the device metrics override' {
         { Set-PageZoom -Percent 150 } | Should -Throw '*boom*'
         $script:PageZoomPercent | Should -Be 100
     }
+
+    It 'keeps the zoom recorded when removing it fails, because the page is still zoomed' {
+        Mock Send-CdpCommand { throw 'connection lost' }
+        $script:PageZoomPercent = 150
+        { Clear-PageZoom } | Should -Throw '*connection lost*'
+        $script:PageZoomPercent | Should -Be 150
+        $script:PageZoomPercent = 100
+    }
+
+    It 'turns a zoom a reconnect could not set again into one warning on the page' {
+        $item = [pscustomobject]@{ Status = 'OK'; Details = [System.Collections.Generic.List[string]]::new() }
+        Add-ZoomLostDetail -Item $item
+        $item.Status | Should -Be 'OK'
+        $script:PageZoomLost = 150
+        Add-ZoomLostDetail -Item $item
+        Add-ZoomLostDetail -Item $item
+        $item.Status | Should -Be 'WARNING'
+        @($item.Details) | Should -Be @('The connection to Edge was lost and restored during this page, but the page zoom of 150% could not be set again; the images taken after that show the page at 100%.')
+        $script:PageZoomLost | Should -Be 0
+    }
+
+    It 'flags a zoom that a reconnect could not set again' {
+        Mock Close-CdpSocket { }
+        Mock Connect-CdpSocket { }
+        Mock Set-PageZoom { $script:PageZoomPercent = 100; throw 'override refused' }
+        $script:PageZoomPercent = 150
+        $script:PageZoomLost = 0
+        $script:CdpWebSocketUrl = 'ws://127.0.0.1:9/devtools/page/x'
+        Restore-CdpConnection 6>$null
+        Should -Invoke Connect-CdpSocket -Times 1 -Exactly
+        $script:PageZoomPercent | Should -Be 100
+        $script:PageZoomLost | Should -Be 150
+        $script:PageZoomLost = 0
+    }
 }
 
 Describe 'One tall image: the height limit' {
@@ -1313,13 +1356,43 @@ Describe 'Capture area and zoom in the report and the JSON summary' {
         $page | Should -Match 'the page content as rendered by Edge'
     }
 
-    It 'reads an item without the new fields as a screen capture' {
+    It 'reads an item and captures without the new fields as screen captures' {
         $old = [pscustomobject]@{
             Index = 1; Name = 'A'; Url = 'https://a/'; FinalUrl = ''; Notes = ''; StepsText = ''; ScrollFullPage = $false
             Status = 'OK'; HttpStatus = 200; Details = [System.Collections.Generic.List[string]]::new()
             StepLog = [System.Collections.Generic.List[object]]::new(); Captures = [System.Collections.Generic.List[object]]::new()
         }
+        $old.Captures.Add([pscustomobject]@{ Timestamp = 't'; CapturedAt = 'c'; Url = 'https://a/'; SegmentIndex = 1; SegmentCount = 1
+            Base64 = 'AQID'; Bytes = 3; Sha256 = ('a' * 64); FileName = 'f.jpg'; FilePath = '' })
         New-HtmlReport -Items @($old) -Run $run | Should -Match '<dt>Capture area</dt><dd>Full screen, including the taskbar clock</dd>'
+    }
+
+    It 'describes what the images got, not what was asked for: <Case>' -ForEach @(
+        @{ Case = 'window, 2 of 5 fell back to the screen'; Area = 'window'; Zoom = 100
+           Shots = @('window/100', 'screen/100', 'window/100', 'screen/100', 'window/100')
+           Expected = 'Edge window only (title bar, tabs and address bar; no taskbar or clock); 2 of 5 image(s) fell back to the full screen' }
+        @{ Case = 'window, every image fell back'; Area = 'window'; Zoom = 100; Shots = @('screen/100', 'screen/100')
+           Expected = 'Full screen, including the taskbar clock (the Edge window only was asked for)' }
+        @{ Case = 'zoom 150 that could not be applied'; Area = 'page'; Zoom = 150; Shots = @('page/100')
+           Expected = 'Page content only (no address bar, taskbar or clock; the URL and capture time are under each image and inside each image file)' }
+        @{ Case = 'zoom lost half-way'; Area = 'screen'; Zoom = 150; Shots = @('screen/150', 'screen/100', 'screen/100')
+           Expected = 'Full screen, including the taskbar clock; page zoom 100% for 2 of 3 image(s), 150% for 1 of 3 image(s)' }
+        @{ Case = 'zoom applied'; Area = 'screen'; Zoom = 80; Shots = @('screen/80')
+           Expected = 'Full screen, including the taskbar clock; page zoom 80%' }
+        @{ Case = 'no image taken'; Area = 'window'; Zoom = 150; Shots = @()
+           Expected = 'Edge window only (title bar, tabs and address bar; no taskbar or clock) - as set; no image was taken; page zoom 150% as set' }
+    ) {
+        $captures = foreach ($shot in $Shots) {
+            $parts = $shot -split '/'
+            New-CaptureRecord -Bytes ([byte[]](1, 2, 3)) -Url 'https://a/' -SegmentIndex 1 -SegmentCount 1 -CaptureArea $parts[0] -ZoomPercent ([int]$parts[1])
+        }
+        Get-CaptureAreaText -Area $Area -ZoomPercent $Zoom -Captures @($captures) | Should -BeExactly $Expected
+
+        $item = New-AreaItem $Area $Zoom
+        $item.Captures.Clear()
+        foreach ($capture in @($captures)) { $item.Captures.Add($capture) }
+        $line = @((New-HtmlReport -Items @($item) -Run $run) -split "`n" | Where-Object { $_ -like '<dt>Capture area</dt>*' })
+        $line[0].TrimEnd() | Should -BeExactly "<dt>Capture area</dt><dd>$(Encode-Html $Expected)</dd>"
     }
 
     It 'lists the capture area and zoom of each page and image in the JSON summary' {

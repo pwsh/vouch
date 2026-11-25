@@ -1130,6 +1130,51 @@ Describe 'Page zoom (headless Edge)' -Tag 'Integration' {
         $script:PageZoomPercent | Should -Be 100
     }
 
+    It 'records 100% and stops scaling page images after a reconnect loses the zoom half-way, and warns' {
+        $script:RealSetPageZoomMid = ${function:Set-PageZoom}
+        $script:RealGetPageCaptureMid = ${function:Get-PageCapture}
+        $global:VouchMid = @{ Fail = $false; Calls = 0; Zooms = [System.Collections.Generic.List[int]]::new() }
+        # After the first segment the socket dies (the override dies with it) and setting
+        # the zoom again on the new connection fails.
+        Mock Set-PageZoom {
+            if ($global:VouchMid.Fail) { $script:PageZoomPercent = 100; throw 'Simulated: the override was refused' }
+            & $script:RealSetPageZoomMid -Percent $Percent
+        }
+        Mock Get-PageCapture {
+            $global:VouchMid.Calls++
+            $global:VouchMid.Zooms.Add($ZoomPercent)
+            $bytes = & $script:RealGetPageCaptureMid -Format $Format -Quality $Quality -ZoomPercent $ZoomPercent -Clip $Clip
+            if ($global:VouchMid.Calls -eq 1) { $global:VouchMid.Fail = $true; $script:CdpSocket.Abort() }
+            , $bytes
+        }
+        $context = @{ RunId = [guid]::NewGuid().ToString(); Format = 'jpeg'; Quality = 85; Extension = 'jpg'; SaveImages = $false; ImagesDir = ''; Screen = '1x1' }
+        $run = Resolve-RunSettings -BoundParameters @{} -Config $null -Defaults @{
+            NavigationTimeoutSec = 10; SettleSeconds = 0.1; ScrollSettleSeconds = 0.1; MaxScrollSegments = 10 }
+        $definition = ConvertTo-CaptureDefinition -Index 1 -Page ([ordered]@{ name = 'Lost zoom'; url = "$Web/tall?px=3000"
+                overrides = [ordered]@{ zoomPercent = 150; captureArea = 'page' }
+                actions = @([ordered]@{ type = 'capture'; scroll = [ordered]@{ mode = 'page' } }) })
+        $settings = Get-PageSettings -Settings $run -Definition $definition -Config (Get-DefaultVouchConfig)
+        $item = Invoke-CaptureItem -Definition $definition -Settings $settings -CaptureContext $context 6>$null
+
+        $item.Captures.Count | Should -BeGreaterOrEqual 3
+        $global:VouchMid.Zooms[0] | Should -Be 150
+        @($global:VouchMid.Zooms | Select-Object -Skip 1 | Sort-Object -Unique) | Should -Be @(100) -Because 'clip.scale follows the zoom the page shows'
+        $item.Captures[0].ZoomPercent | Should -Be 150
+        @($item.Captures | Select-Object -Skip 1 | ForEach-Object ZoomPercent | Sort-Object -Unique) | Should -Be @(100)
+        $first = [Convert]::FromBase64String($item.Captures[0].Base64)
+        $later = [Convert]::FromBase64String($item.Captures[1].Base64)
+        (Get-ImageMetadata -Bytes $first).ZoomPercent | Should -Be 150
+        (Get-ImageMetadata -Bytes $later).ZoomPercent | Should -Be 100
+        (Get-ImagePixelSize -Bytes $later).Width | Should -Be ($script:BaseSize.width - 15) -Because 'an unscaled page image is the page width without the scroll bar'
+        $item.Status | Should -Be 'WARNING'
+        @($item.Details | Where-Object { $_ -like '*page zoom of 150% could not be set again; the images taken after that show the page at 100%*' }).Count |
+            Should -Be 1 -Because ($item.Details -join ' | ')
+        Get-CaptureAreaText -Area page -ZoomPercent 150 -Captures @($item.Captures) | Should -Match 'page zoom 100% for \d+ of \d+ image\(s\), 150% for 1 of'
+        $script:PageZoomPercent | Should -Be 100
+        Invoke-CdpEval -Expression 'innerWidth' | Should -Be $script:BaseSize.width
+        Remove-Variable -Name VouchMid -Scope Global
+    }
+
     It 'takes the zoom off for a 100% page that follows a zoomed one, and zooms only the zoomed page' {
         Mock Set-EdgeForeground { $null }
         $global:VouchZoomShots = [System.Collections.Generic.List[int]]::new()

@@ -160,6 +160,8 @@ $script:LaunchedEdge      = $false
 $script:ReusedEdge        = $false
 # The page zoom in effect on the current DevTools connection (Set-PageZoom); 100 = none.
 $script:PageZoomPercent   = 100
+# A zoom that a reconnect could not set again (Restore-CdpConnection); 0 = none.
+$script:PageZoomLost      = 0
 
 # DevTools binds to the IPv4 loopback only; "localhost" can resolve to ::1 and fail.
 $script:CdpHost = '127.0.0.1'
@@ -1751,7 +1753,9 @@ function Restore-CdpConnection {
     if ($zoom -ne 100) {
         try { Set-PageZoom -Percent $zoom }
         catch {
-            # Set-PageZoom leaves the zoom recorded as 100, so the captures say what they show.
+            # Set-PageZoom leaves the zoom recorded as 100, so the captures say what they
+            # show; the flag lets the page being captured say so too (Add-ZoomLostDetail).
+            $script:PageZoomLost = $zoom
             Write-Host "WARNING: the page zoom of $zoom% could not be set again after reconnecting to Edge; the page is shown at 100%: $($_.Exception.Message)" -ForegroundColor Yellow
         }
     }
@@ -2075,9 +2079,27 @@ function Clear-PageZoom {
     <#
         Shows the page at 100% again. Also called at the end of every run: the Designer
         keeps Edge open, and a page left zoomed would puzzle the person using it.
+        Recorded as 100 only once the browser accepted it: if the command fails, the
+        page may still be zoomed, and the captures must keep saying so.
     #>
-    $script:PageZoomPercent = 100
     [void](Send-CdpCommand -Method 'Emulation.clearDeviceMetricsOverride' -TimeoutSec 10)
+    $script:PageZoomPercent = 100
+}
+
+function Add-ZoomLostDetail {
+    <#
+        Turns a zoom that a reconnect could not set again ($script:PageZoomLost, set by
+        Restore-CdpConnection) into a WARNING on the page being captured, once, and
+        clears the flag. The reconnect happens deep inside some CDP call, where no item
+        is at hand; without this the report would say OK above images whose zoom
+        changed half-way through the page.
+    #>
+    param([Parameter(Mandatory)][object]$Item)
+    $lost = $script:PageZoomLost
+    if ($lost -le 0) { return }
+    $script:PageZoomLost = 0
+    if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+    $Item.Details.Add("The connection to Edge was lost and restored during this page, but the page zoom of $lost% could not be set again; the images taken after that show the page at 100%.")
 }
 
 function Get-SingleImagePlan {
@@ -3735,6 +3757,16 @@ function Add-ItemCapture {
     }
     if ($area -eq 'page') {
         $encoded = Get-PageCapture -Format $Context.Format -Quality $Context.Quality -ZoomPercent $ZoomPercent -Clip $PageClip
+        if ($script:PageZoomPercent -ne $ZoomPercent) {
+            # The connection was restored during the capture and the zoom changed with it
+            # (Restore-CdpConnection): the image was scaled for a zoom the page no longer
+            # shows, so take it again at the zoom it has now.
+            $ZoomPercent = $script:PageZoomPercent
+            $metadataArguments.ZoomPercent = $ZoomPercent
+            $capturedAt = [System.DateTimeOffset]::Now
+            $metadataArguments.CapturedAt = $capturedAt
+            $encoded = Get-PageCapture -Format $Context.Format -Quality $Context.Quality -ZoomPercent $ZoomPercent -Clip $PageClip
+        }
         # The image is not a screen: say what it is, at the size it came back.
         $size = Get-ImagePixelSize -Bytes $encoded
         $screenText = "$($size.Width)x$($size.Height) image of the page content only (no browser window, taskbar or clock)"
@@ -3813,20 +3845,54 @@ function Get-StatusCssClass {
 
 function Get-CaptureAreaText {
     <#
-        The report's one-line description of what a page's images show. A page-content
-        image has no address bar or clock, so the line says where the URL and the
-        capture time are instead.
+        The report's one-line description of what a page's images show. It is read from
+        the capture records - what each image really got - not from the page's settings:
+        a window capture that fell back to the full screen, or a zoom that could not be
+        applied, must not be described as asked for. Mixed results are counted. The
+        settings (-Area, -ZoomPercent) only describe a page without images, as such.
+        A page-content image has no address bar or clock, so the line says where the
+        URL and the capture time are instead.
     #>
     param(
         [AllowEmptyString()][string]$Area = 'screen',
-        [int]$ZoomPercent = 100
+        [int]$ZoomPercent = 100,
+        [AllowNull()][object[]]$Captures = @()
     )
-    $text = switch ($Area) {
-        'window' { 'Edge window only (title bar, tabs and address bar; no taskbar or clock)' }
-        'page'   { 'Page content only (no address bar, taskbar or clock; the URL and capture time are under each image and inside each image file)' }
-        default  { 'Full screen, including the taskbar clock' }
+    $long = @{
+        screen = 'Full screen, including the taskbar clock'
+        window = 'Edge window only (title bar, tabs and address bar; no taskbar or clock)'
+        page   = 'Page content only (no address bar, taskbar or clock; the URL and capture time are under each image and inside each image file)'
     }
-    if ($ZoomPercent -gt 0 -and $ZoomPercent -ne 100) { $text += "; page zoom $ZoomPercent%" }
+    $short = @{ screen = 'the full screen'; window = 'the Edge window only'; page = 'the page content only' }
+    if ($Area -notin 'screen', 'window', 'page') { $Area = 'screen' }
+
+    $images = @($Captures | Where-Object { $null -ne $_ })
+    if ($images.Count -eq 0) {
+        $text = "$($long[$Area]) - as set; no image was taken"
+        if ($ZoomPercent -gt 0 -and $ZoomPercent -ne 100) { $text += "; page zoom $ZoomPercent% as set" }
+        return $text
+    }
+
+    $total = $images.Count
+    $areaOf = { param($c) if ($c.PSObject.Properties['CaptureArea'] -and [string]$c.CaptureArea -in 'screen', 'window', 'page') { [string]$c.CaptureArea } else { 'screen' } }
+    $zoomOf = { param($c) if ($c.PSObject.Properties['ZoomPercent'] -and [int]$c.ZoomPercent -gt 0) { [int]$c.ZoomPercent } else { 100 } }
+    $areas = @($images | ForEach-Object { & $areaOf $_ } | Group-Object | Sort-Object -Property @{ Expression = 'Count'; Descending = $true }, Name)
+    # The line leads with the area that was asked for when any image has it.
+    $main = if (@($areas.Name) -contains $Area) { $Area } else { [string]$areas[0].Name }
+    $text = $long[$main]
+    foreach ($group in $areas) {
+        if ($group.Name -eq $main) { continue }
+        $text += "; $($group.Count) of $total image(s) fell back to $($short[$group.Name])"
+    }
+    if ($main -ne $Area) { $text += " ($($short[$Area]) was asked for)" }
+
+    $zooms = @($images | ForEach-Object { & $zoomOf $_ } | Group-Object | Sort-Object -Property @{ Expression = 'Count'; Descending = $true }, Name)
+    if ($zooms.Count -eq 1) {
+        if ([int]$zooms[0].Name -ne 100) { $text += "; page zoom $($zooms[0].Name)%" }
+    }
+    else {
+        $text += '; page zoom ' + (($zooms | ForEach-Object { "$($_.Name)% for $($_.Count) of $total image(s)" }) -join ', ')
+    }
     return $text
 }
 
@@ -4005,7 +4071,7 @@ a { color: #12507d; }
         [void]$sb.AppendLine("<dt>Scroll capture</dt><dd>$(Encode-Html $scrollText)</dd>")
         $itemArea = if ($item.PSObject.Properties['CaptureArea']) { [string]$item.CaptureArea } else { 'screen' }
         $itemZoom = if ($item.PSObject.Properties['ZoomPercent']) { [int]$item.ZoomPercent } else { 100 }
-        [void]$sb.AppendLine("<dt>Capture area</dt><dd>$(Encode-Html (Get-CaptureAreaText -Area $itemArea -ZoomPercent $itemZoom))</dd>")
+        [void]$sb.AppendLine("<dt>Capture area</dt><dd>$(Encode-Html (Get-CaptureAreaText -Area $itemArea -ZoomPercent $itemZoom -Captures @($item.Captures)))</dd>")
         [void]$sb.AppendLine('</dl>')
 
         if (-not [string]::IsNullOrWhiteSpace($item.Notes)) {
@@ -4722,12 +4788,15 @@ function Invoke-ScrollCapture {
         if ($earlierDetails -notcontains $Text) { $Item.Details.Add($Text) }
     }
     $area = (Get-PageCaptureMode -Settings $Settings).Area
-    # The zoom the page really shows (Set-PageZoom records it only once it applied).
-    $zoom = $script:PageZoomPercent
+    # The zoom is read at the moment of each shot: a reconnect between two segments can
+    # lose it (Restore-CdpConnection), and every image must record - and, for page
+    # captures, be scaled by - the zoom the page shows at that moment.
     $shoot = {
         param([int]$Index, [int]$Count, [string]$Url, $Clip)
+        Add-ZoomLostDetail -Item $Item
         Add-ItemCapture -Item $Item -SegmentIndex $Index -SegmentCount $Count -PageUrl $Url -Context $CaptureContext `
-            -CaptureNumber $CaptureNumber -Label $Label -CaptureArea $area -ZoomPercent $zoom -PageClip $Clip -PageTitle $PageTitle
+            -CaptureNumber $CaptureNumber -Label $Label -CaptureArea $area -ZoomPercent $script:PageZoomPercent -PageClip $Clip -PageTitle $PageTitle
+        Add-ZoomLostDetail -Item $Item
     }
     $theCapture = if ($Label) { "the capture '$Label'" } else { 'the capture' }
 
@@ -4793,7 +4862,7 @@ function Invoke-ScrollCapture {
             if ([string]$scrollTarget.kind -eq 'window') {
                 try {
                     $content = Get-PageContentSize
-                    $plan = Get-SingleImagePlan -CssHeight $content.Height -DevicePixelRatio $content.DevicePixelRatio -ZoomPercent $zoom
+                    $plan = Get-SingleImagePlan -CssHeight $content.Height -DevicePixelRatio $content.DevicePixelRatio -ZoomPercent $script:PageZoomPercent
                     if ($plan.Fits) {
                         $singleClip = @{ x = 0; y = 0; width = [Math]::Ceiling($content.Width); height = [Math]::Ceiling($content.Height) }
                     }
@@ -4926,6 +4995,8 @@ function Invoke-CaptureItem {
             if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
             $Item.Details.Add("The page zoom could not be set to $($captureMode.ZoomPercent)%, so the page may be shown at another size: $($_.Exception.Message)")
         }
+        # A zoom lost before this page started is not this page's concern: it was just set anew.
+        $script:PageZoomLost = 0
 
         Set-NavigationMarker
         $navigation = Send-CdpCommand -Method 'Page.navigate' -Params @{ url = $Definition.Url } -TimeoutSec $navigationTimeoutSec
