@@ -16,15 +16,23 @@
   - The hit layer is a transparent box over the whole window inside a closed shadow
     root, shown as a manual popover so it sits in the browser's top layer (above modal
     dialogs and popovers that opened before it), placed inside the modal dialog that is
-    really on top (everything outside it is inert) and inside the innermost open auto
-    popover (so a press does not light-dismiss the page's menu). Every refresh checks
-    that it is still there, last, on top and covering the whole window; repairs are
+    really on top (everything outside it is inert) and inside the open menu (auto or
+    hint popover) that is on top of the browser's popover stack, so a press does not
+    light-dismiss the page's menus. Dialogs and menus are looked for in the page and in
+    every open shadow root; closed shadow roots cannot be searched. Every refresh checks
+    that the layer is still there, on top and covering the whole window; repairs are
     bounded, and what cannot be restored ends the pick.
-  - Keys never reach the page: every key event is swallowed at window capture (the
-    browser's own shortcuts keep their default). The focus is taken once at the start;
-    the page may move it within its own documents (never fought over), but a focus in a
-    frame from another site is taken back, boundedly, or the pick ends. Esc cancels;
-    scroll keys scroll what lies under the pointer, like the wheel. No keyboard picking.
+  - Keys: ONE rule, decided by where the key event goes, never by what kind of control
+    has the focus. A key aimed at the picker's own layer never reaches the page, and
+    only function keys and Ctrl/Alt/Meta combinations keep their default (the browser's
+    own shortcuts). A key aimed anywhere else - the page took the focus - is stopped AND
+    prevented, every one. On top of that every beforeinput is cancelled, cut/copy/paste
+    never reach the page, and the first sign of typing arriving in the page anyway (a
+    composition starting, a trusted input event) ENDS the pick ("typing"). The focus is
+    taken once at the start; the page may move it within its own documents (never
+    fought over), but a focus in a frame the picker cannot listen in is taken back,
+    boundedly, or the pick ends. Esc cancels; scroll keys scroll what lies under the
+    pointer, like the wheel. No keyboard picking.
   - It PROPOSES text and selectors. It never decides: the server keeps a proposal only
     when the engine's own find-only scripts, run against this page, resolve it to the
     marked element. There is no second matcher here.
@@ -32,6 +40,10 @@
     numbers) and short codes, caps their length and builds every sentence itself.
   - stop() removes everything: listeners, timers, the observer, the injected nodes, the
     mark and the single namespaced global window.__vouchPicker.
+  - A page that reloads or moves on by itself during a pick takes all this with it. For
+    that moment the server has the browser run a small shield at the start of every new
+    document (Get-DesignerPickShieldScript in Designer.ps1): it swallows clicks and keys
+    until the server has put the picker back, which replaces it (see "previous" below).
 */
 (function (cfg) {
   'use strict';
@@ -47,13 +59,14 @@
   var POINTER = ['pointerdown', 'pointerup', 'pointercancel', 'mousedown', 'mouseup', 'click', 'dblclick', 'auxclick', 'contextmenu',
     'touchstart', 'touchend', 'touchcancel', 'dragstart', 'drop', 'submit'];
   var KEYS = ['keydown', 'keypress', 'keyup'];
+  var CLIPBOARD = ['cut', 'copy', 'paste'];
   var hadTarget = Object.prototype.hasOwnProperty.call(window, '__vouchTarget');
   var savedTarget = hadTarget ? window.__vouchTarget : undefined;
   var NONE = {};
 
   var state = { phase: 'picking', code: '', message: '', note: '', picked: null, hover: null, down: NONE, downMoves: 0, saved: null };
-  var attached = [];   // { win, type, fn }
-  var windows = [];    // windows that have our listeners
+  var attached = [];   // { target, type, fn }: every listener added, on windows and on open shadow roots
+  var handlers = typeof WeakMap === 'function' ? new WeakMap() : null;   // window -> its listener functions (stable, so adding again is a no-op)
   var timer = 0;
   var observer = null;
   var pointer = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
@@ -100,53 +113,189 @@
   root.appendChild(label);
   root.appendChild(banner);
 
+  // ---------------------------------------------------------------- the page's trees
+  /*
+    Where an event really goes: the first node of its path. Read at window, event.target
+    is the outermost shadow host when the layer sits inside a component's shadow root
+    (the layer goes inside the page's open menu, wherever that is).
+  */
+  function targetOf(ev) {
+    var path = null;
+    try { path = typeof ev.composedPath === 'function' ? ev.composedPath() : null; } catch (e) { path = null; }
+    return path && path.length ? path[0] : ev.target;
+  }
+  // The tree the host is in (the page, or a shadow root): hit-tests asked there name the host itself.
+  function scopeOf() {
+    var r = host.getRootNode ? host.getRootNode() : null;
+    return r && r !== host && typeof r.elementsFromPoint === 'function' ? r : document;
+  }
+  // Up one step in the tree as drawn: out of a slot, a parent, or a shadow root's host.
+  function upDrawn(n) { return n.assignedSlot || n.parentNode || n.host || null; }
+  function deepContains(a, b) {
+    for (var n = b, depth = 0; n && depth < 2000; n = upDrawn(n), depth++) { if (n === a) { return true; } }
+    return false;
+  }
+  // The picker's host, or a component that holds it (what a hit-test in an outer tree names instead).
+  function isOurs(e) { return e === host || (!!e && !!e.shadowRoot && deepContains(e, host)); }
+  /*
+    The page's documents and open shadow roots, found by walking every element (closed
+    shadow roots cannot be seen from a page script). "scopes" are the trees of the top
+    page (where its dialogs and menus are looked for), "roots" every open shadow root,
+    "wins" every window the picker may listen in - frames inside shadow roots included,
+    which the engine's own frame list does not look for.
+    The walk costs time on a big page, so it is repeated at most every 200 ms and less
+    often when it is slow (at most about a twentieth of the time).
+  */
+  var known = { scopes: [document], roots: [], wins: [window] }, scanDue = 0;
+  function walkTree(scope, top, out) {
+    var all = scope.querySelectorAll('*');
+    for (var i = 0; i < all.length; i++) {
+      var e = all[i], r = e.shadowRoot;
+      if (r && r.querySelectorAll) { out.roots.push(r); if (top) { out.scopes.push(r); } walkTree(r, top, out); }
+      if (e.localName === 'iframe' || e.localName === 'frame') {
+        var d = null;
+        try { d = e.contentDocument; } catch (x) { d = null; }
+        if (d && d.documentElement && out.wins.length < 500) { out.wins.push(e.contentWindow); walkTree(d, false, out); }
+      }
+    }
+  }
+  function scan(force) {
+    var now = Date.now();
+    if (!force && now < scanDue) { return; }
+    var out = { scopes: [document], roots: [], wins: [window] };
+    try { walkTree(document, true, out); } catch (e) { /* a tree changing under the walk: next time */ }
+    known = out;
+    scanDue = Date.now() + Math.max(200, (Date.now() - now) * 20);
+  }
+
   // ---------------------------------------------------------------- staying on top
-  // Whether an element is what lies on top at its own centre (the picker's host skipped).
+  // What lies on top at a point, as the host's own tree names it.
+  function topAt(x, y) { return scopeOf().elementFromPoint(x, y); }
+  // Whether an element is what lies on top at its own centre (the picker's layer skipped).
   function onTopAtCentre(el) {
     var r = el.getBoundingClientRect();
     if (!(r.width > 0 && r.height > 0)) { return false; }
-    var list = document.elementsFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    var scope = el.getRootNode ? el.getRootNode() : document;
+    if (!scope || typeof scope.elementsFromPoint !== 'function') { scope = document; }
+    var list = scope.elementsFromPoint(r.left + r.width / 2, r.top + r.height / 2);
     for (var i = 0; i < list.length; i++) {
-      if (list[i] === host) { continue; }
-      return list[i] === el || el.contains(list[i]);
+      if (list[i] === el || deepContains(el, list[i])) { return true; }
+      if (isOurs(list[i])) { continue; }
+      return false;
     }
     return false;
+  }
+  /*
+    Menus and dialogs the layer could not be drawn in (a component that does not show
+    content added to it): left alone from then on, the layer goes one level further out.
+  */
+  var unusable = typeof WeakSet === 'function' ? new WeakSet() : { has: function () { return false; }, add: function () { } };
+  // The open modal dialogs and the open menus (auto and hint popovers) of the top page, shadow roots included.
+  function topLayerOwners() {
+    var dialogs = [], pops = [];
+    known.scopes.forEach(function (scope) {
+      if (scope !== document && scope.isConnected === false) { return; }
+      var list = [];
+      try { list = scope.querySelectorAll('dialog[open],[popover]'); } catch (e) { list = []; }
+      for (var i = 0; i < list.length; i++) {
+        var el = list[i];
+        if (el === host || unusable.has(el)) { continue; }
+        try {
+          if (el.localName === 'dialog' && el.matches(':modal')) { dialogs.push(el); }
+          else if ((el.popover === 'auto' || el.popover === 'hint') && el.matches(':popover-open')) { pops.push(el); }
+        }
+        catch (e) { /* dialogs or popovers unknown to this browser */ }
+      }
+    });
+    return { dialogs: dialogs, pops: pops };
   }
   /*
     The open modal dialog that is really on top (everything outside it is inert): not the
     last one in the page, but the one whose own centre is not covered - a lower modal is
     covered by the upper one's backdrop. Document order only decides when none can tell.
   */
-  function topModal() {
-    var list = document.querySelectorAll('dialog[open]'), last = null, top = null;
-    for (var i = 0; i < list.length; i++) {
-      var modal = false;
-      try { modal = list[i].matches(':modal'); } catch (e) { modal = false; }
-      if (!modal) { continue; }
-      last = list[i];
-      if (onTopAtCentre(list[i])) { top = list[i]; }
-    }
-    return top || last;
+  function topModal(dialogs) {
+    var top = null;
+    for (var i = 0; i < dialogs.length; i++) { if (onTopAtCentre(dialogs[i])) { top = dialogs[i]; } }
+    return top || (dialogs.length ? dialogs[dialogs.length - 1] : null);
   }
   /*
-    The innermost open auto popover (a native menu): a press outside the auto popover
-    stack closes them all, and the press target is the picker's host - so the host goes
-    inside it, which keeps the menu open while the person points (established in Edge:
-    with the host outside, the press closed the menu and the site saw it close).
+    The order in which menus opened during this pick (beforetoggle, seen at window
+    capture and in every known shadow root): the one opened later is above.
   */
-  function topAutoPopover(within) {
-    var list = (within || document).querySelectorAll('[popover]'), open = [];
-    for (var i = 0; i < list.length; i++) {
-      var el = list[i];
-      if (el === host || el.popover !== 'auto') { continue; }
-      try { if (el.matches(':popover-open')) { open.push(el); } } catch (e) { /* popovers unknown */ }
+  var opened = typeof WeakMap === 'function' ? new WeakMap() : null, openCount = 0;
+  // Whether menu a holds a button that opens menu b (popovertarget, commandfor, interestfor).
+  function invokes(a, b) {
+    var found = false;
+    function look(node) {
+      var i, list = node.querySelectorAll('button,input,[commandfor],[interestfor]');
+      for (i = 0; i < list.length && !found; i++) {
+        var e = list[i];
+        try { found = e.popoverTargetElement === b || e.commandForElement === b || e.interestForElement === b; } catch (x) { found = false; }
+      }
+      var all = node.querySelectorAll('*');
+      for (i = 0; i < all.length && !found; i++) { if (all[i].shadowRoot && all[i] !== host) { look(all[i].shadowRoot); } }
     }
-    var inner = open.filter(function (el) { return !open.some(function (o) { return o !== el && el.contains(o); }); });
-    return inner.length ? inner[inner.length - 1] : null;
+    try { look(a); if (!found && a.shadowRoot) { look(a.shadowRoot); } } catch (e) { found = false; }
+    return found;
   }
+  /*
+    Whether menu b is above menu a in the browser's popover stack. Open menus always form
+    one chain (showing one closes every menu that is not its ancestor): one seen opening
+    later is above; otherwise b is above a when it is inside a, or a holds the button
+    that opens b.
+  */
+  function above(b, a) {
+    var hb = b.popover === 'hint', ha = a.popover === 'hint';
+    if (hb !== ha) {
+      // A hint (tooltip) that belongs to a menu is above it. One that does not cannot be
+      // kept together with the menu at all (a press in either closes the other,
+      // established in Edge): the menu is kept.
+      var hint = hb ? b : a, menu = hb ? a : b, belongs = deepContains(menu, hint) || invokes(menu, hint);
+      return hb ? belongs : !belongs;
+    }
+    var sb = (opened && opened.get(b)) || 0, sa = (opened && opened.get(a)) || 0;
+    if (sb !== sa) { return sb > sa; }
+    return deepContains(a, b) || invokes(a, b);
+  }
+  /*
+    The open menu on top of the popover stack: a press outside that stack closes every
+    menu, and a press inside a lower menu closes the ones above it - and the press
+    target is the picker's host. So the host goes inside the top one, which keeps every
+    menu open while the person points (established in Edge: cancelling the press does
+    not stop the closing, and the site sees its menu close).
+    NOT document order: a sub-menu need not be inside its menu, nor come after it. When
+    the chain cannot be told from the page (a sub-menu opened by script alone, before
+    the pick), the one not covered at its centre wins, then the last found.
+  */
+  function topPopover(pops, modal) {
+    var open = modal ? pops.filter(function (p) { return deepContains(modal, p); }) : pops;
+    if (!open.length) { return null; }
+    var top = open.filter(function (a) { return !open.some(function (b) { return b !== a && above(b, a); }); });
+    if (top.length > 1) { var clear = top.filter(onTopAtCentre); if (clear.length) { top = clear; } }
+    if (!top.length) { top = open; }
+    return top[top.length - 1];
+  }
+  /*
+    Where the host goes: inside the menu on top, else the modal dialog on top, else the
+    page. A menu or dialog that draws its content from an open shadow root gets the host
+    there (content added beside it would not be drawn).
+  */
   function wantedParent() {
-    var modal = topModal();
-    return topAutoPopover(modal) || modal || document.documentElement;
+    var owners = topLayerOwners();
+    var modal = topModal(owners.dialogs);
+    var owner = topPopover(owners.pops, modal) || modal;
+    if (!owner) { return document.documentElement; }
+    return owner.shadowRoot && owner.shadowRoot.appendChild ? owner.shadowRoot : owner;
+  }
+  /*
+    Only in the page itself must the host be the last child (so nothing added later is
+    drawn above it where the top layer is not available). Inside a site's menu or dialog
+    its place among the children does not matter: a menu that keeps adding rows must
+    not cost a repair each time, nor see its :last-child styles move to the host.
+  */
+  function misplaced(parent) {
+    return host.parentNode !== parent || (parent === document.documentElement && parent.lastElementChild !== host);
   }
   function showOnTop(again) {
     if (!canPopover || !host.isConnected) { return; }
@@ -159,12 +308,18 @@
   function placeHost() {
     var parent = wantedParent();
     if (!parent) { return; }
-    if (host.parentNode !== parent || parent.lastElementChild !== host) {
+    if (misplaced(parent)) {
       // The first placement is the picker's own; later ones are the page changing things.
       if (placed && !repaired()) { return; }
-      parent.appendChild(host);
+      // Moving an element drops its focus: the picker's own focus goes along with its own move.
+      var ours = focusOurs();
+      try { parent.appendChild(host); }
+      catch (e) { unusable.add(parent.host || parent); return; }
       if (placed) { moves++; lastMove = Date.now(); }
       placed = true;
+      showOnTop(false);
+      if (ours) { park(); }
+      return;
     }
     showOnTop(false);
   }
@@ -190,7 +345,7 @@
   function onTopEverywhere() {
     var w = window.innerWidth, h = window.innerHeight, points = [[0.5, 0.5], [0.05, 0.05], [0.95, 0.05], [0.05, 0.95], [0.95, 0.95]];
     for (var i = 0; i < points.length; i++) {
-      var e = document.elementFromPoint(w * points[i][0], h * points[i][1]);
+      var e = topAt(w * points[i][0], h * points[i][1]);
       if (e && e !== host) { return false; }
     }
     return true;
@@ -204,16 +359,22 @@
   /*
     The focus is taken ONCE, at the start, so the page's own controls are not focused
     when the person starts. After that the page may keep or move the focus wherever it
-    likes in its own document or a same-site frame - every key there is swallowed at
-    window capture anyway - and the picker never fights it (focus traps would fight back
-    until the stack overflows). Only a focus inside a frame from another site matters,
-    because keys there never pass the picker: it is taken back out of the event, at most
-    3 times a second, and if it will not stay out the pick ends ("focus").
+    likes in its own document or a same-site frame - every key there is stopped and
+    prevented at window capture - and the picker never fights it (focus traps would
+    fight back until the stack overflows). Only a focus inside a frame the picker cannot
+    listen in matters (a frame from another site, or one hidden in a closed shadow
+    root), because keys there never pass the picker: it is taken back out of the event,
+    at most 3 times a second, and if it will not stay out the pick ends ("focus").
   */
+  // Whether the focus is on the picker's own layer (asked in the host's own tree: a shadow root when it is in one).
+  function focusOurs() {
+    var r = host.getRootNode ? host.getRootNode() : null;
+    return !!r && r !== host && r.activeElement === host;
+  }
   function park() {
-    if (document.activeElement === host) { return true; }
+    if (focusOurs()) { return true; }
     try { hitLayer.focus({ preventScroll: true }); } catch (e) { /* not focusable now */ }
-    return document.activeElement === host;
+    return focusOurs();
   }
   var takeBacks = [], takeBackTimer = 0;
   function takeBackFocus() {
@@ -229,9 +390,20 @@
       park();
     }, 0);
   }
+  /*
+    Whether the focus is in a frame whose keys never pass the picker. Followed from the
+    page's focused element down through open shadow roots and same-site frames: a frame
+    whose document cannot be reached is from another site. And when the top window has
+    lost the focus to one of its frames (windowBlurred) but the trail ends at an
+    ordinary element of the top page, the frame is hidden inside a closed shadow root.
+  */
+  var windowBlurred = false;
   function focusInForeignFrame() {
     var a = document.activeElement;
-    for (var depth = 0; depth < 12 && a && /^i?frame$/i.test(a.tagName); depth++) {
+    for (var depth = 0; depth < 40 && a; depth++) {
+      var inner = a.shadowRoot ? a.shadowRoot.activeElement : null;
+      if (inner) { a = inner; continue; }
+      if (!/^i?frame$/i.test(a.localName || '')) { return windowBlurred && a.ownerDocument === document && document.hasFocus(); }
       var d = null;
       try { d = a.contentDocument; } catch (e) { d = null; }
       if (!d) { return true; }
@@ -239,17 +411,37 @@
     }
     return false;
   }
+  // The top window lost or got the focus: told apart from the person leaving Edge by document.hasFocus(), a moment later.
+  function onWindowFocus(ev) {
+    if (ev.target !== window) { return; }
+    if (ev.type === 'focus') { windowBlurred = false; return; }
+    setTimeout(function () {
+      windowBlurred = document.hasFocus() && !focusOurs() && document.activeElement !== document.body;
+      if (windowBlurred && (state.phase === 'picking' || state.phase === 'picked')) { takeBackFocus(); }
+    }, 0);
+  }
 
   // ---------------------------------------------------------------- geometry
   /*
-    Whether an element is drawn without scaling, mirroring or turning: no CSS rotate or
-    scale, and a transform that is at most a translation (which the bounding rect
-    already includes). Anything else would make a frame's inside map to other points.
+    Whether an element is drawn without scaling, mirroring or turning: no CSS rotate,
+    scale or zoom other than the identity (rotate: 0deg, scale: 1 and zoom: 1 are what
+    utility classes and resting transitions leave behind), no motion path (offset-path
+    turns an element without any transform), and a transform that is at most a
+    translation (which the bounding rect already includes). Anything else would make a
+    frame's inside map to other points.
   */
+  function allNumbers(text, wanted) {
+    var parts = String(text).trim().split(/\s+/);
+    for (var i = 0; i < parts.length; i++) { if (parseFloat(parts[i]) !== wanted) { return false; } }
+    return parts.length > 0;
+  }
   function onlyMoved(el) {
     var cs = el.ownerDocument.defaultView.getComputedStyle(el);
-    if ((cs.rotate && cs.rotate !== 'none') || (cs.scale && cs.scale !== 'none')) { return false; }
-    if (cs.zoom && cs.zoom !== '1' && cs.zoom !== 'normal') { return false; }
+    // rotate computes to an angle, or an axis and an angle: the angle is the last part.
+    if (cs.rotate && cs.rotate !== 'none' && parseFloat(String(cs.rotate).trim().split(/\s+/).pop()) !== 0) { return false; }
+    if (cs.scale && cs.scale !== 'none' && !allNumbers(cs.scale, 1)) { return false; }
+    if (cs.zoom && cs.zoom !== 'normal' && parseFloat(cs.zoom) !== 1) { return false; }
+    if (cs.offsetPath && cs.offsetPath !== 'none') { return false; }
     var t = cs.transform;
     if (!t || t === 'none') { return true; }
     var m = /^matrix\(([^)]*)\)$/.exec(t);
@@ -380,9 +572,15 @@
   function hitTest(x, y) {
     var doc = document, win = window, ox = 0, oy = 0;
     for (var depth = 0; depth < 12; depth++) {
-      var list = doc.elementsFromPoint(x - ox, y - oy), el = null;
-      for (var i = 0; i < list.length; i++) { if (list[i] !== host) { el = list[i]; break; } }
-      if (!el) { return null; }
+      // In the top page the question is asked in the host's own tree (a shadow root when
+      // the layer sits inside a component's menu), which names the host itself.
+      var list = (depth === 0 ? scopeOf() : doc).elementsFromPoint(x - ox, y - oy), found = null;
+      for (var i = 0; i < list.length; i++) { if (list[i] !== host) { found = list[i]; break; } }
+      if (!found) { return null; }
+      // As the page's document sees it: a node inside a component counts as that component.
+      var el = found;
+      while (inShadow(el)) { el = el.getRootNode().host; }
+      if (el !== found) { return { el: el, real: found, win: win, refused: '' }; }
       var tag = el.tagName.toLowerCase();
       if (tag === 'iframe' || tag === 'frame') {
         var inner = null;
@@ -394,10 +592,17 @@
         doc = inner; win = el.contentWindow;
         continue;
       }
+      // Into open shadow roots, to be able to say that what is there cannot be recorded
+      // (a component that merely holds the picker's layer is hit as itself).
       var real = el;
-      for (var k = 0; k < 12 && real.shadowRoot && real.shadowRoot.elementFromPoint; k++) {
-        var deeper = real.shadowRoot.elementFromPoint(x - ox, y - oy);
-        if (!deeper || deeper === real) { break; }
+      for (var k = 0; k < 12 && real.shadowRoot && real.shadowRoot.elementsFromPoint && !isOurs(real); k++) {
+        var sub = real.shadowRoot.elementsFromPoint(x - ox, y - oy), deeper = null;
+        for (var j = 0; j < sub.length; j++) {
+          if (isOurs(sub[j])) { continue; }
+          if (sub[j].getRootNode() === real.shadowRoot) { deeper = sub[j]; }
+          break;
+        }
+        if (!deeper) { break; }
         real = deeper;
       }
       return { el: el, real: real, win: win, refused: '' };
@@ -575,12 +780,12 @@
   function onMove(win) {
     return function (ev) {
       if (state.phase !== 'picking' || !ev.isTrusted) { return; }
-      if (ev.target === host && win === window) {
+      if (targetOf(ev) === host && win === window) {
         pointer.x = ev.clientX; pointer.y = ev.clientY;
         state.hover = resolveHit(hitTest(ev.clientX, ev.clientY));
         if (state.note && state.note.indexOf('uncovered') === 0) { state.note = ''; }
       }
-      else { state.hover = null; state.note = aboveReason(ev.target); }
+      else { state.hover = null; state.note = aboveReason(targetOf(ev)); }
       draw();
     };
   }
@@ -595,7 +800,7 @@
     return function (ev) {
       swallow(ev);
       if (!ev.isTrusted || state.phase !== 'picking') { return; }
-      var onLayer = ev.target === host && win === window;
+      var target = targetOf(ev), onLayer = target === host && win === window;
       if (ev.type === 'pointerdown') {
         // A layer the page made us move just now (its own listener ran first, at this very
         // press) means the page is changing under the pointer: this press picks nothing.
@@ -612,12 +817,15 @@
       // may not send the click at all after the page moved things around (for example a
       // dialog opened at the press).
       if (ev.type === 'pointerup' && state.down !== NONE && ev.button === 0) {
-        if (!onLayer) { setNote(aboveReason(ev.target)); state.down = NONE; return; }
+        if (!onLayer) { setNote(aboveReason(target)); state.down = NONE; return; }
         if (moves !== state.downMoves || state.down !== keyOf(resolveHit(hitTest(ev.clientX, ev.clientY)))) { setNote('changed'); state.down = NONE; }
         return;
       }
       if (ev.type !== 'click') { return; }
-      if (!onLayer) { setNote(aboveReason(ev.target)); return; }
+      // A click the browser made itself, without the pointer (pointerId -1): the page's
+      // access key (Alt + a letter), which cannot be switched off. It is cancelled like
+      // every click, and said so.
+      if (!onLayer) { setNote(ev.pointerId === -1 ? 'shortcut' : aboveReason(target)); return; }
       if (ev.button !== 0) { return; }
       var down = state.down;
       state.down = NONE;
@@ -627,89 +835,172 @@
       accept(info);
     };
   }
-  // The element with the keyboard focus can be typed in (so a key's default would change it).
-  function focusEditable() {
-    var doc = document, a = doc.activeElement;
-    for (var depth = 0; depth < 12 && a && /^i?frame$/i.test(a.tagName); depth++) {
-      var d = null;
-      try { d = a.contentDocument; } catch (e) { d = null; }
-      if (!d) { return false; }
-      doc = d; a = d.activeElement;
-    }
-    if (!a || a === host) { return false; }
-    return a.isContentEditable || /^(input|textarea|select)$/i.test(a.tagName);
+  /*
+    ONE rule for keys, decided by where the key goes - never by what kind of control has
+    the focus (an <input> inside a component, a <select> that F4 opens, a link that
+    Ctrl+Enter opens in a new tab: the list of such cases has no end):
+    - aimed at the picker's own layer: never reaches the page; function keys and
+      Ctrl/Alt/Meta combinations keep their default, so the browser's own shortcuts
+      work (the layer cannot be typed in and has no default of the site's);
+    - aimed anywhere else (the page took the focus - in the page, a same-site frame or
+      any shadow tree): never reaches the page AND its default is prevented, every key.
+    Esc cancels; the scroll keys (arrows, Page Up/Down, Home/End, Space and Shift+Space)
+    scroll what is under the pointer. There is no keyboard picking: words and selectors
+    can be typed in the Designer instead.
+  */
+  function onKey(win) {
+    return function (ev) {
+      var ours = win === window && targetOf(ev) === host;
+      // A key arriving here means this window has the focus, not a frame inside it.
+      if (win === window && ev.isTrusted) { windowBlurred = false; }
+      var browsers = /^F([1-9]|1[0-9]|2[0-4])$/.test(ev.key) || ev.ctrlKey || ev.altKey || ev.metaKey;
+      ev.stopImmediatePropagation();
+      ev.stopPropagation();
+      if (!(ours && browsers) || ev.key === 'Escape') { ev.preventDefault(); }
+      if (!ev.isTrusted || ev.type !== 'keydown') { return; }
+      if (ev.key === 'Escape') { if (state.phase === 'picking') { finish('cancelled', 'esc', ''); } return; }
+      if (state.phase !== 'picking' || ev.ctrlKey || ev.altKey || ev.metaKey) { return; }
+      var step = 40, page = Math.max(40, window.innerHeight * 0.875), dx = 0, dy = 0;
+      switch (ev.key) {
+        case 'ArrowDown': dy = step; break;
+        case 'ArrowUp': dy = -step; break;
+        case 'ArrowRight': dx = step; break;
+        case 'ArrowLeft': dx = -step; break;
+        case 'PageDown': dy = page; break;
+        case 'PageUp': dy = -page; break;
+        case ' ': case 'Spacebar': dy = ev.shiftKey ? -page : page; break;
+        case 'Home': dy = -1e7; break;
+        case 'End': dy = 1e7; break;
+        default: return;
+      }
+      scrollAt(pointer.x, pointer.y, dx, dy);
+    };
   }
   /*
-    The browser's own shortcuts keep working (reload, find, zoom, back, the address bar,
-    function keys): their key events still never reach the page, but their default is
-    not prevented. In a field the page has focused, only shortcuts that cannot change
-    the field pass (no paste, cut, undo, select-all or deleting by word).
+    The picker never edits anything, so every edit the browser is about to make is
+    cancelled (beforeinput): typing a key's default could not stop - text an input
+    method commits, the emoji panel, clipboard history, voice typing, spelling
+    corrections - and undo/redo, which Ctrl+Z would apply to the page's last edited
+    field even with the focus on the picker's layer.
   */
-  function browserShortcut(ev) {
-    var fn = /^F([1-9]|1[0-9]|2[0-4])$/.test(ev.key);
-    if (fn) { return true; }
-    if (!(ev.ctrlKey || ev.altKey || ev.metaKey)) { return false; }
-    if (!focusEditable()) { return true; }
-    if ((ev.ctrlKey || ev.metaKey) && /^(r|f|l|t|n|w|0|=|\+|-|Tab|PageUp|PageDown)$/i.test(ev.key)) { return true; }
-    return ev.altKey && !ev.ctrlKey && !ev.metaKey && /^(ArrowLeft|ArrowRight|Home)$/.test(ev.key);
-  }
+  function onBeforeInput(ev) { swallow(ev); }
   /*
-    Keys never reach the page. Esc cancels; the scroll keys (arrows, Page Up/Down,
-    Home/End, Space and Shift+Space) scroll what is under the pointer; every other key
-    does nothing. There is no keyboard picking: words and selectors can be typed in the
-    Designer instead.
+    Typing reached the page all the same: a composition started (its text cannot be
+    cancelled) or a field changed. The pick ends rather than go on while the page is
+    being typed in. Events the page makes itself do not count.
   */
-  function onKey(ev) {
-    if (browserShortcut(ev)) { ev.stopImmediatePropagation(); ev.stopPropagation(); return; }
-    swallow(ev);
-    if (!ev.isTrusted || ev.type !== 'keydown') { return; }
-    if (ev.key === 'Escape') { if (state.phase === 'picking') { finish('cancelled', 'esc', ''); } return; }
-    if (state.phase !== 'picking' || ev.ctrlKey || ev.altKey || ev.metaKey) { return; }
-    var step = 40, page = Math.max(40, window.innerHeight * 0.875), dx = 0, dy = 0;
-    switch (ev.key) {
-      case 'ArrowDown': dy = step; break;
-      case 'ArrowUp': dy = -step; break;
-      case 'ArrowRight': dx = step; break;
-      case 'ArrowLeft': dx = -step; break;
-      case 'PageDown': dy = page; break;
-      case 'PageUp': dy = -page; break;
-      case ' ': case 'Spacebar': dy = ev.shiftKey ? -page : page; break;
-      case 'Home': dy = -1e7; break;
-      case 'End': dy = 1e7; break;
-      default: return;
-    }
-    scrollAt(pointer.x, pointer.y, dx, dy);
+  function onTyping(ev) {
+    if (!ev.isTrusted || (state.phase !== 'picking' && state.phase !== 'picked')) { return; }
+    finish('error', 'typing', '');
+  }
+  // Cut, copy and paste never reach the page (a site may act on a paste anywhere); nothing is cut or pasted.
+  function onClipboard(ev) {
+    ev.stopImmediatePropagation();
+    ev.stopPropagation();
+    if (ev.type !== 'copy') { ev.preventDefault(); }
   }
   // Never a focus change inside a focus event: only a focus gone into another site's frame is taken back, later.
   function onFocusIn() {
     if (state.phase === 'picking' || state.phase === 'picked') { takeBackFocus(); }
   }
-  // The picker's own popover toggling must not start the guard again (it would loop).
-  function onTopLayerChange(ev) { if (ev.target !== host) { guard(); } }
+  /*
+    A menu or dialog of the page opening or closing. beforetoggle comes before the
+    change: it gives the order menus open in, and the guard runs as soon as the page's
+    script is done (a microtask), before any further press. The picker's own popover
+    toggling must not start the guard again (it would loop).
+  */
+  function onTopLayerChange(ev) {
+    var t = targetOf(ev);
+    if (t === host) { return; }
+    if (ev.type === 'beforetoggle') {
+      if (opened && t && t.nodeType === 1) { if (ev.newState === 'open') { opened.set(t, ++openCount); } else { opened.delete(t); } }
+      // A menu the layer could not be drawn in gets another chance when it opens again
+      // (not when it closes: the layer would hop in and out of it under the very press).
+      if (t && ev.newState === 'open' && typeof unusable.delete === 'function') { unusable.delete(t); }
+      Promise.resolve().then(guard);
+      return;
+    }
+    guard();
+  }
+  // A frame finished loading: its new page gets the listeners now, not at the next refresh.
+  function onLoad(ev) {
+    var t = targetOf(ev);
+    if (!t || t.nodeType !== 1 || !/^i?frame$/i.test(t.localName || '')) { return; }
+    var d = null;
+    try { d = t.contentDocument; } catch (e) { d = null; }
+    if (!d || !d.documentElement) { return; }
+    var out = { scopes: [], roots: [], wins: [t.contentWindow] };
+    try { walkTree(d, false, out); } catch (e) { /* next refresh */ }
+    out.wins.forEach(listen);
+  }
+  function add(target, type, fn) {
+    target.addEventListener(type, fn, true);
+    for (var i = 0; i < attached.length; i++) { if (attached[i].target === target && attached[i].type === type && attached[i].fn === fn) { return; } }
+    attached.push({ target: target, type: type, fn: fn });
+  }
+  /*
+    Adds the listeners to a window. Called again on every refresh: adding the same
+    function twice does nothing, and a window whose page was replaced (a frame that
+    navigated or reloaded, document.open()) has lost them all and gets them back.
+  */
   function listen(win) {
-    if (windows.indexOf(win) >= 0) { return; }
-    windows.push(win);
-    var add = function (type, fn) { win.addEventListener(type, fn, true); attached.push({ win: win, type: type, fn: fn }); };
-    var pointerFn = onPointer(win);
-    POINTER.forEach(function (type) { add(type, pointerFn); });
-    KEYS.forEach(function (type) { add(type, onKey); });
-    add('mousemove', onMove(win));
-    add('focusin', onFocusIn);
-    add('toggle', onTopLayerChange);
-    add('fullscreenchange', onTopLayerChange);
+    try {
+      // A frame's new page came with the server's shield (it swallows everything until
+      // the picker is there): the picker's own listeners take over.
+      var there = win !== window ? win[NS] : null;
+      if (there && there.shield && typeof there.stop === 'function') { there.stop(); }
+      var h = handlers ? handlers.get(win) : null;
+      if (!h) {
+        h = { pointer: onPointer(win), key: onKey(win), move: onMove(win) };
+        if (handlers) { handlers.set(win, h); }
+      }
+      POINTER.forEach(function (type) { add(win, type, h.pointer); });
+      KEYS.forEach(function (type) { add(win, type, h.key); });
+      CLIPBOARD.forEach(function (type) { add(win, type, onClipboard); });
+      add(win, 'mousemove', h.move);
+      add(win, 'focusin', onFocusIn);
+      add(win, 'beforeinput', onBeforeInput);
+      add(win, 'input', onTyping);
+      add(win, 'compositionstart', onTyping);
+      add(win, 'toggle', onTopLayerChange);
+      add(win, 'beforetoggle', onTopLayerChange);
+      add(win, 'fullscreenchange', onTopLayerChange);
+      // A frame's load event stops at its document (it never reaches the window).
+      add(win.document, 'load', onLoad);
+      if (win === window) { add(win, 'blur', onWindowFocus); add(win, 'focus', onWindowFocus); }
+    }
+    catch (e) { /* a frame that went away or changed site meanwhile */ }
+  }
+  // Menus, dialogs and frames inside an open shadow root: their events do not leave it.
+  function listenRoot(root) {
+    try {
+      add(root, 'toggle', onTopLayerChange);
+      add(root, 'beforetoggle', onTopLayerChange);
+      add(root, 'load', onLoad);
+      if (observer && observed.indexOf(root) < 0 && root.isConnected !== false && deepContains(document, root)) {
+        observed.push(root);
+        observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['open'] });
+      }
+    }
+    catch (e) { /* gone */ }
+  }
+  function listenAll() {
+    known.wins.forEach(listen);
+    known.roots.forEach(listenRoot);
   }
   function unlistenAll() {
-    attached.forEach(function (a) { try { a.win.removeEventListener(a.type, a.fn, true); } catch (e) { /* frame gone */ } });
-    attached = []; windows = [];
+    attached.forEach(function (a) { try { a.target.removeEventListener(a.type, a.fn, true); } catch (e) { /* frame gone */ } });
+    attached = [];
   }
 
   /*
-    The guard, run on every refresh, on DOM changes at the top of the page and when
-    top-layer content opens or closes: the host must be connected, last in its parent
-    (the topmost modal dialog or the page), on top, covering the whole window, and
-    keeping the focus out of other sites' frames. A host the page removed is put back and the listeners are added
-    again (document.open() drops every listener). What cannot be restored ends the pick
-    rather than going on unprotected.
+    The guard, run on every refresh, on DOM changes that matter and when top-layer
+    content opens or closes: the host must be connected, where it belongs (inside the
+    menu or modal dialog on top, else last in the page), on top, covering the whole
+    window, and the focus must not be in a frame the picker cannot listen in. A host
+    the page removed is put back and the listeners are added again (document.open()
+    drops every listener). What cannot be restored ends the pick rather than going on
+    unprotected.
   */
   var guarding = false;
   function guard() {
@@ -720,34 +1011,53 @@
       if (!host.isConnected) {
         // Taken out of the page (document.open() also drops every listener): put back and listen again.
         placeHost();
-        unlistenAll();
-        vouchDocs().list.forEach(function (entry) { listen(entry.win); });
+        scan(true);
         watch();
+        listenAll();
       }
-      else if (host.parentNode !== parent || (parent && parent.lastElementChild !== host)) {
-        // Moved only (a dialog opened or closed, something added after it): the listeners stay.
+      else if (misplaced(parent)) {
+        // Moved only (a menu or dialog opened or closed, something added after it): the listeners stay.
         placeHost();
       }
       // A full-screen element stays above the layer whatever is done; clicks there are refused.
       if (!document.fullscreenElement && !onTopEverywhere()) { showOnTop(true); }
-      if (!coversWindow()) { placeHost(); }
+      if (!coversWindow()) {
+        // Not drawn where it is: a menu or dialog that does not show content added to it
+        // (a component with a closed shadow root). Do without that one.
+        var at = host.parentNode, owner = at && at.host ? at.host : at;
+        if (owner && owner !== document.documentElement) { unusable.add(owner); }
+        placeHost();
+      }
       if (!host.isConnected || !coversWindow()) { finish('error', 'coverage', ''); return; }
       if (focusInForeignFrame()) { takeBackFocus(); }
     }
     finally { guarding = false; }
   }
+  /*
+    DOM changes: only those that can matter start the guard - the host gone or no longer
+    where it belongs, or a dialog opening or closing (its "open" attribute). A menu that
+    keeps rewriting its rows around the host costs nothing.
+  */
+  var observed = [];
+  function onMutations(records) {
+    var matters = !host.isConnected || (host.parentNode === document.documentElement && document.documentElement.lastElementChild !== host);
+    for (var i = 0; i < records.length && !matters; i++) { matters = records[i].type === 'attributes'; }
+    if (matters) { guard(); }
+  }
   function watch() {
     if (observer) { observer.disconnect(); }
+    observed = [];
     if (typeof MutationObserver !== 'function') { return; }
-    observer = new MutationObserver(function () { guard(); });
+    observer = new MutationObserver(onMutations);
     observer.observe(document, { childList: true });
     if (document.documentElement) {
       observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['open'] });
     }
   }
   function refresh() {
-    var docs = refreshOverlays();
-    docs.list.forEach(function (entry) { listen(entry.win); });
+    scan(false);
+    listenAll();
+    refreshOverlays();
     guard();
     if (state.phase === 'picking' && state.hover && !state.hover.blocked) { draw(); }
   }
@@ -876,6 +1186,7 @@
     stop: stop,
   };
   Object.defineProperty(window, NS, { value: api, configurable: true, enumerable: false, writable: true });
+  scan(true);
   placeHost();
   watch();
   park();

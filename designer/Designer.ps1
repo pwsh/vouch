@@ -142,6 +142,8 @@ function New-DesignerPickState {
         PageNote  = ''
         Reinjects = 0
         Failures  = 0
+        # The browser's id for the shield script (Add-ElementPickShield), '' when there is none.
+        ShieldId  = ''
         StartedAt = [datetime]::MinValue
         LastPoll  = [datetime]::MinValue
     }
@@ -2805,6 +2807,7 @@ function Get-DesignerPickerText {
         'uncovered-dialog'     = (Get-DesignerPickNote -Code 'uncovered-dialog')
         'uncovered-popup'      = (Get-DesignerPickNote -Code 'uncovered-popup')
         'uncovered-fullscreen' = (Get-DesignerPickNote -Code 'uncovered-fullscreen')
+        shortcut    = (Get-DesignerPickNote -Code 'shortcut')
         page        = 'The whole page'
         nothing     = 'Nothing here scrolls. Point inside the area with the scroll bar.'
         climbed     = 'part of it'
@@ -2815,8 +2818,10 @@ function Get-DesignerPickerText {
 function Get-DesignerPickNote {
     <#
         The words for a short note the picker reports by code while picking goes on: the
-        page changed between press and release, or the click landed on something the page
-        shows above the picking layer. Codes only come from the page, so an unknown one
+        page changed between press and release, the click landed on something the page
+        shows above the picking layer, or the browser clicked one of the page's controls
+        for an access key (Alt + a letter; Edge offers no way to switch those off, the
+        picker cancels the click). Codes only come from the page, so an unknown one
         gives ''.
     #>
     param([AllowEmptyString()][string]$Code)
@@ -2828,6 +2833,7 @@ function Get-DesignerPickNote {
         'uncovered-dialog' { return "That is in a pop-up dialog the page shows above everything else, so it cannot be picked by pointing. $type" }
         'uncovered-popup' { return "That is in a pop-up the page shows above everything else, so it cannot be picked by pointing. $type" }
         'uncovered-fullscreen' { return "That is in a part of the page shown full screen above everything else, so it cannot be picked by pointing. $type" }
+        'shortcut' { return 'That key is a shortcut of this page (Alt and a letter): the page moved the keyboard focus to one of its controls. Vouch cancelled the click that goes with it, so nothing was picked. Click with the mouse to pick.' }
     }
     return ''
 }
@@ -2851,6 +2857,77 @@ function Get-DesignerPickerScript {
     $pairs = foreach ($key in $texts.Keys) { "$(ConvertTo-JsLiteral -Value $key): $(ConvertTo-JsLiteral -Value $texts[$key])" }
     $config = "{ mode: $(ConvertTo-JsLiteral -Value $Mode), token: $(ConvertTo-JsLiteral -Value $Token), texts: { $($pairs -join ', ') } }"
     return "(function () {`n$(Get-FrameDocsScript)`nreturn ($source`n)($config);`n})()"
+}
+
+function Get-DesignerPickShieldScript {
+    <#
+        What the browser runs at the very start of every NEW document in the tab while a
+        pick is on (Page.addScriptToEvaluateOnNewDocument), in the page and in its frames.
+        A page that reloads or moves on by itself takes the picker with it, and the picker
+        only comes back at the next poll: without this, a click in between would act on
+        the fresh page (established in headless Edge: a click 250 ms after
+        location.reload() reached the site's button).
+        The shield only swallows - clicks, keys, edits - and picks nothing. It sits in the
+        picker's own global, so the picker replaces it when it arrives (its start stops
+        whatever was there), and Close-ElementPick's stop() removes it. It also removes
+        itself after 4 seconds: should the Designer ever fail to take the script back,
+        a page is never left dead for longer than that.
+    #>
+    return @'
+(function () {
+  'use strict';
+  var NS = '__vouchPicker';
+  if (window[NS]) { return; }
+  var types = ['pointerdown', 'pointerup', 'pointercancel', 'mousedown', 'mouseup', 'click', 'dblclick', 'auxclick', 'contextmenu',
+    'touchstart', 'touchend', 'touchcancel', 'dragstart', 'drop', 'submit', 'keydown', 'keypress', 'keyup', 'beforeinput', 'cut', 'paste'];
+  var timer = 0;
+  function swallow(ev) { ev.preventDefault(); ev.stopImmediatePropagation(); ev.stopPropagation(); }
+  var api = { shield: true, stop: function () {
+    types.forEach(function (type) { window.removeEventListener(type, swallow, true); });
+    if (timer) { clearTimeout(timer); timer = 0; }
+    if (window[NS] === api) { try { delete window[NS]; } catch (e) { window[NS] = undefined; } }
+    return true;
+  } };
+  types.forEach(function (type) { window.addEventListener(type, swallow, true); });
+  timer = setTimeout(api.stop, 4000);
+  Object.defineProperty(window, NS, { value: api, configurable: true, enumerable: false, writable: true });
+})();
+'@
+}
+
+function Add-ElementPickShield {
+    <#
+        Has the browser put the shield into every new document of the tab from now on.
+        Edge only runs such scripts while the connection's Page domain is enabled
+        (established: registered without it, the script never ran), so it is enabled for
+        the pick and disabled again afterwards - nothing else here uses it.
+        Without the shield picking still works as before (the page is then unprotected
+        for a moment after it reloads by itself), so a browser that refuses is not an error.
+    #>
+    param([Parameter(Mandatory)][object]$Pick)
+    try {
+        [void](Send-CdpCommand -Method 'Page.enable' -TimeoutSec 5)
+        $answer = Send-CdpCommand -Method 'Page.addScriptToEvaluateOnNewDocument' -Params @{ source = (Get-DesignerPickShieldScript) } -TimeoutSec 5
+        $Pick.ShieldId = [string](Get-DesignerValue -Object $answer -Name 'identifier')
+    }
+    catch { Write-Verbose "The shield for new pages could not be set: $($_.Exception.Message)" }
+}
+
+function Remove-ElementPickShield {
+    <#
+        Takes the shield script back, so pages loaded after the pick are left alone. A
+        connection that is gone took the script with it (it belongs to the connection);
+        a shield already in a page ends with the picker's stop() or by itself.
+    #>
+    param([Parameter(Mandatory)][object]$Pick, [int]$TimeoutSec = 3)
+    if (-not $Pick.ShieldId) { return }
+    $id = $Pick.ShieldId
+    $Pick.ShieldId = ''
+    try {
+        [void](Send-CdpCommand -Method 'Page.removeScriptToEvaluateOnNewDocument' -Params @{ identifier = $id } -TimeoutSec $TimeoutSec)
+        [void](Send-CdpCommand -Method 'Page.disable' -TimeoutSec $TimeoutSec)
+    }
+    catch { Write-Verbose "The shield for new pages could not be taken back: $($_.Exception.Message)" }
 }
 
 function Test-DesignerGeneratedId {
@@ -3102,6 +3179,7 @@ function Start-ElementPick {
         return $pick
     }
     $pick.State = 'picking'
+    Add-ElementPickShield -Pick $pick
     try { [void](Send-CdpCommand -Method 'Page.bringToFront' -TimeoutSec 5) } catch { Write-Verbose "Page.bringToFront: $($_.Exception.Message)" }
     Show-DesignerAuditWindow -State $State
     return $pick
@@ -3109,8 +3187,9 @@ function Start-ElementPick {
 
 function Close-ElementPick {
     <#
-        Ends a pick: the picker removes everything it put into the page, the result is
-        kept for the panel, and the windows go back side by side with the panel in front.
+        Ends a pick: the shield for new pages is taken back, the picker removes everything
+        it put into the page, the result is kept for the panel, and the windows go back
+        side by side with the panel in front.
     #>
     param(
         [Parameter(Mandatory)][object]$State,
@@ -3122,6 +3201,7 @@ function Close-ElementPick {
     )
     $pick = $State.Pick
     if ($State.Browser.Connected) {
+        Remove-ElementPickShield -Pick $pick
         try { [void](Invoke-CdpEval -Expression '(window.__vouchPicker && typeof window.__vouchPicker.stop === "function") ? window.__vouchPicker.stop() : false' -TimeoutSec 3) }
         catch { Write-Verbose "The picker could not be removed from the page: $($_.Exception.Message)" }
     }
@@ -3223,6 +3303,7 @@ function Update-ElementPick {
             $pick.State = 'error'
             $pick.Code = 'tab'
             $pick.Message = if ($still) { 'Picking stopped: the tab stopped answering. Pick again.' } else { 'Picking stopped: the tab you were picking in was closed.' }
+            if ($still) { Remove-ElementPickShield -Pick $pick -TimeoutSec 1 }
             [void](Set-DesignerLayout -State $State -Focus panel)
             Update-DesignerBrowser -State $State -Force
         }
@@ -3265,6 +3346,7 @@ function Update-ElementPick {
         'error' {
             switch ($code) {
                 'focus' { Close-ElementPick -State $State -Outcome error -Code 'focus' -Message 'Picking stopped: the keyboard focus stayed inside a frame from another site, where Vouch cannot keep keys from acting on the page. Click outside that frame in Edge, then pick again.' }
+                'typing' { Close-ElementPick -State $State -Outcome error -Code 'typing' -Message 'Picking stopped: a field in the page started to change. Typing reached it (for example from an input method, the emoji panel, clipboard history or voice typing), or the page filled it in itself. Vouch cannot hold that back, so it stopped rather than go on. Check the field in the page, then click Pick again or type the words in the Designer.' }
                 'coverage' { Close-ElementPick -State $State -Outcome error -Code 'coverage' -Message 'Picking stopped: this page is built in a way that lets clicks past the picking layer (for example it replaces or transforms the whole page), so picking could not go on safely. Type the words or selector in the Designer instead.' }
                 default { Close-ElementPick -State $State -Outcome error -Code 'picker' -Message 'Picking stopped unexpectedly in the page. Pick again.' }
             }

@@ -192,11 +192,15 @@ iframe{width:260px;height:110px;border:1px solid #888} #spacer{height:2500px;bac
 <div><div class="panel" id="leftpanel">$rows</div> <div class="panel" id="rightpanel">$rows</div> <div id="clipbox"><div style="height:400px">Clipped content</div></div> <div id="hscroll" style="width:200px;overflow-x:auto;display:inline-block;vertical-align:top"><div style="width:1200px;height:60px">Wide content</div></div></div>
 <dialog id="dlg"><p>A dialog</p><button id="dlgbtn" onclick="hit('dialog')">Dialog action</button></dialog>
 <div popover="manual" id="pop"><button id="popbtn" onclick="hit('popover')">Popover action</button></div>
-<div popover id="autopop"><button id="autobtn" onclick="hit('auto')">Menu item</button></div>
+<div popover id="submenu" style="inset:auto;left:20px;top:330px;margin:0"><button id="subbtn" onclick="hit('sub')">Sub item</button></div>
+<div popover id="autopop"><button id="autobtn" onclick="hit('auto')">Menu item</button> <button id="subopen" popovertarget="submenu" popovertargetaction="show">More</button></div>
 <dialog id="dlg2"><p>A second dialog</p><button id="dlg2btn" onclick="hit('dialog2')">Second dialog action</button></dialog>
 <div id="trapbox" hidden style="position:fixed;left:400px;top:120px;width:260px;padding:12px;background:#eef;border:2px solid #446;z-index:10"><button id="trapfirst" onclick="hit('trap1')">Trap first</button> <button id="trapsecond" onclick="hit('trap2')">Trap second</button></div>
 <form id="lonely" action="/ok" onsubmit="window.__submits++; document.title = 'SUBMITTED'; return false;"><input id="q" name="q" value="find"></form>
+<div class="row" id="keyrow"><select id="sel"><option>One</option><option>Two</option><option>Three</option></select> <span id="fieldhost"></span> <span id="closedhost"></span>
+<a href="/ok" id="keylink" onclick="return hit('keylink')">Key link</a> <button id="akbtn" accesskey="k" onclick="hit('accesskey')">Access</button> <label><input type="checkbox" id="akcheck" accesskey="j"> Tick</label></div>
 <div id="spacer">The rest of a tall page</div>
+<div id="menuhost"></div><div id="menuel" popover style="inset:auto;left:20px;top:420px;margin:0"></div><div id="menuclosed" popover style="inset:auto;left:20px;top:460px;margin:0"></div>
 <script>
 window.__hits = []; window.__downs = 0; window.__keys = 0; window.__submits = 0; window.__winHits = [];
 // A site that acts in the capture phase on window, registered before any picker: it
@@ -244,6 +248,43 @@ if (q.get('fight') === '1') {
     .observe(document.documentElement, { childList: true });
 }
 if (q.get('swapOnUp') === '1') { window.addEventListener('pointerup', function () { var a = document.getElementById('reports-a'); if (a) { var s = document.createElement('span'); s.id = 'swapped'; s.textContent = 'Swapped'; a.replaceWith(s); } }, true); }
+// A sub-menu opened from the menu by its own button; it comes EARLIER in the page than the menu.
+window.__subToggles = [];
+document.getElementById('submenu').addEventListener('toggle', function (e) { window.__subToggles.push(e.newState); });
+if (q.get('submenu') === '1') { document.getElementById('autopop').showPopover(); document.getElementById('subopen').click(); window.__winHits = []; }
+// A menu whose content the page keeps updating (a row added 20 times a second).
+if (q.get('live') === '1') { setInterval(function () { var m = document.getElementById('autopop'); var d = document.createElement('div'); d.textContent = 'Live row'; m.appendChild(d); var rows = m.querySelectorAll('div'); if (rows.length > 6) { rows[0].remove(); } }, 50); }
+// Menus as component libraries build them: a popover inside an open shadow root (1),
+// an element that is the popover itself and draws its content in its open shadow root (2),
+// and the same with a closed shadow root (3), which no page script can look into.
+window.__shadowToggles = [];
+(function () {
+  var mh = document.getElementById('menuhost').attachShadow({ mode: 'open' });
+  var menu = document.createElement('div'); menu.id = 'shadowmenu'; menu.setAttribute('popover', ''); menu.style.cssText = 'inset:auto;left:20px;top:380px;margin:0';
+  var item = document.createElement('button'); item.id = 'shadowitem'; item.textContent = 'Shadow menu item'; item.onclick = function () { hit('shadowitem'); };
+  menu.appendChild(item); mh.appendChild(menu);
+  var me = document.getElementById('menuel'), meRoot = me.attachShadow({ mode: 'open' });
+  var item2 = document.createElement('button'); item2.id = 'elitem'; item2.textContent = 'Element menu item'; item2.onclick = function () { hit('elitem'); }; meRoot.appendChild(item2);
+  var mc = document.getElementById('menuclosed'), mcRoot = mc.attachShadow({ mode: 'closed' });
+  var item3 = document.createElement('button'); item3.textContent = 'Closed menu item'; item3.onclick = function () { hit('closeditem'); }; mcRoot.appendChild(item3);
+  if (q.get('shadowmenu') === '3') { mc.showPopover(); }
+  [menu, me, mc].forEach(function (m) { m.addEventListener('toggle', function (e) { window.__shadowToggles.push(m.id + ':' + e.newState); }); });
+  if (q.get('shadowmenu') === '1') { menu.showPopover(); }
+  if (q.get('shadowmenu') === '2') { me.showPopover(); }
+  // Fields inside components: one in an open shadow root, one in a closed one.
+  var fh = document.getElementById('fieldhost').attachShadow({ mode: 'open' });
+  var f1 = document.createElement('input'); f1.id = 'shadowfield'; f1.value = 'open words here'; fh.appendChild(f1);
+  var ch = document.getElementById('closedhost').attachShadow({ mode: 'closed' });
+  var f2 = document.createElement('input'); f2.id = 'closedfield'; f2.value = 'closed words here'; ch.appendChild(f2);
+  window.__closedField = f2;
+})();
+// What typing, pasting and choosing would do to the site.
+window.__inputs = []; window.__pastes = 0; window.__selChanges = 0; window.__keyEvents = []; window.__dlgEvents = [];
+['beforeinput', 'input', 'compositionstart', 'compositionend'].forEach(function (type) { document.addEventListener(type, function (e) { window.__inputs.push(type); }); });
+document.addEventListener('paste', function () { window.__pastes++; });
+document.getElementById('sel').addEventListener('change', function () { window.__selChanges++; });
+window.addEventListener('keydown', function (e) { window.__keyEvents.push(e); }, true);
+['cancel', 'close'].forEach(function (type) { document.getElementById('dlg').addEventListener(type, function () { window.__dlgEvents.push(type); }); });
 var shadowRoot = document.getElementById('shadowhost').attachShadow({ mode: 'open' });
 var shadowButton = document.createElement('button'); shadowButton.id = 'shadowbtn'; shadowButton.textContent = 'Shadow button';
 shadowButton.onclick = function () { hit('shadow'); }; shadowRoot.appendChild(shadowButton);
@@ -268,9 +309,11 @@ shadowButton.onclick = function () { hit('shadow'); }; shadowRoot.appendChild(sh
                     'rot90' { 'width:200px;height:200px;transform:rotate(90deg)' }
                     'ancestor' { 'width:300px;height:150px' }
                     'translate' { 'width:300px;height:150px;transform:translate(40px,30px)' }
+                    'identity' { 'width:300px;height:150px;scale:1;rotate:0deg;zoom:1;transform:matrix(1,0,0,1,0,0)' }
+                    'offset' { "width:300px;height:150px;offset-path:path('M 150 75 L 151 75');offset-rotate:180deg;offset-distance:0%" }
                     default { 'width:300px;height:150px;border:6px solid #888;padding:24px' }
                 }
-                $frame = "<iframe id='geomframe' src='/pickframe' style='$style'></iframe>"
+                $frame = "<iframe id='geomframe' src='/pickframe' style=""$style""></iframe>"
                 if ([string]$query['kind'] -eq 'ancestor') { $frame = "<div id='turned' style='display:inline-block;transform:rotate(180deg)'>$frame</div>" }
                 Send-Response $context 200 (Page 'Frame geometry' "<div style='margin:20px'>$frame</div>")
             }

@@ -1804,6 +1804,24 @@ Describe 'Browser link and picker: routes and rules without a browser' {
         $script.TrimEnd() | Should -BeLike '*})()'
     }
 
+    It 'has words for every note the picker can report, and none for a code it does not know' {
+        foreach ($code in 'changed', 'changed-again', 'uncovered', 'uncovered-dialog', 'uncovered-popup', 'uncovered-fullscreen', 'shortcut') {
+            Get-DesignerPickNote -Code $code | Should -Not -BeNullOrEmpty
+            (Get-DesignerPickerText -Mode click)[$code] | Should -Be (Get-DesignerPickNote -Code $code)
+        }
+        Get-DesignerPickNote -Code 'shortcut' | Should -Match 'Vouch cancelled the click'
+        Get-DesignerPickNote -Code '<script>' | Should -Be ''
+        Get-DesignerPickNote -Code '' | Should -Be ''
+    }
+
+    It 'keeps the shield for new pages small and self-ending: it only swallows, lives in the picker''s own global and removes itself' {
+        $shield = Get-DesignerPickShieldScript
+        $shield | Should -Match ([regex]::Escape("var NS = '__vouchPicker'"))
+        $shield | Should -Match 'setTimeout\(api\.stop, 4000\)'
+        $shield | Should -Not -Match 'innerHTML|eval\(|fetch\(|XMLHttpRequest'
+        $shield.Length | Should -BeLessThan 2000
+    }
+
     It 'gives up on a request body that stalls, and answers 408' {
         $pipe = [System.IO.Pipes.AnonymousPipeServerStream]::new([System.IO.Pipes.PipeDirection]::In)
         try {
@@ -1918,6 +1936,28 @@ Describe 'Browser link and picker in headless Edge (functions called directly)' 
                 if ($type -eq 'keyDown' -and $Key -eq 'Enter') { $params.text = "`r" }
                 [void](Send-CdpCommand -Method 'Input.dispatchKeyEvent' -Params $params)
             }
+        }
+        function Send-TestChord([string]$Key, [int]$Code, [int]$Modifiers = 0, [string]$Text = '', [string]$KeyCode = '') {
+            # A real key press with modifiers (1 Alt, 2 Ctrl, 4 Meta, 8 Shift; 3 is AltGr).
+            # -Text makes the press type that character; without it the key only acts.
+            foreach ($type in 'keyDown', 'keyUp') {
+                $params = @{ type = $type; key = $Key; code = $(if ($KeyCode) { $KeyCode } else { $Key }); windowsVirtualKeyCode = $Code; nativeVirtualKeyCode = $Code; modifiers = $Modifiers }
+                if (($Modifiers -band 3) -eq 1) { $params.isSystemKey = $true }
+                if ($type -eq 'keyDown') { if ($Text) { $params.text = $Text; $params.unmodifiedText = $Text } else { $params.type = 'rawKeyDown' } }
+                [void](Send-CdpCommand -Method 'Input.dispatchKeyEvent' -Params $params)
+            }
+        }
+        function Get-TestPickerPlace {
+            # Where the picker's host is: the id of its parent, or of the component whose shadow root holds it.
+            return Invoke-CdpEval -Expression @'
+(function () {
+  var h = document.querySelector('vouch-picker-ui');
+  if (h) { return h.parentNode.id || h.parentNode.nodeName; }
+  var all = document.querySelectorAll('*');
+  for (var i = 0; i < all.length; i++) { if (all[i].shadowRoot && all[i].shadowRoot.querySelector('vouch-picker-ui')) { return 'shadow:' + all[i].id; } }
+  return 'none';
+})()
+'@
         }
         function Assert-FramesFree {
             # After a pick, a click inside the same-site frame reaches the site's handler: the
@@ -2341,6 +2381,7 @@ Describe 'Browser link and picker in headless Edge (functions called directly)' 
     It 'picks in a frame that is <Case>' -ForEach @(
         @{ Case = 'padded, with a thick border'; Kind = 'pad' }
         @{ Case = 'only moved (translate)'; Kind = 'translate' }
+        @{ Case = 'at rest: scale 1, rotate 0deg, zoom 1 and an identity matrix'; Kind = 'identity' }
     ) {
         Open-TestPage "/framegeom?kind=$Kind"
         $before = Get-PageTrace
@@ -2359,6 +2400,7 @@ Describe 'Browser link and picker in headless Edge (functions called directly)' 
         @{ Case = 'turned 180 degrees (same box size)'; Kind = 'rot180' }
         @{ Case = 'square and turned 90 degrees (same box size)'; Kind = 'rot90' }
         @{ Case = 'inside a turned box (an ancestor is transformed)'; Kind = 'ancestor' }
+        @{ Case = 'turned along a motion path (offset-path, no transform at all)'; Kind = 'offset' }
     ) {
         Open-TestPage "/framegeom?kind=$Kind"
         $before = Get-PageTrace
@@ -2457,33 +2499,408 @@ Describe 'Browser link and picker in headless Edge (functions called directly)' 
         Invoke-CdpEval -Expression "typeof window.__vouchPicker + '|' + document.querySelectorAll('vouch-picker-ui').length" | Should -Be 'undefined|0'
     }
 
-    It 'leaves the browser''s own shortcuts working while keeping every key from the page' {
+    It 'decides keys by where they go: aimed at the picking layer the browser''s shortcuts keep their default, aimed at the page nothing does' {
         Open-TestPage "/pickme?x=$($script:Web2)"
         [void](Start-ElementPick -State $script:B -Mode click)
         $r = Invoke-CdpEval -Expression @'
 (function () {
-  var k = function (o) { var e = new KeyboardEvent('keydown', Object.assign({ bubbles: true, cancelable: true }, o)); var allowed = document.dispatchEvent(e); return allowed; };
-  var before = window.__keys;
-  var out = { reload: k({ key: 'r', ctrlKey: true }), f5: k({ key: 'F5' }), find: k({ key: 'f', ctrlKey: true }), zoom: k({ key: '+', ctrlKey: true }),
-    back: k({ key: 'ArrowLeft', altKey: true }), plain: k({ key: 'a' }), enter: k({ key: 'Enter' }) };
-  document.getElementById('q').focus();
-  out.pasteInField = k({ key: 'v', ctrlKey: true });
-  out.reloadInField = k({ key: 'r', ctrlKey: true });
+  var layer = document.querySelector('vouch-picker-ui');
+  var k = function (where, o) { return where.dispatchEvent(new KeyboardEvent('keydown', Object.assign({ bubbles: true, cancelable: true, composed: true }, o))); };
+  var keys = { reload: { key: 'r', ctrlKey: true }, f5: { key: 'F5' }, f4: { key: 'F4' }, find: { key: 'f', ctrlKey: true }, zoom: { key: '+', ctrlKey: true },
+    back: { key: 'ArrowLeft', altKey: true }, paste: { key: 'v', ctrlKey: true }, plain: { key: 'a' }, enter: { key: 'Enter' }, esc: { key: 'Escape' } };
+  var before = window.__keys, out = { layer: {}, body: {}, field: {} };
+  Object.keys(keys).forEach(function (n) { out.layer[n] = k(layer, keys[n]); });
+  Object.keys(keys).forEach(function (n) { out.body[n] = k(document.body, keys[n]); });
+  document.getElementById('q').focus({ preventScroll: true });
+  Object.keys(keys).forEach(function (n) { out.field[n] = k(document.getElementById('q'), keys[n]); });
   out.siteSaw = window.__keys - before;
   return out;
 })()
 '@
-        $r.reload | Should -BeTrue
-        $r.f5 | Should -BeTrue
-        $r.find | Should -BeTrue
-        $r.zoom | Should -BeTrue
-        $r.back | Should -BeTrue
-        $r.plain | Should -BeFalse
-        $r.enter | Should -BeFalse
-        $r.pasteInField | Should -BeFalse
-        $r.reloadInField | Should -BeTrue
+        # Aimed at the layer: function keys and Ctrl/Alt combinations are not prevented; plain keys and Esc are.
+        foreach ($name in 'reload', 'f5', 'f4', 'find', 'zoom', 'back', 'paste') { $r.layer.$name | Should -BeTrue -Because "$name aimed at the picking layer keeps its default" }
+        foreach ($name in 'plain', 'enter', 'esc') { $r.layer.$name | Should -BeFalse -Because "$name aimed at the picking layer is prevented" }
+        # Aimed anywhere else: every key is prevented, no exemptions.
+        foreach ($where in 'body', 'field') {
+            foreach ($name in 'reload', 'f5', 'f4', 'find', 'zoom', 'back', 'paste', 'plain', 'enter', 'esc') { $r.$where.$name | Should -BeFalse -Because "$name aimed at the page ($where) is prevented" }
+        }
         $r.siteSaw | Should -Be 0
+        (Get-ElementPickResult -State $script:B).state | Should -Be 'picking' -Because 'keys the page makes itself never cancel'
         [void](Invoke-TestRoute POST '/api/pick/cancel' -State $script:B)
+    }
+
+    It 'keeps every menu open when a sub-menu comes EARLIER in the page than its menu: picking <Case>' -ForEach @(
+        @{ Case = 'the sub-menu''s item'; El = "document.getElementById('subbtn')"; Value = 'Sub item' }
+        @{ Case = 'the menu''s item'; El = "document.getElementById('autobtn')"; Value = 'Menu item' }
+        @{ Case = 'something outside both'; El = "document.getElementById('fav')"; Value = '#fav' }
+    ) {
+        Open-TestPage "/pickme?x=$($script:Web2)&submenu=1"
+        Invoke-CdpEval -Expression "document.getElementById('autopop').matches(':popover-open') + '|' + document.getElementById('submenu').matches(':popover-open')" | Should -Be 'true|true'
+        $before = Get-PageTrace
+        $point = Get-TestPoint $El
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 300
+        # The layer is in the menu on top of the popover stack (the sub-menu), not the last one in the page.
+        Get-TestPickerPlace | Should -Be 'submenu'
+        Send-TestClick $point
+        $r = Wait-TestPick
+        $r.state | Should -Be 'done' -Because "$($r['message']) $($r['notice'])"
+        @($r.result.candidates | ForEach-Object { $_.value }) | Should -Contain $Value
+        Invoke-CdpEval -Expression "document.getElementById('autopop').matches(':popover-open') + '|' + document.getElementById('submenu').matches(':popover-open') + '|' + JSON.stringify(window.__toggles) + JSON.stringify(window.__subToggles)" |
+            Should -Be 'true|true|["open"]["open"]' -Because 'neither menu may close, and the site must not see one close'
+        Assert-SiteUntouched
+        (Get-PageTrace) | Should -BeExactly $before
+    }
+
+    It 'keeps a menu inside a component (open shadow root) open: <Case>' -ForEach @(
+        @{ Case = 'a popover in a shadow root'; Kind = 1; Id = 'shadowmenu'; Place = 'shadowmenu'; Open = "document.getElementById('menuhost').shadowRoot.getElementById('shadowmenu')"; Item = "document.getElementById('menuhost').shadowRoot.getElementById('shadowitem')" }
+        @{ Case = 'a popover element that draws its content from its shadow root'; Kind = 2; Id = 'menuel'; Place = 'shadow:menuel'; Open = "document.getElementById('menuel')"; Item = "document.getElementById('menuel').shadowRoot.getElementById('elitem')" }
+    ) {
+        # Picking something outside the menu works and leaves the menu open.
+        Open-TestPage "/pickme?x=$($script:Web2)&shadowmenu=$Kind"
+        $before = Get-PageTrace
+        $point = Get-TestPoint "document.getElementById('fav')"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 300
+        $place = Invoke-CdpEval -Expression "(function () { var h = ($Open).querySelector('vouch-picker-ui') || (($Open).shadowRoot && ($Open).shadowRoot.querySelector('vouch-picker-ui')); return h ? 'inside' : 'outside'; })()"
+        $place | Should -Be 'inside' -Because 'the layer must be inside the open menu, or the press closes it'
+        Send-TestClick $point
+        $r = Wait-TestPick
+        $r.state | Should -Be 'done' -Because "$($r['message']) $($r['notice'])"
+        @($r.result.candidates | ForEach-Object { $_.value }) | Should -Contain '#fav'
+        Invoke-CdpEval -Expression "($Open).matches(':popover-open') + '|' + JSON.stringify(window.__shadowToggles)" | Should -Be "true|[`"${Id}:open`"]"
+        Assert-SiteUntouched
+        (Get-PageTrace) | Should -BeExactly $before
+        Invoke-CdpEval -Expression "(function () { var o = ($Open); return o.querySelectorAll('vouch-picker-ui').length + (o.shadowRoot ? o.shadowRoot.querySelectorAll('vouch-picker-ui').length : 0); })()" | Should -Be 0
+        # Pointing at the menu's own item: it is inside a component, so it cannot be recorded - said plainly, menu still open, nothing clicked.
+        $point = Get-TestPoint $Item
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 300
+        Send-TestClick $point
+        $r = Wait-TestPick
+        $r.state | Should -Be 'error'
+        $r.code | Should -Be 'shadow'
+        Invoke-CdpEval -Expression "($Open).matches(':popover-open') + '|' + JSON.stringify(window.__shadowToggles)" | Should -Be "true|[`"${Id}:open`"]"
+        Assert-SiteUntouched
+    }
+
+    It 'still picks when a menu hides its inside in a CLOSED shadow root (known limit: that menu closes at the press)' {
+        Open-TestPage "/pickme?x=$($script:Web2)&shadowmenu=3"
+        $point = Get-TestPoint "document.getElementById('fav')"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 600
+        # The layer cannot be drawn inside that menu, so it stays in the page - and the pick goes on.
+        Get-TestPickerPlace | Should -Be 'HTML'
+        (Get-ElementPickResult -State $script:B).state | Should -Be 'picking'
+        Send-TestClick $point
+        $r = Wait-TestPick
+        $r.state | Should -Be 'done' -Because "$($r['message']) $($r['notice'])"
+        @($r.result.candidates | ForEach-Object { $_.value }) | Should -Contain '#fav'
+        Assert-SiteUntouched
+        # The stated limit, as it is today: the browser closed the menu at the press.
+        Invoke-CdpEval -Expression 'JSON.stringify(window.__shadowToggles)' | Should -Be '["menuclosed:open","menuclosed:closed"]'
+    }
+
+    It 'follows menus the page opens and closes during the pick, and keeps its own keyboard focus when it moves' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        $point = Get-TestPoint "document.getElementById('fav')"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 300
+        # Opened by the page: the layer is inside before the page's script has even returned.
+        Invoke-CdpEval -Expression "document.getElementById('autopop').showPopover(); Promise.resolve().then(function () { var h = document.querySelector('vouch-picker-ui'); return h.parentNode.id + '|' + document.activeElement.tagName; })" | Should -Be 'autopop|VOUCH-PICKER-UI'
+        Start-Sleep -Milliseconds 300
+        Send-TestClick $point
+        $r = Wait-TestPick
+        $r.state | Should -Be 'done' -Because "$($r['message']) $($r['notice'])"
+        Invoke-CdpEval -Expression "document.getElementById('autopop').matches(':popover-open') + '|' + JSON.stringify(window.__toggles)" | Should -Be 'true|["open"]'
+        # Closed by the page with the layer inside: the layer is back over the page at once.
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 300
+        Get-TestPickerPlace | Should -Be 'autopop'
+        Invoke-CdpEval -Expression "document.getElementById('autopop').hidePopover(); Promise.resolve().then(function () { var h = document.querySelector('vouch-picker-ui'); return h.parentNode.nodeName + '|' + document.elementFromPoint(300, 300).tagName; })" | Should -Be 'HTML|VOUCH-PICKER-UI'
+        Start-Sleep -Milliseconds 300
+        Send-TestClick $point
+        $r = Wait-TestPick
+        $r.state | Should -Be 'done' -Because "$($r['message']) $($r['notice'])"
+        Assert-SiteUntouched
+    }
+
+    It 'does not count a menu''s own changes as repairs: a menu that keeps rewriting its rows can be picked in' {
+        Open-TestPage "/pickme?x=$($script:Web2)&autopop=1&live=1"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 1500
+        (Get-ElementPickResult -State $script:B).state | Should -Be 'picking' -Because 'twenty rows a second must not end the pick'
+        Get-TestPickerPlace | Should -Be 'autopop'
+        Send-TestClick (Get-TestPoint "document.getElementById('autobtn')")
+        $r = Wait-TestPick
+        $r.state | Should -Be 'done' -Because "$($r['message']) $($r['notice'])"
+        @($r.result.candidates | ForEach-Object { $_.value }) | Should -Contain 'Menu item'
+        Invoke-CdpEval -Expression "document.getElementById('autopop').matches(':popover-open') + '|' + JSON.stringify(window.__toggles) + JSON.stringify(window.__hits)" | Should -Be 'true|["open"][]'
+    }
+
+    It 'Esc cancels the pick and leaves the page''s open <Case> open' -ForEach @(
+        @{ Case = 'menu'; Query = 'autopop=1'; Probe = "document.getElementById('autopop').matches(':popover-open') + '|' + JSON.stringify(window.__toggles)"; Expected = 'true|["open"]' }
+        @{ Case = 'modal dialog'; Query = 'dialog=1'; Probe = "document.getElementById('dlg').open + '|' + JSON.stringify(window.__dlgEvents)"; Expected = 'true|[]' }
+    ) {
+        # Control: without a pick, Esc in the page closes it.
+        Open-TestPage "/pickme?x=$($script:Web2)&$Query"
+        Send-TestKey -Key 'Escape' -Code 27
+        Start-Sleep -Milliseconds 200
+        Invoke-CdpEval -Expression $Probe | Should -Not -Be $Expected
+        Open-TestPage "/pickme?x=$($script:Web2)&$Query"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 300
+        Send-TestKey -Key 'Escape' -Code 27
+        (Wait-TestPick).state | Should -Be 'cancelled'
+        Start-Sleep -Milliseconds 200
+        Invoke-CdpEval -Expression $Probe | Should -Be $Expected
+        Invoke-CdpEval -Expression "typeof window.__vouchPicker + '|' + document.querySelectorAll('vouch-picker-ui').length" | Should -Be 'undefined|0'
+    }
+
+    It 'lets no key edit a field the page focused inside a component: <Case>' -ForEach @(
+        @{ Case = 'open shadow root'; Field = "document.getElementById('fieldhost').shadowRoot.getElementById('shadowfield')"; Value = 'open words here' }
+        @{ Case = 'closed shadow root'; Field = 'window.__closedField'; Value = 'closed words here' }
+        @{ Case = 'the page itself'; Field = "document.getElementById('q')"; Value = 'find' }
+    ) {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 300
+        [void](Invoke-CdpEval -Expression "(function () { var f = ($Field); f.focus({ preventScroll: true }); f.setSelectionRange(f.value.length, f.value.length); return true; })()")
+        Send-TestChord -Key 'Backspace' -Code 8 -Modifiers 2                      # Ctrl+Backspace: delete a word
+        Send-TestChord -Key 'Delete' -Code 46 -Modifiers 2                        # Ctrl+Delete
+        Send-TestChord -Key '@' -Code 81 -Modifiers 3 -Text '@' -KeyCode 'KeyQ'   # AltGr+Q types @
+        Send-TestChord -Key 'x' -Code 88 -Text 'x' -KeyCode 'KeyX'                # a letter
+        Send-TestChord -Key 'a' -Code 65 -Modifiers 2 -KeyCode 'KeyA'             # Ctrl+A, then
+        Send-TestChord -Key 'Backspace' -Code 8                                   # Backspace would empty it
+        Send-TestChord -Key 'x' -Code 88 -Modifiers 2 -KeyCode 'KeyX'             # Ctrl+X
+        Send-TestChord -Key 'z' -Code 90 -Modifiers 2 -KeyCode 'KeyZ'             # Ctrl+Z
+        Start-Sleep -Milliseconds 200
+        Invoke-CdpEval -Expression "($Field).value" | Should -Be $Value
+        Invoke-CdpEval -Expression 'JSON.stringify(window.__inputs)' | Should -Be '[]'
+        (Get-ElementPickResult -State $script:B).state | Should -Be 'picking'
+        Assert-SiteUntouched
+        [void](Invoke-TestRoute POST '/api/pick/cancel' -State $script:B)
+    }
+
+    It 'does not open or change a list (a select element) the page focused: F4, Alt+Down, arrows, letters' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        $open = "(function () { try { return document.getElementById('sel').matches(':open'); } catch (e) { return 'unknown'; } })()"
+        # Control: without a pick, F4 opens the list (so the check below means something).
+        [void](Invoke-CdpEval -Expression "document.getElementById('sel').focus({ preventScroll: true }); true")
+        Send-TestChord -Key 'F4' -Code 115
+        Start-Sleep -Milliseconds 200
+        Invoke-CdpEval -Expression $open | Should -BeTrue
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 300
+        [void](Invoke-CdpEval -Expression "document.getElementById('sel').focus({ preventScroll: true }); true")
+        foreach ($press in @(@{ Key = 'F4'; Code = 115; Mod = 0 }, @{ Key = 'ArrowDown'; Code = 40; Mod = 1 }, @{ Key = 'ArrowDown'; Code = 40; Mod = 0 }, @{ Key = 'Enter'; Code = 13; Mod = 0 })) {
+            Send-TestChord -Key $press.Key -Code $press.Code -Modifiers $press.Mod
+            Start-Sleep -Milliseconds 150
+            Invoke-CdpEval -Expression $open | Should -BeFalse -Because "$($press.Key) (modifiers $($press.Mod)) must not open the list"
+        }
+        Send-TestChord -Key 't' -Code 84 -Text 't' -KeyCode 'KeyT'
+        Start-Sleep -Milliseconds 200
+        Invoke-CdpEval -Expression "document.getElementById('sel').value + '|' + window.__selChanges" | Should -Be 'One|0'
+        (Get-ElementPickResult -State $script:B).state | Should -Be 'picking'
+        Assert-SiteUntouched
+        [void](Invoke-TestRoute POST '/api/pick/cancel' -State $script:B)
+    }
+
+    It 'does not activate a <Case> the page focused: Enter, Ctrl+Enter, Alt+Enter, Shift+Enter, Space' -ForEach @(
+        @{ Case = 'link'; Id = 'keylink' }
+        @{ Case = 'button'; Id = 'akbtn' }
+    ) {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 300
+        [void](Invoke-CdpEval -Expression "document.getElementById('$Id').focus({ preventScroll: true }); true")
+        foreach ($mod in 0, 2, 1, 8) { Send-TestChord -Key 'Enter' -Code 13 -Modifiers $mod -Text "`r" }
+        Send-TestChord -Key ' ' -Code 32 -Text ' ' -KeyCode 'Space'
+        Start-Sleep -Milliseconds 200
+        # Not even the site's listeners on window saw a click (the keys' defaults were prevented, so the browser made none).
+        Assert-SiteUntouched
+        Invoke-CdpEval -Expression "document.activeElement.id" | Should -Be $Id
+        $r = Get-ElementPickResult -State $script:B
+        $r.state | Should -Be 'picking'
+        $r.notice | Should -BeNullOrEmpty
+        [void](Invoke-TestRoute POST '/api/pick/cancel' -State $script:B)
+    }
+
+    It 'cancels text the browser is about to insert, and ends the pick when a composition starts in a page field' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 300
+        [void](Invoke-CdpEval -Expression "document.getElementById('q').focus({ preventScroll: true }); true")
+        # Text committed in one go (how the emoji panel, clipboard history and voice typing deliver it): cancelled.
+        [void](Send-CdpCommand -Method 'Input.insertText' -Params @{ text = 'X' })
+        Start-Sleep -Milliseconds 200
+        Invoke-CdpEval -Expression "document.getElementById('q').value + '|' + JSON.stringify(window.__inputs)" | Should -Be 'find|[]'
+        (Get-ElementPickResult -State $script:B).state | Should -Be 'picking'
+        # A composition (an input method): it cannot be cancelled, so the pick ends and says so.
+        [void](Send-CdpCommand -Method 'Input.imeSetComposition' -Params @{ text = 'ka'; selectionStart = 2; selectionEnd = 2 })
+        $r = Wait-TestPick
+        $r.state | Should -Be 'error'
+        $r.code | Should -Be 'typing'
+        $r.message | Should -Match 'a field in the page started to change'
+        $r.message | Should -Match 'click Pick again or type the words in the Designer'
+        Invoke-CdpEval -Expression "typeof window.__vouchPicker + '|' + document.querySelectorAll('vouch-picker-ui').length" | Should -Be 'undefined|0'
+        Invoke-CdpEval -Expression 'JSON.stringify(window.__hits)' | Should -Be '[]'
+    }
+
+    It 'with the focus on the picking layer: Ctrl+Z does not undo the page''s typing, and a paste never reaches the page' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        [void](Invoke-CdpEval -Expression "(function () { var f = document.getElementById('q'); f.focus({ preventScroll: true }); f.setSelectionRange(4, 4); return true; })()")
+        Send-TestChord -Key 'z' -Code 90 -Text 'z' -KeyCode 'KeyZ'
+        Send-TestChord -Key 'y' -Code 89 -Text 'y' -KeyCode 'KeyY'
+        Invoke-CdpEval -Expression "document.getElementById('q').value" | Should -Be 'findzy'
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 300
+        Invoke-CdpEval -Expression 'document.activeElement.tagName' | Should -Be 'VOUCH-PICKER-UI'
+        [void](Invoke-CdpEval -Expression 'window.__inputs = []; true')
+        Send-TestChord -Key 'z' -Code 90 -Modifiers 2 -KeyCode 'KeyZ'
+        Send-TestChord -Key 'y' -Code 89 -Modifiers 2 -KeyCode 'KeyY'
+        Send-TestChord -Key 'v' -Code 86 -Modifiers 2 -KeyCode 'KeyV'
+        Send-TestChord -Key 'Insert' -Code 45 -Modifiers 8
+        Start-Sleep -Milliseconds 200
+        Invoke-CdpEval -Expression "document.getElementById('q').value + '|' + JSON.stringify(window.__inputs) + '|' + window.__pastes" | Should -Be 'findzy|[]|0'
+        # The keys were aimed at the layer and, being Ctrl combinations, kept their default (the browser's own shortcuts work).
+        Invoke-CdpEval -Expression "JSON.stringify(window.__keyEvents.filter(function (e) { return e.ctrlKey && e.key !== 'Control'; }).map(function (e) { return e.key + ':' + e.defaultPrevented; }))" | Should -Be '["z:false","y:false","v:false"]'
+        (Get-ElementPickResult -State $script:B).state | Should -Be 'picking'
+        [void](Invoke-TestRoute POST '/api/pick/cancel' -State $script:B)
+    }
+
+    It 'cancels the click of a page''s access key (Alt + letter), says so, and never picks from it' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        # Control: without a pick, Alt+K clicks the page's button.
+        Send-TestChord -Key 'k' -Code 75 -Modifiers 1 -Text 'k' -KeyCode 'KeyK'
+        Invoke-CdpEval -Expression 'JSON.stringify(window.__hits)' | Should -Be '["accesskey"]'
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        $before = Get-PageTrace
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 300
+        Send-TestChord -Key 'k' -Code 75 -Modifiers 1 -Text 'k' -KeyCode 'KeyK'
+        Send-TestChord -Key 'j' -Code 74 -Modifiers 1 -Text 'j' -KeyCode 'KeyJ'
+        Start-Sleep -Milliseconds 300
+        # The control did not act: no handler ran, the checkbox did not change, the title is the same.
+        Invoke-CdpEval -Expression "JSON.stringify(window.__hits) + '|' + document.getElementById('akcheck').checked + '|' + document.title" | Should -Be '[]|false|Pick me'
+        # What Edge does not let a page script stop (the stated limit): the focus moved to the
+        # page's control, and a listener of the site on window saw the click.
+        Invoke-CdpEval -Expression 'document.activeElement.id' | Should -Be 'akcheck'
+        Invoke-CdpEval -Expression 'JSON.stringify(window.__winHits)' | Should -Be '["click:akbtn","click:akcheck"]'
+        $r = Get-ElementPickResult -State $script:B
+        $r.state | Should -Be 'picking' -Because 'a click made by the browser for a key never picks'
+        $r.notice | Should -Match 'shortcut of this page'
+        # The person then picks with the mouse: what is under the pointer, not the access-key control.
+        [void](Invoke-CdpEval -Expression 'window.__winHits = []; true')
+        Send-TestClick (Get-TestPoint "document.getElementById('fav')")
+        $r = Wait-TestPick
+        $r.state | Should -Be 'done'
+        @($r.result.candidates | ForEach-Object { $_.value }) | Should -Contain '#fav'
+        Assert-SiteUntouched
+        [void](Invoke-CdpEval -Expression "document.activeElement.blur(); true")
+        (Get-PageTrace) | Should -BeExactly $before
+    }
+
+    It 'keeps keys from a same-site frame that <Case> during the pick' -ForEach @(
+        @{ Case = 'reloads'; Js = "new Promise(function (done) { var f = document.getElementById('sameframe'); f.addEventListener('load', function () { f.contentDocument.getElementById('framebtn').focus(); done(true); }, { once: true }); f.contentWindow.location.reload(); })"; Frame = "document.getElementById('sameframe')" }
+        @{ Case = 'is added'; Js = "new Promise(function (done) { var f = document.createElement('iframe'); f.id = 'lateframe'; f.src = '/pickframe'; f.addEventListener('load', function () { f.contentDocument.getElementById('framebtn').focus(); done(true); }); document.body.prepend(f); })"; Frame = "document.getElementById('lateframe')" }
+    ) {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 300
+        # The frame's new page focuses its own button as soon as it has loaded; Enter follows at once, several times over.
+        foreach ($round in 1..4) {
+            if ($round -gt 1 -and $Case -eq 'is added') { [void](Invoke-CdpEval -Expression "document.getElementById('lateframe').remove(); true") }
+            [void](Invoke-CdpEval -Expression $Js -TimeoutSec 10)
+            Send-TestChord -Key 'Enter' -Code 13 -Text "`r"
+            Send-TestChord -Key ' ' -Code 32 -Text ' ' -KeyCode 'Space'
+            Invoke-CdpEval -Expression "String(($Frame).contentDocument.body.getAttribute('data-clicks')) + '|' + JSON.stringify(window.__hits)" | Should -Be 'null|[]' -Because "round ${round}: the frame's new page must not get the key"
+            Start-Sleep -Milliseconds (60 * $round)
+        }
+        (Get-ElementPickResult -State $script:B).state | Should -Be 'picking'
+        # The page then focuses a field of its own, back in the top page: left alone (no focus fight), keys still do nothing.
+        [void](Invoke-CdpEval -Expression "document.getElementById('q').focus({ preventScroll: true }); true")
+        Start-Sleep -Milliseconds 500
+        Invoke-CdpEval -Expression 'document.activeElement.id' | Should -Be 'q'
+        Send-TestChord -Key 'x' -Code 88 -Text 'x' -KeyCode 'KeyX'
+        Invoke-CdpEval -Expression "document.getElementById('q').value" | Should -Be 'find'
+        (Get-ElementPickResult -State $script:B).state | Should -Be 'picking'
+        [void](Invoke-TestRoute POST '/api/pick/cancel' -State $script:B)
+    }
+
+    It 'takes the focus back from a frame hidden in a closed shadow root (its keys would never pass the picking layer)' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 300
+        [void](Invoke-CdpEval -TimeoutSec 10 -Expression "new Promise(function (done) { var c = document.createElement('div'); c.id = 'closedframe'; document.body.prepend(c); var r = c.attachShadow({ mode: 'closed' }); var f = document.createElement('iframe'); f.src = '/pickframe'; f.onload = function () { window.__cf = f; f.contentDocument.getElementById('framebtn').focus(); done(true); }; r.appendChild(f); })")
+        Start-Sleep -Milliseconds 300
+        Send-TestChord -Key 'Enter' -Code 13 -Text "`r"
+        Start-Sleep -Milliseconds 200
+        Invoke-CdpEval -Expression "String(window.__cf.contentDocument.body.getAttribute('data-clicks')) + '|' + JSON.stringify(window.__hits)" | Should -Be 'null|[]'
+        $r = Get-ElementPickResult -State $script:B
+        $r.state | Should -BeIn 'picking', 'error'
+        if ($r.state -eq 'error') { $r.code | Should -Be 'focus' }
+        else { Invoke-CdpEval -Expression 'document.activeElement.tagName' | Should -Be 'VOUCH-PICKER-UI' }
+        [void](Invoke-TestRoute POST '/api/pick/cancel' -State $script:B)
+    }
+
+    It 'shields a page that reloads by itself during a pick until the picker is back: no click or key reaches the fresh page' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        $fav = Get-TestPoint "document.getElementById('fav')"
+        $inFrame = Get-TestPoint "document.getElementById('sameframe').contentDocument.getElementById('framebtn')"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Start-Sleep -Milliseconds 300
+        $ready = "new Promise(function (done) { var t = function () { (document.readyState === 'complete' && window.__hits && document.getElementById('sameframe').contentDocument.getElementById('framebtn')) ? done(true) : setTimeout(t, 20); }; t(); })"
+        # The page reloads itself. The server is NOT asked in between (no poll), so the picker is not back yet.
+        [void](Send-CdpCommand -Method 'Page.reload')
+        [void](Invoke-CdpEval -Expression $ready -TimeoutSec 10)
+        Invoke-CdpEval -Expression "typeof window.__vouchPicker + '|' + !!(window.__vouchPicker && window.__vouchPicker.shield) + '|' + document.querySelectorAll('vouch-picker-ui').length" | Should -Be 'object|true|0'
+        Send-TestClick $fav
+        Send-TestClick $inFrame
+        [void](Invoke-CdpEval -Expression "document.getElementById('akbtn').focus({ preventScroll: true }); true")
+        Send-TestChord -Key 'Enter' -Code 13 -Text "`r"
+        [void](Invoke-CdpEval -Expression "document.getElementById('q').focus({ preventScroll: true }); true")
+        Send-TestChord -Key 'x' -Code 88 -Text 'x' -KeyCode 'KeyX'
+        [void](Send-CdpCommand -Method 'Input.insertText' -Params @{ text = 'X' })
+        Start-Sleep -Milliseconds 200
+        Invoke-CdpEval -Expression "document.getElementById('q').value + '|' + String(document.getElementById('sameframe').contentDocument.body.getAttribute('data-clicks'))" | Should -Be 'find|null'
+        # The shield came before every listener of the site: not even those on window saw anything.
+        Assert-SiteUntouched
+        # The next poll puts the picker back (it replaces the shield), and picking goes on.
+        $r = Get-ElementPickResult -State $script:B
+        $r.state | Should -Be 'picking'
+        Start-Sleep -Milliseconds 300
+        Invoke-CdpEval -Expression "!!window.__vouchPicker.shield + '|' + document.querySelectorAll('vouch-picker-ui').length + '|' + typeof document.getElementById('sameframe').contentWindow.__vouchPicker" | Should -Be 'false|1|undefined'
+        Send-TestClick (Get-TestPoint "document.getElementById('fav')")
+        $r = Wait-TestPick
+        $r.state | Should -Be 'done' -Because "$($r['message']) $($r['notice'])"
+        @($r.result.candidates | ForEach-Object { $_.value }) | Should -Contain '#fav'
+        Assert-SiteUntouched
+        # After the pick the shield is taken back: a page loaded now is the site's own again, at once.
+        [void](Send-CdpCommand -Method 'Page.reload')
+        [void](Invoke-CdpEval -Expression $ready -TimeoutSec 10)
+        Invoke-CdpEval -Expression 'typeof window.__vouchPicker' | Should -Be 'undefined'
+        Send-TestClick (Get-TestPoint "document.getElementById('fav')")
+        Invoke-CdpEval -Expression 'JSON.stringify(window.__hits)' | Should -Be '["fav"]'
+    }
+
+    It 'lets the shield end by itself after 4 seconds, so a page is never left dead if the picker does not come back' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        try {
+            [void](Send-CdpCommand -Method 'Page.reload')
+            Start-Sleep -Milliseconds 1500
+            Invoke-CdpEval -Expression '!!(window.__vouchPicker && window.__vouchPicker.shield)' | Should -BeTrue
+            Start-Sleep -Milliseconds 3200
+            Invoke-CdpEval -Expression 'typeof window.__vouchPicker' | Should -Be 'undefined'
+            Send-TestClick (Get-TestPoint "document.getElementById('fav')")
+            Invoke-CdpEval -Expression 'JSON.stringify(window.__hits)' | Should -Be '["fav"]'
+        }
+        finally {
+            [void](Invoke-TestRoute POST '/api/pick/cancel' -State $script:B)
+            $script:B.Pick.ShieldId | Should -BeNullOrEmpty
+        }
     }
 
     It 'says to type it in the Designer when the page changes under every click, and clears a note at the next press' {
@@ -2540,6 +2957,12 @@ Describe 'Browser link and picker in headless Edge (functions called directly)' 
         $r.Data.zoom.page | Should -Be 'Zoomed'
         [int](Invoke-CdpEval -Expression 'window.innerWidth') | Should -Be ($base * 2)
         (Invoke-TestRoute GET '/api/state' -State $script:B).Data.browser.zoom.percent | Should -Be 50
+        # A pick in between turns the browser's Page domain on and off (for its shield): the preview stays as it is.
+        [void](Start-ElementPick -State $script:B -Mode click)
+        $script:B.Pick.ShieldId | Should -Not -BeNullOrEmpty
+        (Invoke-TestRoute POST '/api/pick/cancel' -State $script:B).Data.state | Should -Be 'cancelled'
+        $script:B.Pick.ShieldId | Should -BeNullOrEmpty
+        [int](Invoke-CdpEval -Expression 'window.innerWidth') | Should -Be ($base * 2)
         $r = Invoke-TestRoute POST '/api/browser/navigate' -Body @{ url = "$($script:Base)/ok"; config = $config; pageIndex = 1 } -State $script:B
         $r.Data.zoom.percent | Should -Be 100
         [int](Invoke-CdpEval -Expression 'window.innerWidth') | Should -Be $base
