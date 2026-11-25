@@ -6323,6 +6323,21 @@ function Test-ReportIntegrity {
 
         $manifestLines = [System.Collections.Generic.List[string]]::new()
         $number = 0
+        # Vouch shows each screenshot file once. A report that names one again is failed
+        # for it once, and no image is read or hashed a second time: otherwise a small
+        # report naming one large file thousands of times keeps -Verify busy for minutes.
+        # Names and paths are compared as Windows compares them, ignoring case.
+        $seenFiles = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $seenPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        # Path -> hash of every image file read here, for the SHA256SUMS check further down.
+        $hashByPath = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $repeatReported = $false
+        $reportRepeat = {
+            param([string]$Name)
+            if (-not $repeatReported) {
+                & $add 'Report' $false "The report shows the screenshot file '$Name' more than once; a report made by Vouch shows each file once. Repeated screenshots were not checked again."
+            }
+        }
         foreach ($image in $images) {
             $number++
             $attributes = $image.Attributes
@@ -6331,6 +6346,7 @@ function Test-ReportIntegrity {
             $listed = & $read 'data-sha256'
             $label = if ($file) { $file } else { "#$number" }
             $manifestLines.Add("$listed  $file")
+            if ($file -and -not $seenFiles.Add($file)) { & $reportRepeat $file; $repeatReported = $true; continue }
             if ($listed -cnotmatch '^[0-9a-f]{64}$') {
                 & $add "Image $label" $false 'the report lists no valid SHA-256 hash for it'
                 continue
@@ -6348,11 +6364,13 @@ function Test-ReportIntegrity {
                 else {
                     $located = Resolve-ReportImagePath -ReportDirectory $reportDirectory -Source $source
                     if ($located.Problem) { & $add "Image $label" $false "not checked: $($located.Problem)"; continue }
+                    if (-not $seenPaths.Add($located.Path)) { & $reportRepeat $file; $repeatReported = $true; continue }
                     if (-not (Test-Path -LiteralPath $located.Path -PathType Leaf)) {
                         & $add "Image $label" $false "the image file '$source' is missing (a linked report needs its images folder next to it)"
                         continue
                     }
                     $bytes = [System.IO.File]::ReadAllBytes($located.Path)
+                    $hashByPath[$located.Path] = Get-Sha256Hex -Bytes $bytes
                 }
             }
             catch {
@@ -6360,7 +6378,7 @@ function Test-ReportIntegrity {
                 continue
             }
 
-            $actual = Get-Sha256Hex -Bytes $bytes
+            $actual = if ($source -match '^\s*data:') { Get-Sha256Hex -Bytes $bytes } else { $hashByPath[$located.Path] }
             & $add "Image $label" ($actual -eq $listed) $(if ($actual -eq $listed) { "SHA-256 $actual" } else { "hash is $actual, report lists $listed" })
 
             $metadata = $null
@@ -6407,7 +6425,7 @@ function Test-ReportIntegrity {
                 if ($located.Problem) { & $add "File $name" $false "not checked: $($located.Problem)"; continue }
                 $filePath = $located.Path
                 if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) { & $add "File $name" $false 'missing'; continue }
-                $actual = Get-Sha256Hex -Bytes ([System.IO.File]::ReadAllBytes($filePath))
+                $actual = if ($hashByPath.ContainsKey($filePath)) { $hashByPath[$filePath] } else { Get-Sha256Hex -Bytes ([System.IO.File]::ReadAllBytes($filePath)) }
                 & $add "File $name" ($actual -eq $expected) $(if ($actual -eq $expected) { 'matches' } else { "hash is $actual, expected $expected" })
             }
         }

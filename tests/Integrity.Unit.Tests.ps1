@@ -1129,3 +1129,68 @@ Describe '-Verify on files that are not reports, and on very many faults (fix ro
         }
     }
 }
+
+Describe '-Verify reads and hashes each screenshot once (fix round 5)' {
+    BeforeAll {
+        $script:ShotTag = '<img alt="[^"]*" data-file="003_Admin_users_seg01\.jpg"[^>]*>'
+    }
+
+    It 'fails a linked report that shows one large image file <Count> times, once, in seconds' -ForEach @(@{ Count = 2 }, @{ Count = 5000 }) {
+        $folder = Join-Path $TestDrive "linked-$Count"
+        $report = New-TestReport -Folder $folder -Linked
+        # 20 MB: hashing it for every tag would take minutes.
+        $file = Join-Path $folder 'images\report\003_Admin_users_seg01.jpg'
+        $stream = [System.IO.File]::Open($file, [System.IO.FileMode]::Append)
+        try { $stream.Write([byte[]]::new(20MB), 0, 20MB) } finally { $stream.Dispose() }
+        $html = [System.IO.File]::ReadAllText($report)
+        $tag = [regex]::Match($html, $script:ShotTag).Value
+        [System.IO.File]::WriteAllText($report, $html.Replace($tag, ($tag * $Count)), [System.Text.UTF8Encoding]::new($false))
+        # Counts the times the large file is hashed (the mock itself never runs).
+        $script:BigHashes = 0
+        Mock Get-Sha256Hex { 'x' } -ParameterFilter { if ($Bytes.Length -gt 10MB) { $script:BigHashes++ }; $false }
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $results = @(Test-ReportIntegrity -Path $report)
+        $watch.Stop()
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 20
+        $script:BigHashes | Should -Be 1 -Because 'neither a repeated tag nor the SHA256SUMS check may hash the file again'
+        @($results | Where-Object Check -eq 'File 003_Admin_users_seg01.jpg').Count | Should -Be 1
+        $repeat = @($results | Where-Object Detail -like "The report shows the screenshot file '003_Admin_users_seg01.jpg' more than once*")
+        $repeat.Count | Should -Be 1
+        $repeat[0].Ok | Should -BeFalse
+        @($results | Where-Object Check -eq 'Image 003_Admin_users_seg01.jpg').Count | Should -Be 1
+        @($results | Where-Object Check -eq 'Image 003_Admin_users_seg02.jpg').Count | Should -Be 1
+        ($results | Where-Object Check -eq 'Manifest').Ok | Should -BeFalse
+    }
+
+    It 'fails a self-contained report that shows one screenshot 300 times, once, without hashing it again' {
+        $folder = Join-Path $TestDrive 'embedded'
+        $report = New-TestReport -Folder $folder
+        $html = [System.IO.File]::ReadAllText($report)
+        $tag = [regex]::Match($html, $script:ShotTag).Value
+        # A payload of 50 KB in every copy: 15 MB of report.
+        $big = [regex]::Replace($tag, 'base64,[A-Za-z0-9+/=]+', { 'base64,' + ('A' * 50000) })
+        [System.IO.File]::WriteAllText($report, $html.Replace($tag, ($big * 300)), [System.Text.UTF8Encoding]::new($false))
+        $script:Hashed = 0
+        Mock Get-Sha256Hex { 'x' } -ParameterFilter { if ($Bytes.Length -eq 37500) { $script:Hashed++ }; $false }
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $results = @(Test-ReportIntegrity -Path $report)
+        $watch.Stop()
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 20
+        $script:Hashed | Should -Be 1
+        @($results | Where-Object Detail -like 'The report shows the screenshot file*more than once*').Count | Should -Be 1
+        @($results | Where-Object Check -eq 'Image 003_Admin_users_seg01.jpg').Count | Should -Be 1
+        ($results | Where-Object Check -eq 'Manifest').Ok | Should -BeFalse
+    }
+
+    It 'treats a file name that differs only in case as the same file' {
+        $folder = Join-Path $TestDrive 'case'
+        $report = New-TestReport -Folder $folder -Linked
+        $html = [System.IO.File]::ReadAllText($report)
+        $figure = [regex]::Match($html, '(?s)<figure>.*?</figure>\r\n').Value
+        $twin = $figure.Replace('003_Admin_users_seg01.jpg', '003_ADMIN_users_seg01.jpg')
+        [System.IO.File]::WriteAllText($report, $html.Replace($figure, $figure + $twin), [System.Text.UTF8Encoding]::new($false))
+        $results = @(Test-ReportIntegrity -Path $report)
+        @($results | Where-Object Detail -like 'The report shows the screenshot file*more than once*').Count | Should -Be 1
+        @($results | Where-Object Check -like 'Image 003_A*seg01.jpg').Count | Should -Be 1
+    }
+}
