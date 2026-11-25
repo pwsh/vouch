@@ -337,10 +337,11 @@ Describe 'Resolve-RunSettings' {
             KeepBrowserOpen = [switch]$false; FailOnWarning = [switch]$false; LogDir = ''
             JsonSummary = [switch]$false; UseVirtualDesktop = [switch]$false; Verify = ''
             LoginSetup = [switch]$false; ConfigPath = ''; Only = [string[]]@()
+            CaptureArea = 'screen'; ZoomPercent = 100
         }
         $config = '{
             "browser":  { "profileDir": "C:\\cfg-profile", "debugPort": 9333, "keepBrowserOpen": true },
-            "defaults": { "navigationTimeoutSec": 45, "settleSeconds": 0.5, "maxScrollSegments": 12 },
+            "defaults": { "navigationTimeoutSec": 45, "settleSeconds": 0.5, "maxScrollSegments": 12, "captureArea": "page", "zoomPercent": 80 },
             "output":   { "dir": "C:\\cfg-out", "reportName": "", "imageFormat": "png", "saveImages": true }
         }' | ConvertFrom-Json
     }
@@ -371,6 +372,15 @@ Describe 'Resolve-RunSettings' {
         $settings.ImageFormat | Should -Be 'png'
         $settings.SaveImages | Should -BeTrue
         $settings.KeepBrowserOpen | Should -BeTrue
+        $settings.CaptureArea | Should -Be 'page'
+        $settings.ZoomPercent | Should -Be 80
+        $settings.ZoomPercent | Should -BeOfType [int]
+    }
+
+    It 'takes -CaptureArea and -ZoomPercent typed on the command line over the config' {
+        $settings = Resolve-RunSettings -BoundParameters @{ CaptureArea = 'window'; ZoomPercent = 150 } -Defaults $defaults -Config $config
+        $settings.CaptureArea | Should -Be 'window'
+        $settings.ZoomPercent | Should -Be 150
     }
 
     It 'keeps the default where the config is silent or blank' {
@@ -927,14 +937,23 @@ Describe 'Configuration file' {
             foreach ($n in 1, 2) {
                 $config['pages'].Add([ordered]@{ overrides = [ordered]@{ zoomPercent = 80; settleSeconds = 1 } })
             }
+            $config['defaults']['account'] = 'svc-audit'
             $inactive = Get-InactiveConfigSetting -Config $config
             $inactive | Should -Be @(
-                'defaults.captureArea', 'output.embedImages', 'output.zip.enabled', 'report.title', 'report.period.label', 'page overrides: zoomPercent')
+                'defaults.account', 'output.embedImages', 'output.zip.enabled', 'report.title', 'report.period.label')
+        }
+
+        It 'no longer lists the capture area and zoom, which now work' {
+            $config = Get-DefaultVouchConfig
+            $config['defaults']['captureArea'] = 'window'
+            $config['defaults']['zoomPercent'] = 150
+            $config['pages'].Add([ordered]@{ overrides = [ordered]@{ captureArea = 'page'; zoomPercent = 80 } })
+            (Get-InactiveConfigSetting -Config $config).Count | Should -Be 0
         }
     }
 
     Context 'Get-InactiveConfigSetting for page actions' {
-        It 'lists pause actions and one-tall-image captures, and no longer lists waitFor' {
+        It 'lists pause actions, and no longer lists waitFor or one-tall-image captures' {
             $config = Get-DefaultVouchConfig
             $config['defaults']['waitFor'] = '#ready'
             $config['pages'].Add([ordered]@{ overrides = [ordered]@{ waitFor = '#grid' }; actions = @(
@@ -944,7 +963,7 @@ Describe 'Configuration file' {
                     [ordered]@{ type = 'capture'; scroll = [ordered]@{ mode = 'none'; as = 'single' } }
                     [ordered]@{ type = 'pause' }) })
             $inactive = Get-InactiveConfigSetting -Config $config
-            $inactive | Should -Be @('page actions: pause', 'page actions: capture scroll "as": "single"')
+            $inactive | Should -Be @('page actions: pause')
         }
     }
 
@@ -1058,6 +1077,19 @@ Describe 'Browser-internal tabs' {
         Test-InternalPageTarget -Target ([pscustomobject]@{ url = $Url }) | Should -Be $Internal
     }
 
+    It 'classifies <Url> as <Kind>, the one rule both tab decisions use' -ForEach @(
+        @{ Url = 'edge://sync-confirmation-dialog/'; Kind = 'browser' }
+        @{ Url = 'CHROME://newtab/'; Kind = 'browser' }
+        @{ Url = 'devtools://devtools/bundled/inspector.html'; Kind = 'tool' }
+        @{ Url = 'edge-extension://abc/popup.html'; Kind = 'tool' }
+        @{ Url = 'chrome-extension://abc/options.html'; Kind = 'tool' }
+        @{ Url = 'about:blank'; Kind = 'web' }
+        @{ Url = 'https://intranet.example/edge://x'; Kind = 'web' }
+    ) {
+        Get-PageTargetKind -Target ([pscustomobject]@{ url = $Url }) | Should -Be $Kind
+        Get-PageTargetKind -Target ([pscustomobject]@{ id = 'no url' }) | Should -Be 'web'
+    }
+
     It 'Get-CdpPageTarget skips the sync dialog Edge lists first' {
         Mock Get-DevToolsTargetList {
             [pscustomobject]@{ id = 'sync'; type = 'page'; url = 'edge://sync-confirmation-dialog/'; webSocketDebuggerUrl = 'ws://x/sync' }
@@ -1107,5 +1139,225 @@ Describe 'Get-ScreenCapture' -Tag 'Desktop' {
             $image.Height | Should -Be $bounds.Height
         }
         finally { $image.Dispose(); $stream.Dispose() }
+    }
+}
+
+Describe 'Capture area: window crop' {
+    BeforeAll { Add-Type -AssemblyName System.Drawing }
+
+    It 'keeps a window that is fully on the screen as it is (<Case>)' -ForEach @(
+        @{ Case = 'at the origin'; Window = @(0, 0, 1600, 900); Screen = @(0, 0, 2560, 1440); Expected = @(0, 0, 1600, 900) }
+        @{ Case = 'inside'; Window = @(100, 50, 800, 600); Screen = @(0, 0, 1920, 1080); Expected = @(100, 50, 800, 600) }
+    ) {
+        $rect = Get-WindowCaptureRectangle -WindowBounds ([System.Drawing.Rectangle]::new($Window[0], $Window[1], $Window[2], $Window[3])) `
+            -ScreenBounds ([System.Drawing.Rectangle]::new($Screen[0], $Screen[1], $Screen[2], $Screen[3]))
+        @($rect.X, $rect.Y, $rect.Width, $rect.Height) | Should -Be $Expected
+    }
+
+    It 'clips a window that hangs over the edges of the screen' {
+        $rect = Get-WindowCaptureRectangle -WindowBounds ([System.Drawing.Rectangle]::new(-50, -20, 800, 600)) `
+            -ScreenBounds ([System.Drawing.Rectangle]::new(0, 0, 1920, 1080))
+        @($rect.X, $rect.Y, $rect.Width, $rect.Height) | Should -Be @(0, 0, 750, 580)
+        $rect = Get-WindowCaptureRectangle -WindowBounds ([System.Drawing.Rectangle]::new(1500, 900, 800, 600)) `
+            -ScreenBounds ([System.Drawing.Rectangle]::new(0, 0, 1920, 1080))
+        @($rect.X, $rect.Y, $rect.Width, $rect.Height) | Should -Be @(1500, 900, 420, 180)
+    }
+
+    It 'gives coordinates inside the screen image when the primary display does not start at 0,0' {
+        $rect = Get-WindowCaptureRectangle -WindowBounds ([System.Drawing.Rectangle]::new(-1000, 100, 500, 400)) `
+            -ScreenBounds ([System.Drawing.Rectangle]::new(-1920, 0, 1920, 1080))
+        @($rect.X, $rect.Y, $rect.Width, $rect.Height) | Should -Be @(920, 100, 500, 400)
+    }
+
+    It 'returns nothing for a window that is <Case>' -ForEach @(
+        @{ Case = 'on another monitor'; Window = @(2000, 0, 800, 600) }
+        @{ Case = 'minimised (parked at -32000)'; Window = @(-32000, -32000, 160, 28) }
+        @{ Case = 'empty'; Window = @(10, 10, 0, 0) }
+        @{ Case = 'touching the edge only'; Window = @(1920, 0, 800, 600) }
+    ) {
+        Get-WindowCaptureRectangle -WindowBounds ([System.Drawing.Rectangle]::new($Window[0], $Window[1], $Window[2], $Window[3])) `
+            -ScreenBounds ([System.Drawing.Rectangle]::new(0, 0, 1920, 1080)) | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Page zoom: the device metrics override' {
+    It 'zooms <Percent>% from a <Width>x<Height> window to a <ExpectedWidth>x<ExpectedHeight> layout' -ForEach @(
+        @{ Percent = 50; Width = 1256; Height = 708; ExpectedWidth = 2512; ExpectedHeight = 1416 }
+        @{ Percent = 80; Width = 1256; Height = 708; ExpectedWidth = 1570; ExpectedHeight = 885 }
+        @{ Percent = 125; Width = 5112; Height = 1308; ExpectedWidth = 4090; ExpectedHeight = 1046 }
+        @{ Percent = 150; Width = 1256; Height = 708; ExpectedWidth = 837; ExpectedHeight = 472 }
+    ) {
+        $metrics = Get-ZoomDeviceMetrics -Width $Width -Height $Height -ZoomPercent $Percent
+        $metrics.width | Should -Be $ExpectedWidth
+        $metrics.height | Should -Be $ExpectedHeight
+        $metrics.scale | Should -Be ($Percent / 100)
+        # Measured in a headed window: only this combination fills the window.
+        $metrics.deviceScaleFactor | Should -Be 0
+        $metrics.mobile | Should -BeFalse
+        $metrics.dontSetVisibleSize | Should -BeTrue
+        $metrics | Should -BeOfType [hashtable]
+    }
+
+    It 'reads the capture area and zoom of a page, defaulting to the screen at 100%' {
+        $mode = Get-PageCaptureMode -Settings ([pscustomobject]@{ CaptureArea = 'Page'; ZoomPercent = 150 })
+        $mode.Area | Should -BeExactly 'page'
+        $mode.ZoomPercent | Should -Be 150
+        $mode = Get-PageCaptureMode -Settings ([pscustomobject]@{ CaptureArea = ''; ZoomPercent = 0 })
+        $mode.Area | Should -Be 'screen'
+        $mode.ZoomPercent | Should -Be 100
+        (Get-PageCaptureMode -Settings ([pscustomobject]@{ SettleSeconds = 1 })).Area | Should -Be 'screen'
+    }
+
+    It 'sets the zoom from the unzoomed window and records it only once it applied' {
+        $script:Sent = [System.Collections.Generic.List[object]]::new()
+        Mock Send-CdpCommand { $script:Sent.Add([pscustomobject]@{ Method = $Method; Params = $Params }) }
+        Mock Invoke-CdpEval { [pscustomobject]@{ width = 1256; height = 708 } }
+        Set-PageZoom -Percent 150
+        @($script:Sent.Method) | Should -Be @('Emulation.clearDeviceMetricsOverride', 'Emulation.setDeviceMetricsOverride')
+        $script:Sent[1].Params.width | Should -Be 837
+        $script:PageZoomPercent | Should -Be 150
+        Clear-PageZoom
+        $script:PageZoomPercent | Should -Be 100
+        $script:Sent[-1].Method | Should -Be 'Emulation.clearDeviceMetricsOverride'
+    }
+
+    It 'leaves the zoom at 100 when it cannot be applied' {
+        Mock Send-CdpCommand { if ($Method -eq 'Emulation.setDeviceMetricsOverride') { throw 'boom' } }
+        Mock Invoke-CdpEval { [pscustomobject]@{ width = 1256; height = 708 } }
+        $script:PageZoomPercent = 80
+        { Set-PageZoom -Percent 150 } | Should -Throw '*boom*'
+        $script:PageZoomPercent | Should -Be 100
+    }
+}
+
+Describe 'One tall image: the height limit' {
+    It 'an output of <Css> CSS px x <Ratio> x <Zoom>% is <Output> px high: fits <Fits>' -ForEach @(
+        @{ Css = 16096; Ratio = 1; Zoom = 100; Output = 16096; Fits = $true }
+        @{ Css = 16384; Ratio = 1; Zoom = 100; Output = 16384; Fits = $true }
+        @{ Css = 16385; Ratio = 1; Zoom = 100; Output = 16385; Fits = $false }
+        @{ Css = 12000; Ratio = 1; Zoom = 150; Output = 18000; Fits = $false }
+        @{ Css = 30000; Ratio = 1; Zoom = 50; Output = 15000; Fits = $true }
+        @{ Css = 10000; Ratio = 1.5; Zoom = 100; Output = 15000; Fits = $true }
+        @{ Css = 10000; Ratio = 2; Zoom = 100; Output = 20000; Fits = $false }
+        @{ Css = 100.2; Ratio = 1; Zoom = 100; Output = 101; Fits = $true }
+    ) {
+        $plan = Get-SingleImagePlan -CssHeight $Css -DevicePixelRatio $Ratio -ZoomPercent $Zoom
+        $plan.OutputHeight | Should -Be $Output
+        $plan.Fits | Should -Be $Fits
+    }
+}
+
+Describe 'Reading a screenshot response without ConvertFrom-Json' {
+    BeforeAll {
+        function ConvertTo-TestMessage([string]$Json) { , [System.Text.Encoding]::UTF8.GetBytes($Json) }
+    }
+
+    It 'decodes result.data of the awaited response' {
+        $data = [byte[]](1, 2, 3, 250)
+        $answer = ConvertFrom-CdpDataResponse -MessageId 7 -Method 'Page.captureScreenshot' `
+            -Message (ConvertTo-TestMessage "{""id"":7,""result"":{""data"":""$([Convert]::ToBase64String($data))""}}")
+        , $answer.Data | Should -BeOfType [byte[]]
+        $answer.Data | Should -Be $data
+    }
+
+    It 'skips events and other responses' {
+        ConvertFrom-CdpDataResponse -MessageId 7 -Method 'm' -Message (ConvertTo-TestMessage '{"method":"Page.loadEventFired","params":{}}') | Should -BeNullOrEmpty
+        ConvertFrom-CdpDataResponse -MessageId 7 -Method 'm' -Message (ConvertTo-TestMessage '{"id":6,"result":{"data":"AQ=="}}') | Should -BeNullOrEmpty
+    }
+
+    It 'throws the browser''s error' {
+        { ConvertFrom-CdpDataResponse -MessageId 7 -Method 'Page.captureScreenshot' -Message (ConvertTo-TestMessage '{"id":7,"error":{"code":-32000,"message":"Unable to capture"}}') } |
+            Should -Throw "*'Page.captureScreenshot' failed: Unable to capture*"
+    }
+
+    It 'returns no bytes for a result without data' {
+        (ConvertFrom-CdpDataResponse -MessageId 7 -Method 'm' -Message (ConvertTo-TestMessage '{"id":7,"result":{}}')).Data.Length | Should -Be 0
+    }
+}
+
+Describe 'Capture area and zoom in the report and the JSON summary' {
+    BeforeAll {
+        $run = [pscustomobject]@{
+            StartTime = 's'; EndTime = 'e'; TimeZone = 'tz'; Computer = 'c'; User = 'u'; OperatingSystem = 'os'
+            EdgeVersion = 'Edg'; BrowserInstance = 'b'; CaptureDesktop = 'd'; ToolVersion = 't'; CsvPath = 'x'; ImageFormat = 'jpeg'
+            ImageDescription = 'JPEG'; ScreenResolution = 'r'; Total = 1; OkCount = 1; WarnCount = 0; FailCount = 0; CaptureCount = 1
+        }
+        function New-AreaItem([string]$Area, [int]$Zoom) {
+            $captures = [System.Collections.Generic.List[object]]::new()
+            $captures.Add((New-CaptureRecord -Bytes ([byte[]](1, 2, 3)) -Url 'https://a/' -SegmentIndex 1 -SegmentCount 1 -FileName 'f.jpg' -CaptureArea $Area -ZoomPercent $Zoom))
+            $item = New-CaptureItem -Definition ([pscustomobject]@{ Index = 1; Name = 'A'; Url = 'https://a/'; Notes = ''; StepsText = ''; ScrollFullPage = $false })
+            $item.CaptureArea = $Area
+            $item.ZoomPercent = $Zoom
+            foreach ($capture in $captures) { $item.Captures.Add($capture) }
+            return $item
+        }
+    }
+
+    It 'describes <Area> at <Zoom>% as "<Pattern>"' -ForEach @(
+        @{ Area = 'screen'; Zoom = 100; Pattern = 'Full screen, including the taskbar clock</dd>' }
+        @{ Area = 'window'; Zoom = 100; Pattern = 'Edge window only*no taskbar or clock)</dd>' }
+        @{ Area = 'page'; Zoom = 150; Pattern = 'Page content only*URL and capture time are under each image*; page zoom 150%</dd>' }
+    ) {
+        $html = New-HtmlReport -Items @((New-AreaItem $Area $Zoom)) -Run $run
+        $line = @($html -split "`n" | Where-Object { $_ -like '<dt>Capture area</dt>*' })
+        $line.Count | Should -Be 1
+        $line[0].TrimEnd() | Should -BeLike "*$Pattern"
+    }
+
+    It 'keeps the screen wording of the report for screen captures, and drops the clock promise otherwise' {
+        $screen = New-HtmlReport -Items @((New-AreaItem 'screen' 100)) -Run $run
+        $screen | Should -Match 'including the Windows taskbar clock\.</p>'
+        $screen | Should -Match 'unretouched captures of the primary display\.</footer>'
+        $page = New-HtmlReport -Items @((New-AreaItem 'page' 100)) -Run $run
+        $page | Should -Not -Match 'taskbar clock\.</p>'
+        $page | Should -Match 'the page content as rendered by Edge'
+    }
+
+    It 'reads an item without the new fields as a screen capture' {
+        $old = [pscustomobject]@{
+            Index = 1; Name = 'A'; Url = 'https://a/'; FinalUrl = ''; Notes = ''; StepsText = ''; ScrollFullPage = $false
+            Status = 'OK'; HttpStatus = 200; Details = [System.Collections.Generic.List[string]]::new()
+            StepLog = [System.Collections.Generic.List[object]]::new(); Captures = [System.Collections.Generic.List[object]]::new()
+        }
+        New-HtmlReport -Items @($old) -Run $run | Should -Match '<dt>Capture area</dt><dd>Full screen, including the taskbar clock</dd>'
+    }
+
+    It 'lists the capture area and zoom of each page and image in the JSON summary' {
+        $summary = ConvertTo-RunSummaryJson -Items @((New-AreaItem 'page' 80)) -Run $run -ReportPath 'r.html' -ExitCode 0 | ConvertFrom-Json
+        $summary.Items[0].CaptureArea | Should -Be 'page'
+        $summary.Items[0].ZoomPercent | Should -Be 80
+        $summary.Items[0].Captures[0].CaptureArea | Should -Be 'page'
+        $summary.Items[0].Captures[0].ZoomPercent | Should -Be 80
+    }
+}
+
+Describe 'Get-PageSettings and -CaptureArea / -ZoomPercent on the command line' {
+    It 'keeps the typed values over the page override and the configuration' {
+        $run = Resolve-RunSettings -BoundParameters @{ CaptureArea = 'window'; ZoomPercent = 125 } -Config $null -Defaults @{ NavigationTimeoutSec = 30 }
+        $config = Get-DefaultVouchConfig
+        $config['defaults']['zoomPercent'] = 90
+        $page = [pscustomobject]@{ Overrides = [ordered]@{ captureArea = 'page'; zoomPercent = 80 } }
+        $settings = Get-PageSettings -Settings $run -Definition $page -Config $config -BoundNames 'CaptureArea', 'ZoomPercent'
+        $settings.CaptureArea | Should -Be 'window'
+        $settings.ZoomPercent | Should -Be 125
+        $settings = Get-PageSettings -Settings $run -Definition $page -Config $config
+        $settings.CaptureArea | Should -Be 'page'
+        $settings.ZoomPercent | Should -Be 80
+    }
+}
+
+Describe 'A waitFor action that times out, on a German PC' {
+    BeforeAll {
+        $originalCulture = [System.Globalization.CultureInfo]::CurrentCulture
+        [System.Globalization.CultureInfo]::CurrentCulture = [System.Globalization.CultureInfo]::new('de-DE')
+    }
+    AfterAll { [System.Globalization.CultureInfo]::CurrentCulture = $originalCulture }
+
+    It 'writes the seconds with a dot' {
+        Mock Wait-PageElement { $false }
+        $entry = Invoke-PageAction -Action ([ordered]@{ type = 'waitFor'; selector = '#late'; timeoutSec = 1.5 }) `
+            -Settings ([pscustomobject]@{ NavigationTimeoutSec = 30; SettleSeconds = 0 })
+        $entry.Ok | Should -BeFalse
+        $entry.Message | Should -BeLike "*'#late' within 1.5 second(s)*"
     }
 }

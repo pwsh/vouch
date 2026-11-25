@@ -9,7 +9,8 @@
     screen captures (GDI CopyFromScreen) of the primary display, so the Windows taskbar
     clock is part of every image. Long pages are captured as a series of viewport
     segments. Everything is assembled into a single self-contained HTML report with
-    base64-embedded images.
+    base64-embedded images. -CaptureArea can narrow the images to the Edge window or to
+    the page content only (see below).
 
 .PARAMETER CsvPath
     Path to the capture definition CSV. Header: Name,Url,Steps,ScrollFullPage,Notes
@@ -45,6 +46,19 @@
     Capture on a fresh virtual desktop (Task View) that the run opens and closes again,
     so other open applications are not in the taskbar of the evidence. Pinned taskbar
     icons still show. The report's Desktop line records whether the switch was confirmed.
+
+.PARAMETER CaptureArea
+    What each screenshot shows. screen (default): the whole primary display, with the
+    taskbar clock. window: the Edge window only (title bar, tabs and address bar; no
+    taskbar). page: the page content only, taken by the browser itself - Edge does not
+    need to be in front, but the image has no address bar or clock (the capture time
+    and URL are in the report and inside each image file). A configuration file sets
+    it per run (defaults.captureArea) or per page (overrides).
+
+.PARAMETER ZoomPercent
+    Shows the pages zoomed, 25 to 500 (default 100), like Ctrl+plus/minus but without
+    changing anything in the Edge profile; the page reflows to the zoomed width. Set per
+    run or per page (defaults.zoomPercent / overrides) in a configuration file.
 
 .PARAMETER JsonSummary
     Also write the results as JSON next to the report (same name, .json): run metadata
@@ -119,6 +133,12 @@ param(
 
     [switch]$UseVirtualDesktop,
 
+    [ValidateSet('screen', 'window', 'page')]
+    [string]$CaptureArea = 'screen',
+
+    [ValidateRange(25, 500)]
+    [int]$ZoomPercent = 100,
+
     [string]$Verify = '',
 
     [switch]$LoginSetup
@@ -138,6 +158,8 @@ $script:EdgeProcess       = $null
 $script:BrowserWsUrl      = ''
 $script:LaunchedEdge      = $false
 $script:ReusedEdge        = $false
+# The page zoom in effect on the current DevTools connection (Set-PageZoom); 100 = none.
+$script:PageZoomPercent   = 100
 
 # DevTools binds to the IPv4 loopback only; "localhost" can resolve to ::1 and fail.
 $script:CdpHost = '127.0.0.1'
@@ -242,6 +264,48 @@ namespace Vouch
 }
 '@
         Add-Type -TypeDefinition $code -Language CSharp
+    }
+
+    # Window geometry is a type of its own, with its own check: a PowerShell session
+    # keeps a compiled type until it ends, so one that already loaded Vouch.Native from
+    # an older vouch.ps1 would never see members added to it. A new type name loads
+    # beside the old one.
+    if (-not ('Vouch.WindowGeometry' -as [type])) {
+        $geometryCode = @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace Vouch
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct WindowRect
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    public static class WindowGeometry
+    {
+        // DWMWA_EXTENDED_FRAME_BOUNDS: the window as drawn on screen, without the
+        // invisible resize borders that GetWindowRect includes.
+        public const int ExtendedFrameBounds = 9;
+
+        [DllImport("dwmapi.dll")]
+        public static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out WindowRect pvAttribute, int cbAttribute);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetWindowRect(IntPtr hWnd, out WindowRect lpRect);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsZoomed(IntPtr hWnd);
+    }
+}
+'@
+        Add-Type -TypeDefinition $geometryCode -Language CSharp
     }
 
     # Without this, CopyFromScreen returns a scaled/cropped image on displays with
@@ -1375,14 +1439,13 @@ function Select-VouchPage {
 
 function Get-InactiveConfigSetting {
     <#
-        TEMPORARY - shrink as each setting starts working (capture area and zoom,
-        prompts and pause actions, report fields, zip, open when done).
+        TEMPORARY - shrink as each setting starts working (prompts and pause actions,
+        report fields, zip, open when done).
         Settings the file may set that this engine does not apply yet. A non-default
         value is listed so the user is told it had no effect rather than finding out
         from the evidence. Returns the setting paths, each once.
-        Two page actions are listed as well: "pause" (skipped with a warning by
-        Invoke-PageAction until the prompt exists) and a capture with "as": "single"
-        (one tall image needs page-content capture; it is taken as segments for now).
+        The "pause" page action is listed as well: Invoke-PageAction skips it with a
+        warning until the prompt exists.
     #>
     param([Parameter(Mandatory)][System.Collections.IDictionary]$Config)
 
@@ -1394,7 +1457,7 @@ function Get-InactiveConfigSetting {
         if ($Value -is [string] -and [string]::IsNullOrWhiteSpace($Value) -and [string]::IsNullOrWhiteSpace([string]$Default)) { return }
         if ($Value -ne $Default -and -not $names.Contains($Name)) { $names.Add($Name) }
     }
-    $pageKeys = 'account', 'captureArea', 'zoomPercent', 'onNotReady', 'promptTimeoutSec'
+    $pageKeys = 'account', 'onNotReady', 'promptTimeoutSec'
     foreach ($key in $pageKeys) { & $check "defaults.$key" $Config['defaults'][$key] $defaults['defaults'][$key] }
     foreach ($key in 'embedImages', 'openReport') { & $check "output.$key" $Config['output'][$key] $defaults['output'][$key] }
     & $check 'output.zip.enabled' $Config['output']['zip']['enabled'] $false
@@ -1411,10 +1474,6 @@ function Get-InactiveConfigSetting {
             if ($action -isnot [System.Collections.IDictionary]) { continue }
             $type = Get-VouchActionType -Type $action['type']
             if ($type -eq 'pause') { & $check 'page actions: pause' $true $false }
-            if ($type -eq 'capture' -and $action['scroll'] -is [System.Collections.IDictionary] -and
-                $action['scroll']['as'] -eq 'single' -and $action['scroll']['mode'] -and $action['scroll']['mode'] -ne 'none') {
-                & $check 'page actions: capture scroll "as": "single"' $true $false
-            }
         }
         if ($page['overrides'] -isnot [System.Collections.IDictionary]) { continue }
         foreach ($key in $pageKeys) { & $check "page overrides: $key" $page['overrides'][$key] $defaults['defaults'][$key] }
@@ -1524,6 +1583,25 @@ function Get-DevToolsTargetList {
     $response | ForEach-Object { $_ }
 }
 
+function Get-PageTargetKind {
+    <#
+        What a "page" target in /json/list really is. Edge lists its own pages and tools
+        as page targets like any web page, and two decisions depend on telling them
+        apart (which tab to attach to, which tabs to close), so both read this one
+        classification:
+        'browser' - Edge's own pages (edge://, chrome://), e.g. the sync dialog a fresh
+                    profile opens on a work-joined PC;
+        'tool'    - DevTools windows and extension pages (devtools://, chrome-extension://,
+                    edge-extension://), which belong to something else;
+        'web'     - everything else, the pages a run can use.
+    #>
+    param([AllowNull()][object]$Target)
+    $url = if ($null -ne $Target -and $Target.PSObject.Properties['url']) { [string]$Target.url } else { '' }
+    if ($url -match '^(?i)(edge|chrome)://') { return 'browser' }
+    if ($url -match '^(?i)(devtools|chrome-extension|edge-extension)://') { return 'tool' }
+    return 'web'
+}
+
 function Test-InternalPageTarget {
     <#
         Browser-internal tabs (edge://, chrome://, devtools:// and extension pages) are
@@ -1532,8 +1610,7 @@ function Test-InternalPageTarget {
         run that took the first page attached to that dialog instead of its own tab.
     #>
     param([AllowNull()][object]$Target)
-    $url = if ($null -ne $Target -and $Target.PSObject.Properties['url']) { [string]$Target.url } else { '' }
-    return $url -match '^(?i)(edge|chrome|devtools|chrome-extension|edge-extension)://'
+    return (Get-PageTargetKind -Target $Target) -ne 'web'
 }
 
 function Get-CdpPageTarget {
@@ -1609,8 +1686,7 @@ function Close-OtherPageTargets {
     foreach ($target in $targets) {
         if (-not $target.PSObject.Properties['type'] -or $target.type -ne 'page') { continue }
         if ([string]$target.id -eq $KeepId) { continue }
-        $url = if ($target.PSObject.Properties['url']) { [string]$target.url } else { '' }
-        if ($url -match '^(?i)(devtools|chrome-extension|edge-extension)://') { continue }
+        if ((Get-PageTargetKind -Target $target) -eq 'tool') { continue }
         try { [void](Invoke-RestMethod -Uri "http://$($script:CdpHost):$Port/json/close/$($target.id)" -TimeoutSec 10 -NoProxy) }
         catch { Write-Verbose "Could not close tab $($target.id): $($_.Exception.Message)" }
     }
@@ -1649,30 +1725,49 @@ function Restore-CdpConnection {
         Cancelling a ClientWebSocket receive (which is how a CDP timeout is implemented)
         aborts the socket for good. Open a fresh connection to the same tab so one slow
         page does not fail every row after it; if the tab is gone, attach to another.
+        The page zoom (Set-PageZoom) belongs to the connection that set it and is gone
+        with it, so it is set again on the new one.
     #>
     $url = $script:CdpWebSocketUrl
     Close-CdpSocket
+    $connected = $false
     try {
         Connect-CdpSocket -WebSocketUrl $url
-        return
+        $connected = $true
     }
     catch {
         Write-Verbose "Reconnecting to the same tab failed: $($_.Exception.Message)"
     }
-    if ($script:CdpPort -le 0) { throw 'The DevTools connection was lost and could not be re-established.' }
-    $target = Get-CdpPageTarget -Port $script:CdpPort
-    if ($null -eq $target -or -not $target.PSObject.Properties['webSocketDebuggerUrl']) {
-        throw 'The DevTools connection was lost and no page target is available to reconnect to.'
+    if (-not $connected) {
+        if ($script:CdpPort -le 0) { throw 'The DevTools connection was lost and could not be re-established.' }
+        $target = Get-CdpPageTarget -Port $script:CdpPort
+        if ($null -eq $target -or -not $target.PSObject.Properties['webSocketDebuggerUrl']) {
+            throw 'The DevTools connection was lost and no page target is available to reconnect to.'
+        }
+        Connect-CdpSocket -WebSocketUrl ([string]$target.webSocketDebuggerUrl)
     }
-    Connect-CdpSocket -WebSocketUrl ([string]$target.webSocketDebuggerUrl)
+
+    $zoom = $script:PageZoomPercent
+    if ($zoom -ne 100) {
+        try { Set-PageZoom -Percent $zoom }
+        catch {
+            # Set-PageZoom leaves the zoom recorded as 100, so the captures say what they show.
+            Write-Host "WARNING: the page zoom of $zoom% could not be set again after reconnecting to Edge; the page is shown at 100%: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
 }
 
 function Receive-CdpMessage {
     <#
         Reads exactly one WebSocket message. CDP payloads routinely exceed any single
         buffer, so frames are accumulated until EndOfMessage before decoding.
+        -AsBytes returns the raw UTF-8 bytes instead of a string: a screenshot response
+        can be tens of megabytes, and every text copy of it costs that again.
     #>
-    param([Parameter(Mandatory)][datetime]$Deadline)
+    param(
+        [Parameter(Mandatory)][datetime]$Deadline,
+        [switch]$AsBytes
+    )
 
     $buffer = [byte[]]::new(65536)
     $segment = [System.ArraySegment[byte]]::new($buffer)
@@ -1706,6 +1801,7 @@ function Receive-CdpMessage {
             if ($result.EndOfMessage) { break }
         }
 
+        if ($AsBytes) { return , $stream.ToArray() }
         return [System.Text.Encoding]::UTF8.GetString($stream.ToArray())
     }
     finally {
@@ -1717,11 +1813,16 @@ function Send-CdpCommand {
     <#
         Synchronous request/response over CDP: send a command with an incrementing id,
         then read messages until the matching response arrives, discarding events.
+        -ReturnDataBytes is for screenshots: it returns result.data decoded from base64
+        as a byte[], read with System.Text.Json straight from the received bytes.
+        ConvertFrom-Json builds the whole response as one string and a full-page PNG
+        response of ~77 MB took ~1.8 GB of memory that way.
     #>
     param(
         [Parameter(Mandatory)][string]$Method,
         [hashtable]$Params = @{},
-        [int]$TimeoutSec = 0
+        [int]$TimeoutSec = 0,
+        [switch]$ReturnDataBytes
     )
 
     if ($TimeoutSec -le 0) { $TimeoutSec = $script:CdpDefaultTimeout }
@@ -1748,6 +1849,11 @@ function Send-CdpCommand {
 
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     while ($true) {
+        if ($ReturnDataBytes) {
+            $answer = ConvertFrom-CdpDataResponse -Message (Receive-CdpMessage -Deadline $deadline -AsBytes) -MessageId $messageId -Method $Method
+            if ($null -ne $answer) { return , $answer.Data }
+            continue
+        }
         $raw = Receive-CdpMessage -Deadline $deadline
         $message = $raw | ConvertFrom-Json
 
@@ -1760,6 +1866,56 @@ function Send-CdpCommand {
         }
         if ($message.PSObject.Properties['result']) { return $message.result }
         return $null
+    }
+}
+
+function ConvertFrom-CdpDataResponse {
+    <#
+        Reads one raw CDP message for Send-CdpCommand -ReturnDataBytes. Returns $null
+        when it is not the awaited response (an event, or a stale reply), throws the
+        browser's error, and otherwise returns { Data = byte[] } with result.data
+        decoded from base64 (empty when the result has no data). System.Text.Json reads
+        the UTF-8 bytes in place and decodes the base64 directly, so no string copy of
+        a large screenshot is ever made.
+    #>
+    param(
+        [Parameter(Mandatory)][byte[]]$Message,
+        [Parameter(Mandatory)][int]$MessageId,
+        [Parameter(Mandatory)][string]$Method
+    )
+    $stream = [System.IO.MemoryStream]::new($Message, $false)
+    $document = [System.Text.Json.JsonDocument]::Parse($stream)
+    try {
+        # PowerShell cannot pick among TryGetProperty's overloads, so the properties are
+        # looked up by walking them.
+        $find = {
+            param([System.Text.Json.JsonElement]$Element, [string]$Name)
+            if ($Element.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $null }
+            foreach ($property in $Element.EnumerateObject()) {
+                if ($property.Name -ceq $Name) { return , $property.Value }
+            }
+            return $null
+        }
+        $root = $document.RootElement
+        $id = & $find $root 'id'
+        if ($null -eq $id -or $id.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or $id.GetInt64() -ne $MessageId) { return $null }
+        $errorElement = & $find $root 'error'
+        if ($null -ne $errorElement) {
+            $text = & $find $errorElement 'message'
+            $errorText = if ($null -ne $text) { $text.ToString() } else { $errorElement.GetRawText() }
+            throw "CDP command '$Method' failed: $errorText"
+        }
+        $data = $null
+        $result = & $find $root 'result'
+        if ($null -ne $result) { $data = & $find $result 'data' }
+        if ($null -ne $data -and $data.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
+            return [pscustomobject]@{ Data = $data.GetBytesFromBase64() }
+        }
+        return [pscustomobject]@{ Data = [byte[]]::new(0) }
+    }
+    finally {
+        $document.Dispose()
+        $stream.Dispose()
     }
 }
 
@@ -1858,6 +2014,152 @@ function Wait-PageReady {
 
 #endregion
 
+#region Page zoom and page-content capture ---------------------------------------
+
+function Get-ZoomDeviceMetrics {
+    <#
+        The Emulation.setDeviceMetricsOverride parameters that zoom a page the way
+        Ctrl+plus/minus does: the layout gets W/z x H/z CSS pixels and is drawn at scale z
+        into the unchanged window, so it reflows and fills the window exactly. Measured in
+        a headed, maximised Edge: deviceScaleFactor alone changes nothing on screen, and
+        scale without dontSetVisibleSize letterboxes or cuts off the page. deviceScaleFactor
+        0 keeps the screen's own pixel ratio, so sites do not switch to high-DPI images.
+        -Width/-Height: window.innerWidth/innerHeight measured with no override active.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$Width,
+        [Parameter(Mandatory)][int]$Height,
+        [Parameter(Mandatory)][ValidateRange(25, 500)][int]$ZoomPercent
+    )
+    $scale = $ZoomPercent / 100.0
+    return @{
+        width              = [int][Math]::Round($Width / $scale)
+        height             = [int][Math]::Round($Height / $scale)
+        deviceScaleFactor  = 0
+        mobile             = $false
+        scale              = $scale
+        dontSetVisibleSize = $true
+    }
+}
+
+function Set-PageZoom {
+    <#
+        Zooms the page in the connected tab (Get-ZoomDeviceMetrics). Nothing is stored in
+        the Edge profile: the override belongs to this DevTools connection, survives
+        navigation and redirects, and disappears when the connection closes - which is
+        why Restore-CdpConnection sets it again and $script:PageZoomPercent remembers it.
+        The window must already have its final size: the zoom is computed from it.
+        100 removes any zoom. On failure the zoom is left at 100 and the error thrown.
+    #>
+    param([Parameter(Mandatory)][ValidateRange(25, 500)][int]$Percent)
+
+    # Recorded as 100 until it really applies, so a reconnect in the middle of this
+    # does not try to apply it from inside itself, and captures never claim a zoom
+    # the page does not show.
+    $script:PageZoomPercent = 100
+    [void](Send-CdpCommand -Method 'Emulation.clearDeviceMetricsOverride' -TimeoutSec 10)
+    if ($Percent -eq 100) { return }
+
+    $size = Invoke-CdpEval -Expression '({ width: window.innerWidth, height: window.innerHeight })' -TimeoutSec 10
+    $width = if ($null -ne $size) { [int]$size.width } else { 0 }
+    $height = if ($null -ne $size) { [int]$size.height } else { 0 }
+    if ($width -le 0 -or $height -le 0) {
+        throw 'the browser window reported no size, so the zoom could not be worked out.'
+    }
+    $metrics = Get-ZoomDeviceMetrics -Width $width -Height $height -ZoomPercent $Percent
+    [void](Send-CdpCommand -Method 'Emulation.setDeviceMetricsOverride' -Params $metrics -TimeoutSec 10)
+    $script:PageZoomPercent = $Percent
+}
+
+function Clear-PageZoom {
+    <#
+        Shows the page at 100% again. Also called at the end of every run: the Designer
+        keeps Edge open, and a page left zoomed would puzzle the person using it.
+    #>
+    $script:PageZoomPercent = 100
+    [void](Send-CdpCommand -Method 'Emulation.clearDeviceMetricsOverride' -TimeoutSec 10)
+}
+
+function Get-SingleImagePlan {
+    <#
+        Whether a whole document fits in one image. Page.captureScreenshot returns an
+        image of the full requested size above 16,384 pixels, but past that height it
+        silently repeats the top of the page (measured, no error) - so the height the
+        image WILL have is worked out before capturing: CSS height x the screen's pixel
+        ratio x the zoom scale. Pure.
+    #>
+    param(
+        [Parameter(Mandatory)][double]$CssHeight,
+        [double]$DevicePixelRatio = 1,
+        [int]$ZoomPercent = 100,
+        [int]$MaxHeight = 16384
+    )
+    if ($DevicePixelRatio -le 0) { $DevicePixelRatio = 1 }
+    $outputHeight = [int][Math]::Ceiling($CssHeight * $DevicePixelRatio * ($ZoomPercent / 100.0))
+    return [pscustomobject]@{ OutputHeight = $outputHeight; Fits = ($outputHeight -le $MaxHeight -and $outputHeight -gt 0) }
+}
+
+function Get-PageContentSize {
+    <#
+        The size of the whole document in CSS pixels (Page.getLayoutMetrics, which is
+        exact - window.scrollHeight misses margins) and the screen's pixel ratio, for a
+        one-image capture.
+    #>
+    $metrics = Send-CdpCommand -Method 'Page.getLayoutMetrics' -TimeoutSec 10
+    $content = if ($metrics.PSObject.Properties['cssContentSize']) { $metrics.cssContentSize } else { $metrics.contentSize }
+    $ratio = 1.0
+    try { $ratio = [double](Invoke-CdpEval -Expression 'window.devicePixelRatio' -TimeoutSec 10) }
+    catch { Write-Verbose "Could not read the pixel ratio: $($_.Exception.Message)" }
+    return [pscustomobject]@{
+        Width            = [double]$content.width
+        Height           = [double]$content.height
+        DevicePixelRatio = $ratio
+    }
+}
+
+function Get-PageCapture {
+    <#
+        An image of the page content only, taken by the browser (Page.captureScreenshot):
+        no window, focus or visible desktop is needed, and it contains no address bar,
+        taskbar or clock. The image comes back already encoded in the run's format, so
+        a JPEG is compressed once only.
+        Without -Clip: what the window shows now. The clip is the visible part of the
+        document in document coordinates (cssVisualViewport pageX/pageY), and scale z
+        makes the image the size it has on screen - a capture under the zoom override
+        otherwise comes back at the emulated CSS size. The window's scroll bar is not
+        part of the page and is left out.
+        With -Clip @{ x; y; width; height } (CSS pixels): that part of the whole document,
+        beyond the window (one tall image). Get-SingleImagePlan must have said it fits.
+        Returns the encoded image (no Vouch metadata yet).
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('jpeg', 'png')][string]$Format,
+        [int]$Quality = 85,
+        [int]$ZoomPercent = 100,
+        [System.Collections.IDictionary]$Clip = $null
+    )
+    $scale = $ZoomPercent / 100.0
+    $params = @{ format = $Format }
+    if ($Format -eq 'jpeg') { $params.quality = $Quality }
+    $timeoutSec = 30
+    if ($null -ne $Clip) {
+        $params.clip = @{ x = [double]$Clip.x; y = [double]$Clip.y; width = [double]$Clip.width; height = [double]$Clip.height; scale = $scale }
+        $params.captureBeyondViewport = $true
+        # A 16,000 px PNG of a busy page is ~77 MB of base64 and took 2 s; leave room.
+        $timeoutSec = 120
+    }
+    else {
+        $metrics = Send-CdpCommand -Method 'Page.getLayoutMetrics' -TimeoutSec 10
+        $view = if ($metrics.PSObject.Properties['cssVisualViewport']) { $metrics.cssVisualViewport } else { $metrics.visualViewport }
+        $params.clip = @{ x = [double]$view.pageX; y = [double]$view.pageY; width = [double]$view.clientWidth; height = [double]$view.clientHeight; scale = $scale }
+    }
+    $bytes = Send-CdpCommand -Method 'Page.captureScreenshot' -Params $params -TimeoutSec $timeoutSec -ReturnDataBytes
+    if ($null -eq $bytes -or $bytes.Length -eq 0) { throw 'The browser returned an empty page image.' }
+    return , $bytes
+}
+
+#endregion
+
 #region Window focus and screen capture ---------------------------------------
 
 function Get-EdgeWindowHandle {
@@ -1926,6 +2228,74 @@ function Set-EdgeForeground {
         }
     }
     return $null
+}
+
+function Set-EdgeWindowMaximized {
+    <#
+        Maximises the Edge window ahead of the page, without waiting for the capture.
+        A page zoom is computed from the window's size (Set-PageZoom), so the window must
+        already have the size it will be captured at; Set-EdgeForeground maximises it
+        only right before the screenshot. Called only for zoomed screen and window
+        captures, so runs at 100% behave exactly as before. A window that cannot be found
+        is left to Set-EdgeForeground to report.
+    #>
+    param(
+        [int]$TimeoutSec = 3,
+        [string]$ExpectedTitle = ''
+    )
+    $handle = Get-EdgeWindowHandle -TimeoutSec $TimeoutSec -ExpectedTitle $ExpectedTitle
+    if ($handle -eq [IntPtr]::Zero) { return }
+    if ([Vouch.WindowGeometry]::IsZoomed($handle)) { return }
+    [void][Vouch.Native]::ShowWindow($handle, 3)   # SW_MAXIMIZE
+    # The page learns its new size a moment after the window changes.
+    Start-Sleep -Milliseconds 500
+}
+
+function Get-PrimaryScreenBounds {
+    # The primary display in screen coordinates: what Get-ScreenCapture grabs.
+    return [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+}
+
+function Get-EdgeWindowBounds {
+    <#
+        Where the Edge window is on screen, as a Rectangle, or $null when the window is
+        not found. DWMWA_EXTENDED_FRAME_BOUNDS is the window as drawn: GetWindowRect adds
+        invisible resize borders of about 7 px on each side (8 px past the screen edge
+        for a maximised window), which would put a strip of whatever is behind the window
+        into the evidence. GetWindowRect is only the fallback when DWM cannot answer.
+    #>
+    param(
+        [int]$TimeoutSec = 5,
+        [string]$ExpectedTitle = ''
+    )
+    $handle = Get-EdgeWindowHandle -TimeoutSec $TimeoutSec -ExpectedTitle $ExpectedTitle
+    if ($handle -eq [IntPtr]::Zero) { return $null }
+    $rect = [Vouch.WindowRect]::new()
+    $size = [System.Runtime.InteropServices.Marshal]::SizeOf([type][Vouch.WindowRect])
+    if ([Vouch.WindowGeometry]::DwmGetWindowAttribute($handle, [Vouch.WindowGeometry]::ExtendedFrameBounds, [ref]$rect, $size) -ne 0) {
+        if (-not [Vouch.WindowGeometry]::GetWindowRect($handle, [ref]$rect)) { return $null }
+    }
+    return [System.Drawing.Rectangle]::FromLTRB($rect.Left, $rect.Top, $rect.Right, $rect.Bottom)
+}
+
+function Get-WindowCaptureRectangle {
+    <#
+        The part of the screen image to keep for a window-only capture: the window's
+        bounds clipped to the primary display (what Get-ScreenCapture grabs), in that
+        image's own coordinates. $null when nothing of the window is on the primary
+        display - minimised, on another monitor, or empty bounds - so the caller can fall
+        back to the whole screen. Display scaling needs no handling here: the process is
+        DPI-aware (Initialize-NativeInterop), so both rectangles are in physical pixels.
+        Pure.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Drawing.Rectangle]$WindowBounds,
+        [Parameter(Mandatory)][System.Drawing.Rectangle]$ScreenBounds
+    )
+    if ($WindowBounds.Width -le 0 -or $WindowBounds.Height -le 0) { return $null }
+    $visible = [System.Drawing.Rectangle]::Intersect($WindowBounds, $ScreenBounds)
+    if ($visible.Width -le 0 -or $visible.Height -le 0) { return $null }
+    return [System.Drawing.Rectangle]::new($visible.X - $ScreenBounds.X, $visible.Y - $ScreenBounds.Y, $visible.Width, $visible.Height)
 }
 
 function Send-KeyChord {
@@ -2046,7 +2416,9 @@ function New-CaptureMetadata {
     <#
         What each image carries inside itself, so it still says what it is when it is
         separated from the report: which page, when (local with offset, and UTC), which
-        run, by whom and where.
+        run, by whom and where - and what the image shows: the whole screen, the Edge
+        window or the page content only (CaptureArea; Screen then describes that image),
+        at which page zoom.
     #>
     param(
         [Parameter(Mandatory)][string]$RunId,
@@ -2059,7 +2431,9 @@ function New-CaptureMetadata {
         [Parameter(Mandatory)][int]$SegmentCount,
         [string]$Computer = $env:COMPUTERNAME,
         [string]$User = "$env:USERDOMAIN\$env:USERNAME",
-        [string]$Screen = ''
+        [string]$Screen = '',
+        [ValidateSet('screen', 'window', 'page')][string]$CaptureArea = 'screen',
+        [int]$ZoomPercent = 100
     )
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
     return [ordered]@{
@@ -2075,6 +2449,8 @@ function New-CaptureMetadata {
         Computer      = $Computer
         User          = $User
         Screen        = $Screen
+        CaptureArea   = $CaptureArea
+        ZoomPercent   = $ZoomPercent
     }
 }
 
@@ -2289,7 +2665,24 @@ function Get-ScreenCapture {
         [System.Collections.IDictionary]$Metadata = $null
     )
 
-    $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $bitmap = Get-ScreenBitmap
+    try {
+        $bytes = ConvertTo-EvidenceImage -Bitmap $bitmap -Format $Format -Quality $Quality -Metadata $Metadata
+        # The leading comma keeps the byte array intact instead of streaming it out byte by byte.
+        return , $bytes
+    }
+    finally {
+        $bitmap.Dispose()
+    }
+}
+
+function Get-ScreenBitmap {
+    <#
+        The primary display as a bitmap (GDI CopyFromScreen): the raw grab shared by the
+        screen and window capture areas. The caller disposes it. Requires an unlocked,
+        visible desktop.
+    #>
+    $bounds = Get-PrimaryScreenBounds
     $bitmap = [System.Drawing.Bitmap]::new($bounds.Width, $bounds.Height, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
     try {
         $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
@@ -2299,41 +2692,185 @@ function Get-ScreenCapture {
         finally {
             $graphics.Dispose()
         }
+    }
+    catch {
+        $bitmap.Dispose()
+        throw
+    }
+    return $bitmap
+}
 
-        $stream = [System.IO.MemoryStream]::new()
+function Get-WindowCapture {
+    <#
+        Window-only capture: the screen is grabbed exactly as for a screen capture and
+        cut down to the Edge window (-Rectangle from Get-WindowCaptureRectangle), so the
+        title bar, tabs and address bar are in the evidence and the taskbar and other
+        windows are not. Cutting a real screen grab, rather than asking Windows to draw
+        the window, keeps what is captured what the person saw.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Drawing.Rectangle]$Rectangle,
+        [Parameter(Mandatory)][ValidateSet('jpeg', 'png')][string]$Format,
+        [int]$Quality = 85,
+        [System.Collections.IDictionary]$Metadata = $null
+    )
+    $screen = Get-ScreenBitmap
+    try {
+        $window = $screen.Clone($Rectangle, $screen.PixelFormat)
         try {
-            $encoder = $null
-            if ($Format -eq 'jpeg') {
-                $encoder = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() |
-                    Where-Object { $_.MimeType -eq 'image/jpeg' } |
-                    Select-Object -First 1
-            }
-            if ($null -ne $encoder) {
-                if ($null -ne $Metadata) { Set-JpegMetadata -Image $bitmap -Metadata $Metadata }
-                $encoderParameters = [System.Drawing.Imaging.EncoderParameters]::new(1)
-                try {
-                    $encoderParameters.Param[0] = [System.Drawing.Imaging.EncoderParameter]::new([System.Drawing.Imaging.Encoder]::Quality, [int64]$Quality)
-                    $bitmap.Save($stream, $encoder, $encoderParameters)
-                }
-                finally {
-                    $encoderParameters.Dispose()
-                }
-                # The leading comma keeps the byte array intact instead of streaming it out byte by byte.
-                return , $stream.ToArray()
-            }
-
-            # PNG (asked for, or no JPEG encoder available).
-            $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
-            $png = $stream.ToArray()
-            if ($null -ne $Metadata) { $png = Add-PngTextChunks -Png $png -Metadata $Metadata }
-            return , $png
+            $bytes = ConvertTo-EvidenceImage -Bitmap $window -Format $Format -Quality $Quality -Metadata $Metadata
+            return , $bytes
         }
         finally {
-            $stream.Dispose()
+            $window.Dispose()
         }
     }
     finally {
-        $bitmap.Dispose()
+        $screen.Dispose()
+    }
+}
+
+function Get-JpegEncoder {
+    # GDI+'s JPEG encoder, or $null on the rare system without one (PNG is used then).
+    return [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() |
+        Where-Object { $_.MimeType -eq 'image/jpeg' } |
+        Select-Object -First 1
+}
+
+function ConvertTo-EvidenceImage {
+    <#
+        The one place an image becomes evidence: encoded in the run's format with the
+        Vouch metadata inside it (EXIF for JPEG, text chunks for PNG). Every capture
+        area goes through here, so the metadata, and with it -Verify, work the same for
+        all of them.
+        -Bitmap (screen and window captures): encoded here, exactly as screen captures
+        always were - the bytes do not change with this split.
+        -EncodedImage (page captures): an image the browser already encoded in -Format.
+        It is not decoded and encoded again - that would compress a JPEG twice; the
+        metadata is added to the file as it is (Add-JpegExifSegment, Add-PngTextChunks).
+    #>
+    param(
+        [Parameter(Mandatory, ParameterSetName = 'Bitmap')][System.Drawing.Bitmap]$Bitmap,
+        [Parameter(Mandatory, ParameterSetName = 'Encoded')][byte[]]$EncodedImage,
+        [Parameter(Mandatory)][ValidateSet('jpeg', 'png')][string]$Format,
+        [int]$Quality = 85,
+        [System.Collections.IDictionary]$Metadata = $null
+    )
+
+    if ($PSCmdlet.ParameterSetName -eq 'Encoded') {
+        if ($Format -eq 'png') {
+            if ($null -eq $Metadata) { return , $EncodedImage }
+            return , (Add-PngTextChunks -Png $EncodedImage -Metadata $Metadata)
+        }
+        if ($null -ne (Get-JpegEncoder)) {
+            if ($null -eq $Metadata) { return , $EncodedImage }
+            return , (Add-JpegExifSegment -Jpeg $EncodedImage -Metadata $Metadata)
+        }
+        # No JPEG encoder for the metadata: decode and take the bitmap path, which then
+        # writes a PNG exactly as a screen capture would on such a system.
+        $stream = [System.IO.MemoryStream]::new($EncodedImage)
+        try {
+            $decoded = [System.Drawing.Bitmap]::new($stream)
+            try { return , (ConvertTo-EvidenceImage -Bitmap $decoded -Format $Format -Quality $Quality -Metadata $Metadata) }
+            finally { $decoded.Dispose() }
+        }
+        finally { $stream.Dispose() }
+    }
+
+    $stream = [System.IO.MemoryStream]::new()
+    try {
+        $encoder = $null
+        if ($Format -eq 'jpeg') { $encoder = Get-JpegEncoder }
+        if ($null -ne $encoder) {
+            if ($null -ne $Metadata) { Set-JpegMetadata -Image $Bitmap -Metadata $Metadata }
+            $encoderParameters = [System.Drawing.Imaging.EncoderParameters]::new(1)
+            try {
+                $encoderParameters.Param[0] = [System.Drawing.Imaging.EncoderParameter]::new([System.Drawing.Imaging.Encoder]::Quality, [int64]$Quality)
+                $Bitmap.Save($stream, $encoder, $encoderParameters)
+            }
+            finally {
+                $encoderParameters.Dispose()
+            }
+            return , $stream.ToArray()
+        }
+
+        # PNG (asked for, or no JPEG encoder available).
+        $Bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+        $png = $stream.ToArray()
+        if ($null -ne $Metadata) { $png = Add-PngTextChunks -Png $png -Metadata $Metadata }
+        return , $png
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Add-JpegExifSegment {
+    <#
+        Puts the Vouch EXIF metadata into an already encoded JPEG without re-encoding it.
+        GDI+ can only write EXIF while it encodes, so it encodes a 1x1 image carrying the
+        metadata (Set-JpegMetadata, the same fields a screen capture gets) and that
+        image's APP1 "Exif" segment is copied in after SOI and the JFIF APP0 segment,
+        where GDI+ itself puts it. The picture data is untouched.
+    #>
+    param(
+        [Parameter(Mandatory)][byte[]]$Jpeg,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Metadata
+    )
+    if ($Jpeg.Length -lt 4 -or $Jpeg[0] -ne 0xFF -or $Jpeg[1] -ne 0xD8) { throw 'Not a JPEG image.' }
+
+    $carrier = [System.Drawing.Bitmap]::new(1, 1)
+    $stream = [System.IO.MemoryStream]::new()
+    try {
+        Set-JpegMetadata -Image $carrier -Metadata $Metadata
+        $carrier.Save($stream, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+        $source = $stream.ToArray()
+    }
+    finally {
+        $stream.Dispose()
+        $carrier.Dispose()
+    }
+
+    # Walk the marker segments (FF xx, then a big-endian length that counts itself).
+    $exifStart = -1
+    $exifLength = 0
+    $position = 2
+    while ($position + 4 -le $source.Length -and $source[$position] -eq 0xFF) {
+        $marker = $source[$position + 1]
+        if ($marker -eq 0xDA -or $marker -eq 0xD9) { break }
+        $length = $source[$position + 2] * 256 + $source[$position + 3]
+        if ($marker -eq 0xE1 -and $position + 10 -le $source.Length -and
+            [System.Text.Encoding]::ASCII.GetString($source, $position + 4, 4) -eq 'Exif') {
+            $exifStart = $position
+            $exifLength = 2 + $length
+            break
+        }
+        $position += 2 + $length
+    }
+    if ($exifStart -lt 0) { throw 'GDI+ wrote no EXIF segment for the metadata.' }
+
+    $insertAt = 2
+    if ($Jpeg[2] -eq 0xFF -and $Jpeg[3] -eq 0xE0 -and $Jpeg.Length -ge 6) {
+        $insertAt = 4 + ($Jpeg[4] * 256 + $Jpeg[5])
+    }
+    $output = [byte[]]::new($Jpeg.Length + $exifLength)
+    [System.Array]::Copy($Jpeg, 0, $output, 0, $insertAt)
+    [System.Array]::Copy($source, $exifStart, $output, $insertAt, $exifLength)
+    [System.Array]::Copy($Jpeg, $insertAt, $output, $insertAt + $exifLength, $Jpeg.Length - $insertAt)
+    return , $output
+}
+
+function Get-ImagePixelSize {
+    # Width and height of an encoded image, read from its header (the pixels are not decoded).
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+    $stream = [System.IO.MemoryStream]::new($Bytes)
+    try {
+        $image = [System.Drawing.Image]::FromStream($stream, $false, $false)
+        try { return [pscustomobject]@{ Width = $image.Width; Height = $image.Height } }
+        finally { $image.Dispose() }
+    }
+    finally {
+        $stream.Dispose()
     }
 }
 
@@ -2526,33 +3063,39 @@ $(Get-FrameDocsScript)
       desc: 'the frame ' + vouchFrameName(entry.frame), node: entry.frame, entry: entry };
   }
   // strict: only overflow auto/scroll/overlay, as the automatic search has always done;
-  // an area the person named may also be overflow hidden (it still scrolls by script).
+  // an area the person named may also be overflow hidden (it still scrolls by script),
+  // but not visible or clip: those cannot be scrolled at all.
   function elementCandidate(el, entry, off, strict) {
     if (el === entry.doc.documentElement || el.clientHeight < 50 || el.scrollHeight <= el.clientHeight + 16) { return null; }
     var oy = entry.win.getComputedStyle(el).overflowY;
-    if (strict ? (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') : oy === 'visible') { return null; }
+    if (strict ? (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') : (oy === 'visible' || oy === 'clip')) { return null; }
     return { kind: 'element', area: visibleArea(el.getBoundingClientRect(), off),
       desc: describe(el) + (entry.frame ? ' in the frame ' + vouchFrameName(entry.frame) : ''), node: el, entry: entry };
   }
+  // why: '' (usable), 'invalid' (not a CSS selector), 'notfound', 'crossorigin' (a frame
+  // from another site, which the page cannot look into), 'notscrollable'.
   function areaFor(sel) {
     var hit = null;
     for (var i = 0; i < docs.list.length && !hit; i++) {
       var el = null;
-      try { el = docs.list[i].doc.querySelector(sel); } catch (e) { return { found: false, cand: null }; }
+      try { el = docs.list[i].doc.querySelector(sel); } catch (e) { return { cand: null, why: 'invalid' }; }
       if (el) { hit = { el: el, entry: docs.list[i] }; }
     }
-    if (!hit) { return { found: false, cand: null }; }
+    if (!hit) { return { cand: null, why: 'notfound' }; }
     var tag = hit.el.tagName.toLowerCase();
+    var named = null;
     if (tag === 'iframe' || tag === 'frame') {
+      var reachable = false;
       for (var j = 0; j < docs.list.length; j++) {
-        if (docs.list[j].frame === hit.el) { return { found: true, cand: frameCandidate(docs.list[j]) }; }
+        if (docs.list[j].frame === hit.el) { reachable = true; named = frameCandidate(docs.list[j]); }
       }
-      return { found: true, cand: null };
+      if (!reachable) { return { cand: null, why: 'crossorigin' }; }
     }
-    if (hit.el === hit.entry.doc.documentElement || hit.el === hit.entry.doc.body) {
-      return { found: true, cand: hit.entry.frame ? frameCandidate(hit.entry) : windowCandidate() };
+    else if (hit.el === hit.entry.doc.documentElement || hit.el === hit.entry.doc.body) {
+      named = hit.entry.frame ? frameCandidate(hit.entry) : windowCandidate();
     }
-    return { found: true, cand: elementCandidate(hit.el, hit.entry, offsetOf(hit.entry), false) };
+    else { named = elementCandidate(hit.el, hit.entry, offsetOf(hit.entry), false); }
+    return { cand: named, why: named ? '' : 'notscrollable' };
   }
 
   var candidates = [];
@@ -2573,8 +3116,8 @@ $(Get-FrameDocsScript)
   var chosen = null, fallback = '';
   if (mode === 'page') { chosen = win; }
   else if (mode === 'area') {
-    var named = areaFor(wanted);
-    if (named.cand) { chosen = named.cand; } else { fallback = named.found ? 'notscrollable' : 'notfound'; }
+    var wantedArea = areaFor(wanted);
+    if (wantedArea.cand) { chosen = wantedArea.cand; } else { fallback = wantedArea.why; }
   }
   if (mode === 'auto' || fallback) { chosen = usable.length > 0 ? usable[0] : null; }
 
@@ -2951,6 +3494,7 @@ function Invoke-PageAction {
     $navigationTimeoutSec = [int]$Settings.NavigationTimeoutSec
 
     if ($Action['type'] -eq 'capture') {
+        # Makes the run's tab the one Edge shows (and renders), for every capture area.
         try { [void](Send-CdpCommand -Method 'Page.bringToFront' -TimeoutSec 10) }
         catch { Write-Verbose "Page.bringToFront failed: $($_.Exception.Message)" }
 
@@ -2958,21 +3502,26 @@ function Invoke-PageAction {
         try { $pageTitle = [string](Invoke-CdpEval -Expression 'document.title' -TimeoutSec 10) }
         catch { Write-Verbose "Could not read the page title: $($_.Exception.Message)" }
 
-        $focusWarning = Set-EdgeForeground -ExpectedTitle $pageTitle
-        if ($null -ne $focusWarning) {
-            if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
-            if (-not $Item.Details.Contains($focusWarning)) { $Item.Details.Add($focusWarning) }
+        # Page-content captures are taken by the browser itself: the window does not need
+        # to be in front, so it is left where the person has it.
+        if ((Get-PageCaptureMode -Settings $Settings).Area -ne 'page') {
+            $focusWarning = Set-EdgeForeground -ExpectedTitle $pageTitle
+            if ($null -ne $focusWarning) {
+                if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+                if (-not $Item.Details.Contains($focusWarning)) { $Item.Details.Add($focusWarning) }
+            }
         }
 
         $scroll = $Action['scroll']
         $mode = if ($scroll -is [System.Collections.IDictionary] -and $scroll['mode']) { [string]$scroll['mode'] } else { 'none' }
         $selector = if ($scroll -is [System.Collections.IDictionary] -and $scroll['selector']) { [string]$scroll['selector'] } else { '' }
+        $as = if ($scroll -is [System.Collections.IDictionary] -and $scroll['as'] -eq 'single') { 'single' } else { 'segments' }
         $label = [string]$Action['label']
         $imagesBefore = $Item.Captures.Count
         try {
-            Invoke-ScrollCapture -Item $Item -ScrollMode $mode -ScrollSelector $selector -ExplicitAreas $ExplicitAreas `
+            Invoke-ScrollCapture -Item $Item -ScrollMode $mode -ScrollSelector $selector -ScrollAs $as -ExplicitAreas $ExplicitAreas `
                 -CaptureNumber $CaptureNumber -Label $label -BrowserErrorPage $BrowserErrorPage `
-                -Settings $Settings -CaptureContext $CaptureContext
+                -Settings $Settings -CaptureContext $CaptureContext -PageTitle $pageTitle
         }
         catch {
             if ($PropagateCaptureError) { throw }
@@ -3016,7 +3565,9 @@ function Invoke-PageAction {
                 $timeout = if ($Action.Contains('timeoutSec') -and $null -ne $Action['timeoutSec']) { [double]$Action['timeoutSec'] } else { $navigationTimeoutSec }
                 $selector = [string]$Action['selector']
                 if (-not (Wait-PageElement -Selector $selector -TimeoutSec $timeout)) {
-                    throw "No visible element matched '$selector' within $timeout second(s); the next actions ran anyway."
+                    # Invariant: "1.5 second(s)", not "1,5" on a German PC.
+                    $seconds = ([double]$timeout).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+                    throw "No visible element matched '$selector' within $seconds second(s); the next actions ran anyway."
                 }
             }
             'pause' {
@@ -3097,7 +3648,10 @@ function New-CaptureRecord {
         [string]$FileName = '',
         [System.Nullable[System.DateTimeOffset]]$CapturedAt = $null,
         [int]$CaptureNumber = 1,
-        [AllowEmptyString()][string]$Label = ''
+        [AllowEmptyString()][string]$Label = '',
+        # What the image shows (screen, window, page) and at which page zoom.
+        [ValidateSet('screen', 'window', 'page')][string]$CaptureArea = 'screen',
+        [int]$ZoomPercent = 100
     )
 
     # PowerShell hands a Nullable parameter over already unwrapped.
@@ -3115,6 +3669,8 @@ function New-CaptureRecord {
         FilePath      = $FilePath
         CaptureNumber = $CaptureNumber
         Label         = $Label
+        CaptureArea   = $CaptureArea
+        ZoomPercent   = $ZoomPercent
     }
 }
 
@@ -3122,6 +3678,12 @@ function Add-ItemCapture {
     <#
         One screenshot for an item: stamp the metadata, capture, save (with -SaveImages)
         and record the SHA-256 of the exact bytes that went into the report and the file.
+        -CaptureArea picks what is captured: the whole screen (Get-ScreenCapture, as
+        always), the Edge window cut out of a screen grab, or the page content taken by
+        the browser (-PageClip for one tall image of the document). When the window
+        cannot be found on the primary display, the whole screen is captured instead
+        and the item says so: a screenshot of something is better evidence than none,
+        and the record names the area the image really shows.
     #>
     param(
         [Parameter(Mandatory)][object]$Item,
@@ -3131,15 +3693,62 @@ function Add-ItemCapture {
         [Parameter(Mandatory)][hashtable]$Context,
         # Which capture action of the page this is (Get-CaptureFileName), and its label.
         [int]$CaptureNumber = 1,
-        [AllowEmptyString()][string]$Label = ''
+        [AllowEmptyString()][string]$Label = '',
+        [ValidateSet('screen', 'window', 'page')][string]$CaptureArea = 'screen',
+        # The zoom the page is shown at (Set-PageZoom); page captures are scaled by it.
+        [int]$ZoomPercent = 100,
+        # Page captures only: the part of the document for one tall image.
+        [System.Collections.IDictionary]$PageClip = $null,
+        # The page's title, to find a window that is not known by its process.
+        [AllowEmptyString()][string]$PageTitle = ''
     )
 
     $fileName = Get-CaptureFileName -Index $Item.Index -Name $Item.Name -SegmentIndex $SegmentIndex `
         -Extension $Context.Extension -CaptureNumber $CaptureNumber
+    $area = $CaptureArea
+    $screenText = [string]$Context.Screen
+    $windowRectangle = $null
+    if ($area -eq 'window') {
+        $screenBounds = Get-PrimaryScreenBounds
+        # Set-EdgeForeground has just looked for the window for up to 10 s; a short
+        # look is enough, and keeps a run without a window from waiting per segment.
+        $windowBounds = Get-EdgeWindowBounds -ExpectedTitle $PageTitle -TimeoutSec 2
+        if ($null -ne $windowBounds) {
+            $windowRectangle = Get-WindowCaptureRectangle -WindowBounds $windowBounds -ScreenBounds $screenBounds
+        }
+        if ($null -eq $windowRectangle) {
+            $area = 'screen'
+            $fallback = 'The Edge window could not be found on the main display, so the whole screen was captured instead of the window only.'
+            if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+            if (-not $Item.Details.Contains($fallback)) { $Item.Details.Add($fallback) }
+        }
+        else {
+            $screenText = '{0}x{1} Edge window at ({2},{3}) of the {4}x{5} primary display' -f $windowRectangle.Width, $windowRectangle.Height,
+                ($windowRectangle.X + $screenBounds.X), ($windowRectangle.Y + $screenBounds.Y), $screenBounds.Width, $screenBounds.Height
+        }
+    }
+
     $capturedAt = [System.DateTimeOffset]::Now
-    $metadata = New-CaptureMetadata -RunId $Context.RunId -ItemIndex $Item.Index -ItemName $Item.Name -RequestedUrl $Item.Url `
-        -PageUrl $PageUrl -CapturedAt $capturedAt -SegmentIndex $SegmentIndex -SegmentCount $SegmentCount -Screen $Context.Screen
-    $bytes = Get-ScreenCapture -Format $Context.Format -Quality $Context.Quality -Metadata $metadata
+    $metadataArguments = @{
+        RunId = $Context.RunId; ItemIndex = $Item.Index; ItemName = $Item.Name; RequestedUrl = $Item.Url; PageUrl = $PageUrl
+        CapturedAt = $capturedAt; SegmentIndex = $SegmentIndex; SegmentCount = $SegmentCount; CaptureArea = $area; ZoomPercent = $ZoomPercent
+    }
+    if ($area -eq 'page') {
+        $encoded = Get-PageCapture -Format $Context.Format -Quality $Context.Quality -ZoomPercent $ZoomPercent -Clip $PageClip
+        # The image is not a screen: say what it is, at the size it came back.
+        $size = Get-ImagePixelSize -Bytes $encoded
+        $screenText = "$($size.Width)x$($size.Height) image of the page content only (no browser window, taskbar or clock)"
+        $metadata = New-CaptureMetadata @metadataArguments -Screen $screenText
+        $bytes = ConvertTo-EvidenceImage -EncodedImage $encoded -Format $Context.Format -Quality $Context.Quality -Metadata $metadata
+    }
+    elseif ($area -eq 'window') {
+        $metadata = New-CaptureMetadata @metadataArguments -Screen $screenText
+        $bytes = Get-WindowCapture -Rectangle $windowRectangle -Format $Context.Format -Quality $Context.Quality -Metadata $metadata
+    }
+    else {
+        $metadata = New-CaptureMetadata @metadataArguments -Screen $screenText
+        $bytes = Get-ScreenCapture -Format $Context.Format -Quality $Context.Quality -Metadata $metadata
+    }
 
     $filePath = ''
     if ($Context.SaveImages) {
@@ -3147,7 +3756,8 @@ function Add-ItemCapture {
         [System.IO.File]::WriteAllBytes($filePath, $bytes)
     }
     $Item.Captures.Add((New-CaptureRecord -Bytes $bytes -Url $PageUrl -SegmentIndex $SegmentIndex -SegmentCount $SegmentCount `
-        -FilePath $filePath -FileName $fileName -CapturedAt $capturedAt -CaptureNumber $CaptureNumber -Label $Label))
+        -FilePath $filePath -FileName $fileName -CapturedAt $capturedAt -CaptureNumber $CaptureNumber -Label $Label `
+        -CaptureArea $area -ZoomPercent $ZoomPercent))
 }
 
 function Get-CaptureManifest {
@@ -3199,6 +3809,25 @@ function Get-StatusCssClass {
         'WARNING' { return 'badge warn' }
         default   { return 'badge fail' }
     }
+}
+
+function Get-CaptureAreaText {
+    <#
+        The report's one-line description of what a page's images show. A page-content
+        image has no address bar or clock, so the line says where the URL and the
+        capture time are instead.
+    #>
+    param(
+        [AllowEmptyString()][string]$Area = 'screen',
+        [int]$ZoomPercent = 100
+    )
+    $text = switch ($Area) {
+        'window' { 'Edge window only (title bar, tabs and address bar; no taskbar or clock)' }
+        'page'   { 'Page content only (no address bar, taskbar or clock; the URL and capture time are under each image and inside each image file)' }
+        default  { 'Full screen, including the taskbar clock' }
+    }
+    if ($ZoomPercent -gt 0 -and $ZoomPercent -ne 100) { $text += "; page zoom $ZoomPercent%" }
+    return $text
 }
 
 function New-HtmlReport {
@@ -3280,7 +3909,14 @@ a { color: #12507d; }
     [void]$sb.AppendLine('<body>')
 
     [void]$sb.AppendLine('<h1>Vouch &mdash; Audit Evidence Report</h1>')
-    [void]$sb.AppendLine("<p class=""subtitle"">Screen captures of live application pages, including the Windows taskbar clock.</p>")
+    # Pages captured as the window or the page content only have no taskbar clock: the
+    # general wording must then not promise one. Screen-only reports read as before.
+    $allScreen = -not @($Items | Where-Object {
+            ($_.PSObject.Properties['CaptureArea'] -and $_.CaptureArea -ne 'screen') -or
+            @($_.Captures | Where-Object { $_.PSObject.Properties['CaptureArea'] -and $_.CaptureArea -ne 'screen' }).Count -gt 0 })
+    $subtitle = if ($allScreen) { 'Screen captures of live application pages, including the Windows taskbar clock.' }
+    else { 'Captures of live application pages. Each page states what its images show (its capture area).' }
+    [void]$sb.AppendLine("<p class=""subtitle"">$subtitle</p>")
 
     [void]$sb.AppendLine('<div class="meta"><table>')
     $metaRows = @(
@@ -3367,6 +4003,9 @@ a { color: #12507d; }
             "Yes - full page in viewport segments$area"
         }
         [void]$sb.AppendLine("<dt>Scroll capture</dt><dd>$(Encode-Html $scrollText)</dd>")
+        $itemArea = if ($item.PSObject.Properties['CaptureArea']) { [string]$item.CaptureArea } else { 'screen' }
+        $itemZoom = if ($item.PSObject.Properties['ZoomPercent']) { [int]$item.ZoomPercent } else { 100 }
+        [void]$sb.AppendLine("<dt>Capture area</dt><dd>$(Encode-Html (Get-CaptureAreaText -Area $itemArea -ZoomPercent $itemZoom))</dd>")
         [void]$sb.AppendLine('</dl>')
 
         if (-not [string]::IsNullOrWhiteSpace($item.Notes)) {
@@ -3446,7 +4085,9 @@ a { color: #12507d; }
         [void]$sb.AppendLine('</section>')
     }
 
-    [void]$sb.AppendLine("<footer>Generated by vouch.ps1 v$($Run.ToolVersion) on $(Encode-Html $Run.EndTime) ($(Encode-Html $Run.TimeZone)). Screenshots are unretouched captures of the primary display.</footer>")
+    $footerNote = if ($allScreen) { 'Screenshots are unretouched captures of the primary display.' }
+    else { 'Screenshots are unretouched captures of the primary display, the Edge window, or the page content as rendered by Edge, as each page states.' }
+    [void]$sb.AppendLine("<footer>Generated by vouch.ps1 v$($Run.ToolVersion) on $(Encode-Html $Run.EndTime) ($(Encode-Html $Run.TimeZone)). $footerNote</footer>")
     [void]$sb.AppendLine('</body>')
     [void]$sb.AppendLine('</html>')
 
@@ -3607,6 +4248,8 @@ function ConvertTo-RunSummaryJson {
                 HttpStatus     = $item.HttpStatus
                 ScrollFullPage = $item.ScrollFullPage
                 ScrollArea     = $(if ($item.PSObject.Properties['ScrollArea']) { $item.ScrollArea } else { '' })
+                CaptureArea    = $(if ($item.PSObject.Properties['CaptureArea']) { $item.CaptureArea } else { 'screen' })
+                ZoomPercent    = $(if ($item.PSObject.Properties['ZoomPercent']) { $item.ZoomPercent } else { 100 })
                 Details        = @($item.Details)
                 Steps          = @($item.StepLog | ForEach-Object { [ordered]@{ Text = $_.Text; Ok = $_.Ok; Message = $_.Message } })
                 Captures       = @($item.Captures | ForEach-Object {
@@ -3623,6 +4266,9 @@ function ConvertTo-RunSummaryJson {
                         # Which capture action of the page took it (1, 2, ...) and its label.
                         CaptureNumber = $(if ($_.PSObject.Properties['CaptureNumber']) { $_.CaptureNumber } else { 1 })
                         Label         = $(if ($_.PSObject.Properties['Label']) { $_.Label } else { '' })
+                        # What the image shows (screen, window, page) and the page zoom.
+                        CaptureArea   = $(if ($_.PSObject.Properties['CaptureArea']) { $_.CaptureArea } else { 'screen' })
+                        ZoomPercent   = $(if ($_.PSObject.Properties['ZoomPercent']) { $_.ZoomPercent } else { 100 })
                     }
                 })
             }
@@ -3774,6 +4420,8 @@ function Get-RunSettingDefinition {
         [pscustomobject]@{ Name = 'LogDir';               Type = 'string'; Section = 'output';   Key = 'logDir' }
         [pscustomobject]@{ Name = 'JsonSummary';          Type = 'bool';   Section = 'output';   Key = 'jsonSummary' }
         [pscustomobject]@{ Name = 'UseVirtualDesktop';    Type = 'bool';   Section = 'browser';  Key = 'useVirtualDesktop' }
+        [pscustomobject]@{ Name = 'CaptureArea';          Type = 'string'; Section = 'defaults'; Key = 'captureArea' }
+        [pscustomobject]@{ Name = 'ZoomPercent';          Type = 'int';    Section = 'defaults'; Key = 'zoomPercent' }
         [pscustomobject]@{ Name = 'Verify';               Type = 'string'; Section = '';         Key = '' }
         [pscustomobject]@{ Name = 'LoginSetup';           Type = 'bool';   Section = '';         Key = '' }
         [pscustomobject]@{ Name = 'ConfigPath';           Type = 'string'; Section = '';         Key = '' }
@@ -3916,6 +4564,8 @@ function Get-PageSettings {
         know where a value came from.
         A value typed on the command line beats a page override too: the precedence is
         command line > configuration > default, whatever part of the file it is in.
+        (-CaptureArea and -ZoomPercent are the page-level settings that also have a
+        command-line switch.)
     #>
     param(
         [Parameter(Mandatory)][object]$Settings,
@@ -3939,12 +4589,14 @@ function Get-PageSettings {
 
     $schemaDefaults = Get-DefaultVouchConfig
     foreach ($key in 'account', 'captureArea', 'zoomPercent', 'waitFor', 'onNotReady', 'promptTimeoutSec') {
+        $name = $key.Substring(0, 1).ToUpperInvariant() + $key.Substring(1)
+        # -CaptureArea / -ZoomPercent typed on the command line: already in the run settings.
+        if ($BoundNames -contains $name) { continue }
         $value = $schemaDefaults['defaults'][$key]
         $fromConfig = Get-ConfigValue -Config $Config -Section 'defaults' -Key $key
         if ($fromConfig.Found) { $value = $fromConfig.Value }
         $fromPage = Get-ConfigValue -Config $overrides -Section 'defaults' -Key $key
         if ($fromPage.Found) { $value = $fromPage.Value }
-        $name = $key.Substring(0, 1).ToUpperInvariant() + $key.Substring(1)
         $page[$name] = if ($value -is [string]) { $value } else { [int]$value }
     }
     return [pscustomobject]$page
@@ -4000,16 +4652,46 @@ function New-CaptureItem {
         Details        = [System.Collections.Generic.List[string]]::new()
         StepLog        = [System.Collections.Generic.List[object]]::new()
         Captures       = [System.Collections.Generic.List[object]]::new()
+        # The page's capture area and zoom as set; each capture records what it got.
+        CaptureArea    = 'screen'
+        ZoomPercent    = 100
     }
+}
+
+function Get-PageCaptureMode {
+    <#
+        The capture area and zoom a page's settings ask for. Settings built without the
+        page-level values (Resolve-RunSettings with no defaults for them, as the
+        single-page callers and the tests do) mean what they always meant: the screen,
+        at 100%.
+    #>
+    param([Parameter(Mandatory)][object]$Settings)
+    $area = 'screen'
+    if ($Settings.PSObject.Properties['CaptureArea'] -and [string]$Settings.CaptureArea -in 'screen', 'window', 'page') {
+        $area = ([string]$Settings.CaptureArea).ToLowerInvariant()
+    }
+    $zoom = 100
+    if ($Settings.PSObject.Properties['ZoomPercent'] -and [int]$Settings.ZoomPercent -ge 25 -and [int]$Settings.ZoomPercent -le 500) {
+        $zoom = [int]$Settings.ZoomPercent
+    }
+    return [pscustomobject]@{ Area = $area; ZoomPercent = $zoom }
 }
 
 function Invoke-ScrollCapture {
     <#
         Takes the screenshots of one capture action, for a page that is already loaded
-        and in the foreground: one screen (-ScrollMode none), or one per screen of what
-        scrolls - found automatically (auto), the window (page) or a named area (area;
-        see Get-ScrollTargetScript). Errors from scrolling itself are left to the caller
-        (Invoke-CaptureItem marks the page FAILED and the run moves on).
+        (and in the foreground, for the screen and window areas): one screen
+        (-ScrollMode none), or one per screen of what scrolls - found automatically
+        (auto), the window (page) or a named area (area; see Get-ScrollTargetScript).
+        The page's capture area decides what each image shows (Add-ItemCapture); the
+        scrolling is the same for all three, so auto, page and area behave alike.
+        -ScrollAs single: one tall image of the whole document instead of segments. Only
+        the browser can make such an image, so only for the page capture area, only when
+        the window itself scrolls (an inner panel or frame is not part of the document's
+        height), and only when the image stays within 16,384 pixels (Get-SingleImagePlan).
+        Otherwise it is taken as segments and the item says why.
+        Errors from scrolling itself are left to the caller (Invoke-CaptureItem marks
+        the page FAILED and the run moves on).
         A page may capture several times; a detail an earlier capture of the same page
         already reported is not repeated.
     #>
@@ -4017,6 +4699,7 @@ function Invoke-ScrollCapture {
         [Parameter(Mandatory)][object]$Item,
         [ValidateSet('none', 'auto', 'page', 'area')][string]$ScrollMode = 'none',
         [AllowEmptyString()][string]$ScrollSelector = '',
+        [ValidateSet('segments', 'single')][string]$ScrollAs = 'segments',
         # Every area the page captures explicitly; never reported as "not scrolled".
         [AllowEmptyCollection()][string[]]$ExplicitAreas = @(),
         [int]$CaptureNumber = 1,
@@ -4024,7 +4707,9 @@ function Invoke-ScrollCapture {
         # The browser's own error page is shown: its URL is not the page's, so keep FinalUrl.
         [Parameter(Mandatory)][bool]$BrowserErrorPage,
         [Parameter(Mandatory)][object]$Settings,
-        [Parameter(Mandatory)][hashtable]$CaptureContext
+        [Parameter(Mandatory)][hashtable]$CaptureContext,
+        # The page's title, to find the window for window captures.
+        [AllowEmptyString()][string]$PageTitle = ''
     )
 
     $maxScrollSegments = $Settings.MaxScrollSegments
@@ -4036,9 +4721,27 @@ function Invoke-ScrollCapture {
         if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
         if ($earlierDetails -notcontains $Text) { $Item.Details.Add($Text) }
     }
+    $area = (Get-PageCaptureMode -Settings $Settings).Area
+    # The zoom the page really shows (Set-PageZoom records it only once it applied).
+    $zoom = $script:PageZoomPercent
+    $shoot = {
+        param([int]$Index, [int]$Count, [string]$Url, $Clip)
+        Add-ItemCapture -Item $Item -SegmentIndex $Index -SegmentCount $Count -PageUrl $Url -Context $CaptureContext `
+            -CaptureNumber $CaptureNumber -Label $Label -CaptureArea $area -ZoomPercent $zoom -PageClip $Clip -PageTitle $PageTitle
+    }
+    $theCapture = if ($Label) { "the capture '$Label'" } else { 'the capture' }
+
+    $single = $scrolls -and $ScrollAs -eq 'single'
+    if ($single -and $area -ne 'page') {
+        # Not a problem with the page, so the status stays as it is; said once per page.
+        $note = "One tall image (""as"": ""single"") is only possible with the page capture area, so with the $area area $theCapture was taken as screen-sized segments."
+        if (-not $Item.Details.Contains($note)) { $Item.Details.Add($note) }
+        $single = $false
+    }
 
     $segmentCount = 1
     $viewportHeight = 0.0
+    $singleClip = $null
     if ($scrolls) {
         try {
             # Find what scrolls - the page, a panel inside it, or a frame - and start at its top.
@@ -4059,7 +4762,12 @@ function Invoke-ScrollCapture {
             $fallback = if ($scrollTarget.PSObject.Properties['fallback']) { [string]$scrollTarget.fallback } else { '' }
             if ($fallback) {
                 $which = if ($Label) { " of the capture '$Label'" } else { '' }
-                $why = if ($fallback -eq 'notfound') { 'matches no element on the page' } else { 'does not scroll' }
+                $why = switch ($fallback) {
+                    'notfound'    { 'matches no element on the page' }
+                    'invalid'     { 'is not a CSS selector the browser understands' }
+                    'crossorigin' { 'is a frame from another site, which Vouch cannot look into or scroll' }
+                    default       { 'does not scroll' }
+                }
                 & $addDetail "The scroll area '$ScrollSelector'$which $why, so Vouch scrolled what it found itself ($areaText)."
             }
             foreach ($other in @($scrollTarget.others)) {
@@ -4078,7 +4786,36 @@ function Invoke-ScrollCapture {
             & $addDetail "The page height could not be measured, so only the first screen was captured: $($_.Exception.Message)"
             $segmentCount = 1
             $viewportHeight = 0
+            $single = $false
         }
+
+        if ($single -and $segmentCount -gt 1) {
+            if ([string]$scrollTarget.kind -eq 'window') {
+                try {
+                    $content = Get-PageContentSize
+                    $plan = Get-SingleImagePlan -CssHeight $content.Height -DevicePixelRatio $content.DevicePixelRatio -ZoomPercent $zoom
+                    if ($plan.Fits) {
+                        $singleClip = @{ x = 0; y = 0; width = [Math]::Ceiling($content.Width); height = [Math]::Ceiling($content.Height) }
+                    }
+                    else {
+                        & $addDetail ("The page is too tall for one image ({0} pixels; images cannot be taller than 16,384), so {1} was taken as screen-sized segments." -f
+                            $plan.OutputHeight.ToString([System.Globalization.CultureInfo]::InvariantCulture), $theCapture)
+                    }
+                }
+                catch {
+                    & $addDetail "The size of the page could not be measured for one image, so $theCapture was taken as screen-sized segments: $($_.Exception.Message)"
+                }
+            }
+            else {
+                & $addDetail "One tall image is only possible when the page itself scrolls; here $areaText scrolls inside the page, so $theCapture was taken as screen-sized segments."
+            }
+        }
+    }
+
+    if ($null -ne $singleClip) {
+        $singleUrl = if ($BrowserErrorPage) { $Item.FinalUrl } else { Get-CurrentPageUrl }
+        & $shoot 1 1 $singleUrl $singleClip
+        return
     }
 
     $truncationMessage = "Page truncated at $maxScrollSegments segments (raise -MaxScrollSegments to capture more)."
@@ -4122,16 +4859,14 @@ function Invoke-ScrollCapture {
             }
 
             $segmentUrl = if ($BrowserErrorPage) { $Item.FinalUrl } else { Get-CurrentPageUrl }
-            Add-ItemCapture -Item $Item -SegmentIndex ($segment + 1) -SegmentCount $segmentCount -PageUrl $segmentUrl `
-                -Context $CaptureContext -CaptureNumber $CaptureNumber -Label $Label
+            & $shoot ($segment + 1) $segmentCount $segmentUrl $null
         }
 
         try { [void](Invoke-CdpEval -Expression 'window.__vouchTarget.to(0)' -TimeoutSec 10) }
         catch { Write-Verbose "Could not scroll back to the top: $($_.Exception.Message)" }
     }
     else {
-        Add-ItemCapture -Item $Item -SegmentIndex 1 -SegmentCount 1 -PageUrl $Item.FinalUrl -Context $CaptureContext `
-            -CaptureNumber $CaptureNumber -Label $Label
+        & $shoot 1 1 $Item.FinalUrl $null
     }
 }
 
@@ -4164,7 +4899,34 @@ function Invoke-CaptureItem {
 
     Write-Host ("[{0}/{1}] {2} - {3}" -f $Definition.Index, $ItemCount, $Definition.Name, $Definition.Url)
 
+    $captureMode = Get-PageCaptureMode -Settings $Settings
+    $Item.CaptureArea = $captureMode.Area
+    $Item.ZoomPercent = $captureMode.ZoomPercent
+
     try {
+        # The zoom goes on before the page loads, so the page lays itself out once, at
+        # the zoomed size. It is worked out from the window's size, so a window that will
+        # be captured is maximised first - Set-EdgeForeground would only do that right
+        # before the screenshot. A page at 100% after a zoomed one gets the zoom removed.
+        try {
+            if ($captureMode.ZoomPercent -ne 100) {
+                if ($captureMode.Area -ne 'page') {
+                    $currentTitle = ''
+                    try { $currentTitle = [string](Invoke-CdpEval -Expression 'document.title' -TimeoutSec 10) }
+                    catch { Write-Verbose "Could not read the page title: $($_.Exception.Message)" }
+                    Set-EdgeWindowMaximized -ExpectedTitle $currentTitle
+                }
+                Set-PageZoom -Percent $captureMode.ZoomPercent
+            }
+            elseif ($script:PageZoomPercent -ne 100) {
+                Clear-PageZoom
+            }
+        }
+        catch {
+            if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+            $Item.Details.Add("The page zoom could not be set to $($captureMode.ZoomPercent)%, so the page may be shown at another size: $($_.Exception.Message)")
+        }
+
         Set-NavigationMarker
         $navigation = Send-CdpCommand -Method 'Page.navigate' -Params @{ url = $Definition.Url } -TimeoutSec $navigationTimeoutSec
         $browserErrorPage = $false
@@ -4212,12 +4974,14 @@ function Invoke-CaptureItem {
         $Item.FinalUrl = if ($browserErrorPage) { $Definition.Url } else { Get-CurrentPageUrl }
         $requestedOrigin = Get-OriginFromUrl -Url $Definition.Url
         $finalOrigin = Get-OriginFromUrl -Url $Item.FinalUrl
+        $signInShown = $false
         if (-not [string]::IsNullOrWhiteSpace($finalOrigin) -and
             -not [string]::IsNullOrWhiteSpace($requestedOrigin) -and
             $finalOrigin -ne $requestedOrigin -and
             -not (Test-HttpsUpgrade -RequestedUrl $Definition.Url -FinalUrl $Item.FinalUrl)) {
             if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
             $Item.Details.Add("Redirected to $finalOrigin - possible login required.")
+            $signInShown = $true
         }
         elseif (-not $browserErrorPage -and -not [string]::IsNullOrWhiteSpace($Item.FinalUrl)) {
             $hasPasswordField = $false
@@ -4232,13 +4996,15 @@ function Invoke-CaptureItem {
             if (Test-LoginRedirect -RequestedUrl $Definition.Url -FinalUrl $Item.FinalUrl -HasPasswordField $hasPasswordField) {
                 if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
                 $Item.Details.Add("Redirected to a sign-in page ($(([Uri]$Item.FinalUrl).AbsolutePath)) - the session has probably expired. Run -LoginSetup.")
+                $signInShown = $true
             }
         }
 
         # The page's wait-for element (defaults.waitFor or its override): the page is
-        # only ready when it shows. Not on an error page, which will never show it.
+        # only ready when it shows. Not on an error page or a sign-in page, which will
+        # never show it - waiting the full timeout there would only delay the run.
         $readySelector = if ($Settings.PSObject.Properties['WaitFor']) { [string]$Settings.WaitFor } else { '' }
-        if (-not [string]::IsNullOrWhiteSpace($readySelector) -and $Item.Status -ne 'FAILED') {
+        if (-not [string]::IsNullOrWhiteSpace($readySelector) -and $Item.Status -ne 'FAILED' -and -not $signInShown) {
             $readyProblem = ''
             try {
                 if (-not (Wait-PageElement -Selector $readySelector -TimeoutSec $navigationTimeoutSec)) {
@@ -4484,6 +5250,13 @@ function Invoke-Main {
         }
     }
     finally {
+        # A zoom must not outlive the run, also when it failed or reused an Edge that
+        # stays open (closing the connection drops it too; this makes it certain).
+        if ($null -ne $script:CdpSocket) {
+            try { Clear-PageZoom }
+            catch { Write-Verbose "Could not remove the page zoom: $($_.Exception.Message)" }
+        }
+        $script:PageZoomPercent = 100
         Close-CdpSocket
         if ($settings.KeepBrowserOpen) {
             if ($script:LaunchedEdge) { Write-Host 'Leaving Edge open (-KeepBrowserOpen).' }

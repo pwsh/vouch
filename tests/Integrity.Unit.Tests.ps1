@@ -79,7 +79,9 @@ Describe 'New-CaptureMetadata' {
         $metadata.Segment | Should -Be '1 of 2'
         $metadata.Tool | Should -BeLike 'vouch.ps1 *'
         @($metadata.Keys) | Should -Be @('Tool', 'RunId', 'ItemIndex', 'ItemName', 'RequestedUrl', 'PageUrl', 'CapturedAt',
-            'CapturedAtUtc', 'Segment', 'Computer', 'User', 'Screen')
+            'CapturedAtUtc', 'Segment', 'Computer', 'User', 'Screen', 'CaptureArea', 'ZoomPercent')
+        $metadata.CaptureArea | Should -Be 'screen'
+        $metadata.ZoomPercent | Should -Be 100
     }
 }
 
@@ -215,6 +217,129 @@ Describe 'Test-ReportIntegrity (-Verify)' {
 Describe 'Get-ScreenCapture with metadata' -Tag 'Desktop' {
     It 'embeds the metadata in a real <Format> screen capture' -ForEach @(@{ Format = 'jpeg' }, @{ Format = 'png' }) {
         $bytes = Get-ScreenCapture -Format $Format -Quality 60 -Metadata (New-TestMetadata)
+        (Get-ImageMetadata -Bytes $bytes).ItemName | Should -Be 'Admin – users'
+    }
+}
+
+Describe 'ConvertTo-EvidenceImage' {
+    BeforeAll {
+        function New-TestBitmap {
+            $bitmap = [System.Drawing.Bitmap]::new(120, 80, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            $graphics.Clear([System.Drawing.Color]::White)
+            $graphics.FillRectangle([System.Drawing.Brushes]::SteelBlue, 10, 10, 60, 30)
+            $graphics.FillEllipse([System.Drawing.Brushes]::OrangeRed, 50, 30, 50, 40)
+            $graphics.Dispose()
+            return $bitmap
+        }
+        # The encoding Get-ScreenCapture had before ConvertTo-EvidenceImage was split out of it.
+        function ConvertTo-OldPathImage([System.Drawing.Bitmap]$Bitmap, [string]$Format, [int]$Quality, $Metadata) {
+            $stream = [System.IO.MemoryStream]::new()
+            try {
+                $encoder = $null
+                if ($Format -eq 'jpeg') {
+                    $encoder = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' } | Select-Object -First 1
+                }
+                if ($null -ne $encoder) {
+                    if ($null -ne $Metadata) { Set-JpegMetadata -Image $Bitmap -Metadata $Metadata }
+                    $parameters = [System.Drawing.Imaging.EncoderParameters]::new(1)
+                    $parameters.Param[0] = [System.Drawing.Imaging.EncoderParameter]::new([System.Drawing.Imaging.Encoder]::Quality, [int64]$Quality)
+                    $Bitmap.Save($stream, $encoder, $parameters)
+                    $parameters.Dispose()
+                    return , $stream.ToArray()
+                }
+                $Bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+                $png = $stream.ToArray()
+                if ($null -ne $Metadata) { $png = Add-PngTextChunks -Png $png -Metadata $Metadata }
+                return , $png
+            }
+            finally { $stream.Dispose() }
+        }
+    }
+
+    It 'gives the same <Format> bytes and metadata as the old screen-capture path for a bitmap' -ForEach @(@{ Format = 'jpeg' }, @{ Format = 'png' }) {
+        $metadata = New-TestMetadata
+        $first = New-TestBitmap
+        $second = New-TestBitmap
+        try {
+            $old = ConvertTo-OldPathImage -Bitmap $first -Format $Format -Quality 70 -Metadata $metadata
+            $new = ConvertTo-EvidenceImage -Bitmap $second -Format $Format -Quality 70 -Metadata $metadata
+        }
+        finally { $first.Dispose(); $second.Dispose() }
+        , $new | Should -BeOfType [byte[]]
+        Get-Sha256Hex -Bytes $new | Should -Be (Get-Sha256Hex -Bytes $old)
+        (Get-ImageMetadata -Bytes $new).ItemName | Should -Be 'Admin – users'
+    }
+
+    It 'adds the metadata to a JPEG the browser encoded without touching the picture' {
+        $bitmap = New-TestBitmap
+        $stream = [System.IO.MemoryStream]::new()
+        try { $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Jpeg); $plain = $stream.ToArray() }
+        finally { $stream.Dispose(); $bitmap.Dispose() }
+
+        $tagged = ConvertTo-EvidenceImage -EncodedImage $plain -Format jpeg -Metadata (New-TestMetadata)
+        $read = Get-ImageMetadata -Bytes $tagged
+        $read.ItemName | Should -Be 'Admin – users'
+        $read.PageUrl | Should -Be 'https://app.example.com/admin/users?page=1'
+        $read.CapturedAt | Should -Be '2026-09-24T06:01:02.345-07:00'
+        $read.CaptureArea | Should -Be 'screen'
+        # Same file with one APP1 segment more: SOI + JFIF APP0 first, everything after it unchanged.
+        $app0 = 4 + ($plain[4] * 256 + $plain[5])
+        $added = $tagged.Length - $plain.Length
+        $added | Should -BeGreaterThan 100
+        [byte[]]$tagged[0..($app0 - 1)] | Should -Be ([byte[]]$plain[0..($app0 - 1)])
+        @($tagged[$app0], $tagged[$app0 + 1]) | Should -Be @(0xFF, 0xE1)
+        Get-Sha256Hex -Bytes ([byte[]]$tagged[($app0 + $added)..($tagged.Length - 1)]) |
+            Should -Be (Get-Sha256Hex -Bytes ([byte[]]$plain[$app0..($plain.Length - 1)]))
+        $image = [System.Drawing.Image]::FromStream([System.IO.MemoryStream]::new($tagged))
+        try {
+            $image.Width | Should -Be 120
+            [System.Text.Encoding]::ASCII.GetString($image.GetPropertyItem(0x013B).Value).TrimEnd([char]0) | Should -Be 'CORP\auditor'
+        }
+        finally { $image.Dispose() }
+    }
+
+    It 'adds the metadata to a PNG the browser encoded' {
+        $png = New-TestImage -Format png -Metadata $null
+        $tagged = ConvertTo-EvidenceImage -EncodedImage $png -Format png -Metadata (New-TestMetadata)
+        (Get-ImageMetadata -Bytes $tagged).CapturedAtUtc | Should -Be '2026-09-24T13:01:02.345Z'
+        [byte[]]$tagged[0..32] | Should -Be ([byte[]]$png[0..32])
+    }
+
+    It 'refuses data that is not a JPEG' {
+        { ConvertTo-EvidenceImage -EncodedImage ([byte[]](1..40)) -Format jpeg -Metadata (New-TestMetadata) } | Should -Throw '*Not a JPEG*'
+    }
+
+    It 'records the capture area and zoom in the metadata' {
+        $metadata = New-CaptureMetadata -RunId 'r' -ItemIndex 1 -ItemName 'n' -RequestedUrl 'https://a/' -PageUrl 'https://a/' `
+            -CapturedAt $script:CapturedAt -SegmentIndex 1 -SegmentCount 1 -Screen '800x600 image of the page content only' -CaptureArea page -ZoomPercent 150
+        $bytes = New-TestImage -Format jpeg -Metadata $metadata
+        $read = Get-ImageMetadata -Bytes $bytes
+        $read.CaptureArea | Should -Be 'page'
+        $read.ZoomPercent | Should -Be 150
+        $read.Screen | Should -BeLike '*page content only*'
+    }
+}
+
+Describe 'Window capture (screen grab mocked)' {
+    It 'cuts the window out of the screen image' {
+        Mock Get-ScreenBitmap {
+            $bitmap = [System.Drawing.Bitmap]::new(400, 300, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            $graphics.Clear([System.Drawing.Color]::Black)
+            $graphics.FillRectangle([System.Drawing.Brushes]::Red, 100, 50, 200, 150)
+            $graphics.Dispose()
+            $bitmap
+        }
+        $bytes = Get-WindowCapture -Rectangle ([System.Drawing.Rectangle]::new(100, 50, 200, 150)) -Format png -Metadata (New-TestMetadata)
+        $image = [System.Drawing.Bitmap]::new([System.IO.MemoryStream]::new($bytes))
+        try {
+            $image.Width | Should -Be 200
+            $image.Height | Should -Be 150
+            $image.GetPixel(0, 0).R | Should -Be 255
+            $image.GetPixel(199, 149).R | Should -Be 255
+        }
+        finally { $image.Dispose() }
         (Get-ImageMetadata -Bytes $bytes).ItemName | Should -Be 'Admin – users'
     }
 }

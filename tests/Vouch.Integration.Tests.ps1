@@ -203,6 +203,27 @@ Describe 'CDP plumbing' -Tag 'Integration' {
             @($target.blockedFrames).Count | Should -Be 1
             @($target.blockedFrames)[0] | Should -BeLike "*:$($script:OtherOriginPort)/tall"
         }
+
+        It 'gives each reason a named area cannot be used its own code (<Case>)' -ForEach @(
+            @{ Case = 'not a CSS selector'; Page = 'innerscroll?rows=20'; Selector = 'div['; Fallback = 'invalid' }
+            @{ Case = 'matches nothing'; Page = 'innerscroll?rows=20'; Selector = '#nope'; Fallback = 'notfound' }
+            @{ Case = 'a frame from another site'; Page = 'xframe'; Selector = 'iframe'; Fallback = 'crossorigin' }
+            @{ Case = 'does not scroll'; Page = 'innerscroll?rows=20'; Selector = 'header'; Fallback = 'notscrollable' }
+        ) {
+            $url = if ($Page -eq 'xframe') { "$Web/xframe?to=http://localhost:$($script:OtherOriginPort)/tall" } else { "$Web/$Page" }
+            [void](Open-TestPage $url)
+            (Invoke-CdpEval -Expression (Get-ScrollTargetScript -Mode area -Selector $Selector)).fallback | Should -Be $Fallback
+        }
+
+        It 'does not take a named area with overflow-y: clip, which script cannot scroll' {
+            [void](Open-TestPage "$Web/innerscroll?rows=20")
+            [void](Invoke-CdpEval -Expression "document.getElementById('main').style.overflowY = 'hidden'")
+            $hidden = Invoke-CdpEval -Expression (Get-ScrollTargetScript -Mode area -Selector '#main')
+            $hidden.fallback | Should -Be '' -Because 'overflow hidden still scrolls by script'
+            $hidden.description | Should -Be 'div#main'
+            [void](Invoke-CdpEval -Expression "document.getElementById('main').style.overflowY = 'clip'")
+            (Invoke-CdpEval -Expression (Get-ScrollTargetScript -Mode area -Selector '#main')).fallback | Should -Be 'notscrollable'
+        }
     }
 
     Context 'click steps inside frames' {
@@ -694,7 +715,7 @@ Tall page,$Web/tall?px=3000,,Y,
         @($script:Single).Count | Should -Be 1
         $script:Single.PSObject.Properties.Name | Should -Be @(
             'Index', 'Name', 'Url', 'FinalUrl', 'Notes', 'StepsText', 'ScrollFullPage', 'ScrollArea',
-            'Status', 'HttpStatus', 'Details', 'StepLog', 'Captures')
+            'Status', 'HttpStatus', 'Details', 'StepLog', 'Captures', 'CaptureArea', 'ZoomPercent')
         $script:Single.Captures.GetType().Name | Should -Be 'List`1'
     }
 
@@ -885,6 +906,7 @@ Describe 'Page actions (one page at a time, desktop functions mocked)' -Tag 'Int
     It 'falls back to the automatic search when the area <Case>, and says so' -ForEach @(
         @{ Case = 'matches nothing'; Selector = '#nope'; Pattern = "*'#nope' of the capture 'Panel' matches no element*div#main*" }
         @{ Case = 'does not scroll'; Selector = 'header'; Pattern = "*'header' of the capture 'Panel' does not scroll*div#main*" }
+        @{ Case = 'is not a CSS selector'; Selector = 'div['; Pattern = "*'div?' of the capture 'Panel' is not a CSS selector the browser understands*div#main*" }
     ) {
         $result = Invoke-TestPage -Url "$Web/innerscroll?rows=20" -Actions @((New-Capture 'Panel' 'area' $Selector))
         $item = $result.Item
@@ -892,6 +914,36 @@ Describe 'Page actions (one page at a time, desktop functions mocked)' -Tag 'Int
         @($item.Details | Where-Object { $_ -like $Pattern }).Count | Should -Be 1 -Because ($item.Details -join ' | ')
         $item.ScrollArea | Should -Be 'div#main'
         $item.Captures.Count | Should -BeGreaterOrEqual 2
+    }
+
+    It 'says a named area that is a frame from another site cannot be scrolled' {
+        $result = Invoke-TestPage -Url "$Web/xframe?to=http://localhost:$($script:OtherOriginPort)/tall" -Actions @((New-Capture 'Frame' 'area' 'iframe'))
+        $item = $result.Item
+        $item.Status | Should -Be 'WARNING'
+        @($item.Details | Where-Object { $_ -like "*'iframe' of the capture 'Frame' is a frame from another site*" }).Count |
+            Should -Be 1 -Because ($item.Details -join ' | ')
+        ($item.Details -join ' ') | Should -Not -Match 'does not scroll'
+    }
+
+    It 'takes "as": "single" as segments for the screen area and says so once, without a warning' {
+        $single = [ordered]@{ type = 'capture'; label = 'One'; scroll = [ordered]@{ mode = 'page'; as = 'single' } }
+        $result = Invoke-TestPage -Url "$Web/tall?px=3000" -Actions @($single, $single)
+        $item = $result.Item
+        $item.Status | Should -Be 'OK' -Because ($item.Details -join ' | ')
+        @($item.Details | Where-Object { $_ -like '*only possible with the page capture area*screen-sized segments*' }).Count | Should -Be 1
+        @($item.Captures | Where-Object CaptureNumber -eq 1).Count | Should -BeGreaterOrEqual 2
+        @($item.Captures.CaptureArea | Sort-Object -Unique) | Should -Be @('screen')
+    }
+
+    It 'does not wait for the page''s wait-for element on a sign-in page' {
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $result = Invoke-TestPage -Url "$Web/protected" -WaitFor '#late' -TimeoutSec 6 -Actions @((New-Capture))
+        $watch.Stop()
+        $item = $result.Item
+        ($item.Details -join ' ') | Should -Match 'sign-in page'
+        ($item.Details -join ' ') | Should -Not -Match "did not show '#late'"
+        $item.Captures.Count | Should -Be 1
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 5 -Because 'the 6 s wait-for timeout must not be spent'
     }
 
     It 'scroll mode page scrolls the window even when a panel holds more' {
@@ -1040,6 +1092,367 @@ Describe 'Invoke-Main with several captures per page (desktop functions mocked)'
         $tabs = @($summary.Items | Where-Object Name -eq 'Tabs')[0]
         @($tabs.Captures.Label) | Should -Be @('General', 'Logs')
         @($tabs.Captures.CaptureNumber) | Should -Be @(1, 2)
+    }
+}
+
+Describe 'Page zoom (headless Edge)' -Tag 'Integration' {
+    BeforeAll {
+        Connect-TestPage
+        [void](Open-TestPage "$Web/ok")
+        Clear-PageZoom
+        $script:BaseSize = Invoke-CdpEval -Expression '({ width: innerWidth, height: innerHeight })'
+    }
+    AfterAll {
+        try { Clear-PageZoom } catch { Write-Verbose 'no connection' }
+        Close-CdpSocket
+    }
+
+    It 'zooms to <Percent>% as the formula predicts, keeps it across a navigation and a reconnect, and clears it' -ForEach @(
+        @{ Percent = 50 }, @{ Percent = 150 }
+    ) {
+        $want = Get-ZoomDeviceMetrics -Width $script:BaseSize.width -Height $script:BaseSize.height -ZoomPercent $Percent
+        Set-PageZoom -Percent $Percent
+        $script:PageZoomPercent | Should -Be $Percent
+        Invoke-CdpEval -Expression 'innerWidth' | Should -Be $want.width
+        Invoke-CdpEval -Expression 'innerHeight' | Should -Be $want.height
+
+        [void](Open-TestPage "$Web/tall?px=3000")
+        Invoke-CdpEval -Expression 'innerWidth' | Should -Be $want.width -Because 'the zoom survives a navigation'
+
+        # A timed-out command aborts the socket for good; the next one reconnects, and the
+        # zoom (which belonged to the old connection) must be set again.
+        { Invoke-CdpEval -Expression 'new Promise(r => setTimeout(r, 5000))' -TimeoutSec 2 } | Should -Throw
+        Invoke-CdpEval -Expression 'innerWidth' | Should -Be $want.width -Because 'the zoom survives a reconnect'
+        $script:PageZoomPercent | Should -Be $Percent
+
+        Clear-PageZoom
+        Invoke-CdpEval -Expression 'innerWidth' | Should -Be $script:BaseSize.width
+        $script:PageZoomPercent | Should -Be 100
+    }
+
+    It 'takes the zoom off for a 100% page that follows a zoomed one, and zooms only the zoomed page' {
+        Mock Set-EdgeForeground { $null }
+        $global:VouchZoomShots = [System.Collections.Generic.List[int]]::new()
+        Mock Get-ScreenCapture {
+            $global:VouchZoomShots.Add([int](Invoke-CdpEval -Expression 'innerWidth' -TimeoutSec 10))
+            , [byte[]](0xFF, 0xD8, 0xFF, 0xD9)
+        }
+        Mock Set-EdgeWindowMaximized { }
+        $context = @{ RunId = [guid]::NewGuid().ToString(); Format = 'jpeg'; Quality = 85; Extension = 'jpg'; SaveImages = $false; ImagesDir = ''; Screen = '1x1' }
+        $run = Resolve-RunSettings -BoundParameters @{} -Config $null -Defaults @{
+            NavigationTimeoutSec = 10; SettleSeconds = 0.1; ScrollSettleSeconds = 0.1; MaxScrollSegments = 10 }
+        $items = foreach ($zoom in 150, 100) {
+            $definition = ConvertTo-CaptureDefinition -Index 1 -Page ([ordered]@{ name = "Zoom $zoom"; url = "$Web/ok"; overrides = [ordered]@{ zoomPercent = $zoom } })
+            $settings = Get-PageSettings -Settings $run -Definition $definition -Config (Get-DefaultVouchConfig)
+            Invoke-CaptureItem -Definition $definition -Settings $settings -CaptureContext $context 6>$null
+        }
+        $expected = (Get-ZoomDeviceMetrics -Width $script:BaseSize.width -Height $script:BaseSize.height -ZoomPercent 150).width
+        @($global:VouchZoomShots) | Should -Be @($expected, $script:BaseSize.width)
+        @($items.ZoomPercent) | Should -Be @(150, 100)
+        @($items | ForEach-Object { $_.Captures[0].ZoomPercent }) | Should -Be @(150, 100)
+        @($items.Status) | Should -Be @('OK', 'OK')
+        # The window is sized before the zoom is worked out, for the zoomed screen page only.
+        Should -Invoke Set-EdgeWindowMaximized -Times 1 -Exactly
+        Remove-Variable -Name VouchZoomShots -Scope Global
+    }
+}
+
+Describe 'Capture area: page content, end to end (nothing mocked but the screen path)' -Tag 'Integration' {
+    # A real configuration run in the headless Edge: the page images are taken by the
+    # browser, so this checks the real images, their embedded metadata and -Verify.
+    BeforeAll {
+        Close-CdpSocket
+        $script:RealNewHtmlReportForArea = ${function:New-HtmlReport}
+        $script:RealClearPageZoom = ${function:Clear-PageZoom}
+        $global:VouchArea = @{ ScreenShots = 0; Foreground = 0; Maximize = 0; Clears = 0 }
+        $config = Get-DefaultVouchConfig
+        $config['browser']['profileDir'] = $script:ProfileDir
+        $config['browser']['debugPort'] = $script:CdpPort
+        $config['defaults']['captureArea'] = 'page'
+        $config['defaults']['navigationTimeoutSec'] = 10
+        $config['defaults']['settleSeconds'] = 0.1
+        $config['defaults']['scrollSettleSeconds'] = 0.1
+        $config['output']['dir'] = 'out'
+        $config['output']['reportName'] = 'area.html'
+        $config['output']['saveImages'] = $true
+        $config['output']['jsonSummary'] = $true
+        $single = { param($Mode) [ordered]@{ type = 'capture'; scroll = [ordered]@{ mode = $Mode; as = 'single' } } }
+        $config['pages'].Add([ordered]@{ name = 'Plain'; url = "$Web/ok" })
+        $config['pages'].Add([ordered]@{ name = 'Tall single'; url = "$Web/tall?px=5000"; actions = @((& $single 'page')) })
+        $config['pages'].Add([ordered]@{ name = 'Too tall'; url = "$Web/tall?px=17000"; overrides = [ordered]@{ maxScrollSegments = 3 }; actions = @((& $single 'auto')) })
+        $config['pages'].Add([ordered]@{ name = 'Inner single'; url = "$Web/innerscroll?rows=20"; actions = @((& $single 'auto')) })
+        $config['pages'].Add([ordered]@{ name = 'Inner segments'; url = "$Web/innerscroll?rows=20"
+                actions = @([ordered]@{ type = 'capture'; scroll = [ordered]@{ mode = 'auto' } }) })
+        $config['pages'].Add([ordered]@{ name = 'Zoomed'; url = "$Web/tall?px=3000"; overrides = [ordered]@{ zoomPercent = 150 }; actions = @((& $single 'page')) })
+        $config['pages'].Add([ordered]@{ name = 'After zoom'; url = "$Web/ok" })
+        $config['pages'].Add([ordered]@{ name = 'Screen page'; url = "$Web/ok"; overrides = [ordered]@{ captureArea = 'screen' } })
+        $folder = Join-Path -Path $TestDrive -ChildPath 'area'
+        [void](New-Item -ItemType Directory -Path $folder)
+        $path = Join-Path -Path $folder -ChildPath 'area.json'
+        [System.IO.File]::WriteAllText($path, ($config | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+        $script:AreaReport = Join-Path -Path $folder -ChildPath 'out\area.html'
+        $script:AreaImages = Join-Path -Path $folder -ChildPath 'out\images\area'
+
+        Mock Set-EdgeForeground { $global:VouchArea.Foreground++; $null }
+        Mock Set-EdgeWindowMaximized { $global:VouchArea.Maximize++ }
+        Mock Get-ScreenCapture {
+            $global:VouchArea.ScreenShots++
+            $bitmap = [System.Drawing.Bitmap]::new(16, 10)
+            try {
+                if ($Metadata) { Set-JpegMetadata -Image $bitmap -Metadata $Metadata }
+                $stream = [System.IO.MemoryStream]::new()
+                $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                , $stream.ToArray()
+            }
+            finally { $bitmap.Dispose() }
+        }
+        Mock Clear-PageZoom { $global:VouchArea.Clears++; & $script:RealClearPageZoom }
+        Mock New-HtmlReport {
+            $global:VouchArea.Items = $Items
+            & $script:RealNewHtmlReportForArea -Items $Items -Run $Run
+        }
+        Invoke-Main -BoundParameters @{ ConfigPath = $path } 6>$null
+        $script:AreaExit = $script:ExitCode
+        $script:AreaItems = @{}
+        foreach ($i in $global:VouchArea.Items) { $script:AreaItems[$i.Name] = $i }
+        $script:AreaHtml = [System.IO.File]::ReadAllText($script:AreaReport)
+
+        function Get-SavedImage([object]$Capture) {
+            $bytes = [System.IO.File]::ReadAllBytes((Join-Path $script:AreaImages $Capture.FileName))
+            $size = Get-ImagePixelSize -Bytes $bytes
+            [pscustomobject]@{ Bytes = $bytes; Width = $size.Width; Height = $size.Height; Metadata = (Get-ImageMetadata -Bytes $bytes) }
+        }
+    }
+
+    AfterAll { Remove-Variable -Name VouchArea -Scope Global -ErrorAction SilentlyContinue }
+
+    It 'produces a report that -Verify accepts, with real page images and their metadata' {
+        $script:AreaExit | Should -Be 0
+        $results = @(Test-ReportIntegrity -Path $script:AreaReport)
+        @($results | Where-Object { -not $_.Ok }) | Should -BeNullOrEmpty
+        $total = ($global:VouchArea.Items | ForEach-Object { $_.Captures.Count } | Measure-Object -Sum).Sum
+        @($results | Where-Object Check -like 'Metadata *').Count | Should -Be $total
+        @($results | Where-Object Check -like 'File *').Count | Should -Be $total
+    }
+
+    It 'takes page images without the screen, the window or the foreground' {
+        $global:VouchArea.ScreenShots | Should -Be 1 -Because 'only the page set to the screen area grabs the screen'
+        $global:VouchArea.Foreground | Should -Be 1
+        $global:VouchArea.Maximize | Should -Be 0 -Because 'a zoomed page-content capture does not need the window sized'
+        $script:AreaItems['Screen page'].Captures[0].CaptureArea | Should -Be 'screen'
+    }
+
+    It 'stamps every page image with its area, an honest description, the page URL and the capture time' {
+        foreach ($item in @($global:VouchArea.Items | Where-Object CaptureArea -eq 'page')) {
+            foreach ($capture in $item.Captures) {
+                $image = Get-SavedImage $capture
+                $capture.CaptureArea | Should -Be 'page' -Because $item.Name
+                $image.Metadata.CaptureArea | Should -Be 'page' -Because $item.Name
+                $image.Metadata.Screen | Should -Be "$($image.Width)x$($image.Height) image of the page content only (no browser window, taskbar or clock)"
+                $capture.Url | Should -BeLike "$Web/*" -Because $item.Name
+                $image.Metadata.PageUrl | Should -Be $capture.Url
+                $image.Metadata.CapturedAt | Should -Be $capture.CapturedAt
+                $image.Bytes[0..1] | Should -Be @(0xFF, 0xD8)
+                # The report shows the URL and time under each image: the image itself has no address bar or clock.
+                $script:AreaHtml | Should -Match ([regex]::Escape("Captured $($capture.Timestamp)"))
+            }
+        }
+        $script:AreaHtml | Should -Match '<dt>Capture area</dt><dd>Page content only'
+        $script:AreaHtml | Should -Match 'page zoom 150%'
+        $script:AreaHtml | Should -Match '<dt>Capture area</dt><dd>Full screen, including the taskbar clock</dd>'
+    }
+
+    It 'captures the window''s view for a page that does not scroll' {
+        $plain = Get-SavedImage $script:AreaItems['Plain'].Captures[0]
+        $plain.Width | Should -BeGreaterThan 800
+        $plain.Height | Should -BeGreaterThan 400
+        $script:AreaItems['Plain'].Status | Should -Be 'OK'
+    }
+
+    It 'takes one tall image of the whole document as "single"' {
+        $item = $script:AreaItems['Tall single']
+        $item.Status | Should -Be 'OK' -Because ($item.Details -join ' | ')
+        $item.Captures.Count | Should -Be 1
+        $image = Get-SavedImage $item.Captures[0]
+        $image.Height | Should -Be 5016 -Because 'the 5000 px div plus the 8 px body margin above and below'
+        $image.Width | Should -BeGreaterThan 800
+    }
+
+    It 'falls back to segments with a warning when one image would be too tall' {
+        $item = $script:AreaItems['Too tall']
+        $item.Status | Should -Be 'WARNING'
+        @($item.Details | Where-Object { $_ -like 'The page is too tall for one image (17016 pixels*16,384)*segments*' }).Count |
+            Should -Be 1 -Because ($item.Details -join ' | ')
+        $item.Captures.Count | Should -Be 3
+        $item.Captures[0].SegmentCount | Should -Be 3
+    }
+
+    It 'falls back to segments with a warning for "single" on an inner scrolling area' {
+        $item = $script:AreaItems['Inner single']
+        $item.Status | Should -Be 'WARNING'
+        @($item.Details | Where-Object { $_ -like '*only possible when the page itself scrolls; here div#main scrolls*segments*' }).Count |
+            Should -Be 1 -Because ($item.Details -join ' | ')
+        $item.Captures.Count | Should -BeGreaterOrEqual 2
+    }
+
+    It 'takes page images in segments of an inner scrolling area, like screen captures' {
+        $item = $script:AreaItems['Inner segments']
+        $item.Status | Should -Be 'OK' -Because ($item.Details -join ' | ')
+        $item.ScrollArea | Should -Be 'div#main'
+        # 2020 px of rows in a panel of the window's height less the 60 px header.
+        $item.Captures.Count | Should -BeGreaterOrEqual 3
+        $item.Captures.Count | Should -BeLessOrEqual 5
+        $item.Captures[-1].SegmentIndex | Should -Be $item.Captures[-1].SegmentCount
+        @($item.Captures.Sha256 | Sort-Object -Unique).Count | Should -Be $item.Captures.Count -Because 'each segment shows other rows'
+    }
+
+    It 'scales a zoomed page image to its on-screen size, and the next page is back at 100%' {
+        $zoomed = $script:AreaItems['Zoomed']
+        $zoomed.Status | Should -Be 'OK' -Because ($zoomed.Details -join ' | ')
+        $zoomed.ZoomPercent | Should -Be 150
+        $zoomed.Captures[0].ZoomPercent | Should -Be 150
+        $image = Get-SavedImage $zoomed.Captures[0]
+        $image.Metadata.ZoomPercent | Should -Be 150
+        $image.Height | Should -Be 4524 -Because '3016 CSS pixels at 150%'
+        $after = Get-SavedImage $script:AreaItems['After zoom'].Captures[0]
+        $plain = Get-SavedImage $script:AreaItems['Plain'].Captures[0]
+        @($after.Width, $after.Height) | Should -Be @($plain.Width, $plain.Height)
+        $after.Metadata.ZoomPercent | Should -Be 100
+    }
+
+    It 'lists the capture area of each page and image in the JSON summary' {
+        $summary = Get-Content -LiteralPath ([System.IO.Path]::ChangeExtension($script:AreaReport, '.json')) -Raw | ConvertFrom-Json
+        $zoomed = @($summary.Items | Where-Object Name -eq 'Zoomed')[0]
+        $zoomed.CaptureArea | Should -Be 'page'
+        $zoomed.ZoomPercent | Should -Be 150
+        $zoomed.Captures[0].CaptureArea | Should -Be 'page'
+    }
+
+    It 'removed the zoom for the next page and again at the end of the run' {
+        $global:VouchArea.Clears | Should -Be 2 -Because 'once for the page after the zoomed one, once at the end'
+        $script:PageZoomPercent | Should -Be 100
+    }
+}
+
+Describe 'Capture area: page content as PNG, and the end of a failed run' -Tag 'Integration' {
+    BeforeAll {
+        Connect-TestPage
+        Mock Set-EdgeForeground { throw 'page captures must not bring the window to the front' }
+        Mock Get-ScreenCapture { throw 'page captures must not grab the screen' }
+    }
+    AfterAll { Close-CdpSocket }
+
+    It 'asks the browser for a PNG and adds the metadata to it' {
+        $definition = ConvertTo-CaptureDefinition -Index 4 -Page ([ordered]@{ name = 'Png'; url = "$Web/tall?px=3000"
+                actions = @([ordered]@{ type = 'capture'; scroll = [ordered]@{ mode = 'page'; as = 'single' } }) })
+        $run = Resolve-RunSettings -BoundParameters @{ CaptureArea = 'page' } -Config $null -Defaults @{
+            NavigationTimeoutSec = 10; SettleSeconds = 0.1; ScrollSettleSeconds = 0.1; MaxScrollSegments = 10 }
+        $context = @{ RunId = [guid]::NewGuid().ToString(); Format = 'png'; Quality = 85; Extension = 'png'; SaveImages = $false; ImagesDir = ''; Screen = '1x1' }
+        $item = Invoke-CaptureItem -Definition $definition -Settings $run -CaptureContext $context 6>$null
+        $item.Status | Should -Be 'OK' -Because ($item.Details -join ' | ')
+        $item.Captures.Count | Should -Be 1
+        $bytes = [Convert]::FromBase64String($item.Captures[0].Base64)
+        [System.Text.Encoding]::ASCII.GetString($bytes, 1, 3) | Should -Be 'PNG'
+        (Get-ImagePixelSize -Bytes $bytes).Height | Should -Be 3016
+        $metadata = Get-ImageMetadata -Bytes $bytes
+        $metadata.CaptureArea | Should -Be 'page'
+        $metadata.PageUrl | Should -Be "$Web/tall?px=3000"
+        $item.Captures[0].FileName | Should -Be '004_Png_seg01.png'
+    }
+
+    It 'clears the zoom on the open connection when the run fails' {
+        Close-CdpSocket
+        $script:RealClearForFailure = ${function:Clear-PageZoom}
+        $global:VouchFail = @{ Clears = 0; Ok = 0 }
+        Mock Clear-PageZoom {
+            $global:VouchFail.Clears++
+            & $script:RealClearForFailure
+            $global:VouchFail.Ok++
+        }
+        Mock Invoke-CaptureItem { Set-PageZoom -Percent 150; throw 'Simulated failure in the middle of a page' }
+        $config = Get-DefaultVouchConfig
+        $config['browser']['profileDir'] = $script:ProfileDir
+        $config['browser']['debugPort'] = $script:CdpPort
+        $config['output']['dir'] = 'out'
+        $config['pages'].Add([ordered]@{ name = 'Plain'; url = "$Web/ok" })
+        $path = Join-Path -Path $TestDrive -ChildPath 'fail.json'
+        [System.IO.File]::WriteAllText($path, ($config | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+
+        { Invoke-Main -BoundParameters @{ ConfigPath = $path } 6>$null } | Should -Throw '*Simulated failure*'
+        $global:VouchFail.Clears | Should -Be 1
+        $global:VouchFail.Ok | Should -Be 1 -Because 'the override was removed over the connection that set it'
+        $script:PageZoomPercent | Should -Be 100
+        Remove-Variable -Name VouchFail -Scope Global
+    }
+}
+
+Describe 'Capture area: Edge window (window position mocked)' -Tag 'Integration' {
+    BeforeAll {
+        Connect-TestPage
+        Mock Set-EdgeForeground { $null }
+        Mock Get-PrimaryScreenBounds { [System.Drawing.Rectangle]::new(0, 0, 1920, 1080) }
+        Mock Get-ScreenBitmap {
+            $bitmap = [System.Drawing.Bitmap]::new(1920, 1080, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            $graphics.Clear([System.Drawing.Color]::Black)
+            $graphics.FillRectangle([System.Drawing.Brushes]::Red, 100, 50, 640, 480)
+            $graphics.Dispose()
+            $bitmap
+        }
+        Mock Get-ScreenCapture {
+            $bitmap = [System.Drawing.Bitmap]::new(16, 10)
+            try {
+                if ($Metadata) { Set-JpegMetadata -Image $bitmap -Metadata $Metadata }
+                $stream = [System.IO.MemoryStream]::new()
+                $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                , $stream.ToArray()
+            }
+            finally { $bitmap.Dispose() }
+        }
+        function Invoke-WindowPage {
+            $definition = ConvertTo-CaptureDefinition -Index 2 -Page ([ordered]@{ name = 'Window'; url = "$Web/ok" })
+            $run = Resolve-RunSettings -BoundParameters @{ CaptureArea = 'window' } -Config $null -Defaults @{
+                NavigationTimeoutSec = 10; SettleSeconds = 0.1; ScrollSettleSeconds = 0.1; MaxScrollSegments = 10 }
+            $context = @{ RunId = [guid]::NewGuid().ToString(); Format = 'png'; Quality = 85; Extension = 'png'; SaveImages = $false; ImagesDir = ''; Screen = '1920x1080' }
+            Invoke-CaptureItem -Definition $definition -Settings $run -CaptureContext $context 6>$null
+        }
+    }
+    AfterAll { Close-CdpSocket }
+
+    It 'cuts the screen image down to the window' {
+        Mock Get-EdgeWindowBounds { [System.Drawing.Rectangle]::new(100, 50, 640, 480) }
+        $item = Invoke-WindowPage
+        $item.Status | Should -Be 'OK' -Because ($item.Details -join ' | ')
+        $item.CaptureArea | Should -Be 'window'
+        $item.Captures[0].CaptureArea | Should -Be 'window'
+        $bytes = [Convert]::FromBase64String($item.Captures[0].Base64)
+        $image = [System.Drawing.Bitmap]::new([System.IO.MemoryStream]::new($bytes))
+        try {
+            @($image.Width, $image.Height) | Should -Be @(640, 480)
+            $image.GetPixel(0, 0).R | Should -Be 255
+            $image.GetPixel(639, 479).R | Should -Be 255
+        }
+        finally { $image.Dispose() }
+        $metadata = Get-ImageMetadata -Bytes $bytes
+        $metadata.CaptureArea | Should -Be 'window'
+        $metadata.Screen | Should -Be '640x480 Edge window at (100,50) of the 1920x1080 primary display'
+        $metadata.PageUrl | Should -Be "$Web/ok"
+        Should -Invoke Get-ScreenCapture -Times 0 -Exactly
+    }
+
+    It 'captures the whole screen with a warning when <Case>' -ForEach @(
+        @{ Case = 'the window is not found'; Bounds = $null }
+        @{ Case = 'the window is on another monitor'; Bounds = @(2500, 0, 800, 600) }
+    ) {
+        $script:TestBounds = if ($Bounds) { [System.Drawing.Rectangle]::new($Bounds[0], $Bounds[1], $Bounds[2], $Bounds[3]) } else { $null }
+        Mock Get-EdgeWindowBounds { $script:TestBounds }
+        $item = Invoke-WindowPage
+        $item.Status | Should -Be 'WARNING'
+        @($item.Details | Where-Object { $_ -like 'The Edge window could not be found on the main display, so the whole screen was captured*' }).Count | Should -Be 1
+        $item.Captures.Count | Should -Be 1
+        $item.Captures[0].CaptureArea | Should -Be 'screen'
+        (Get-ImageMetadata -Bytes ([Convert]::FromBase64String($item.Captures[0].Base64))).CaptureArea | Should -Be 'screen'
+        Should -Invoke Get-ScreenCapture -Times 1 -Exactly
     }
 }
 
