@@ -5282,8 +5282,9 @@ table.contents ul { margin: 4px 0 0 0; padding-left: 18px; }
         [void]$sb.Append('<header class="company">')
         if ($Options.LogoDataUri) {
             # Only ever an <img> source: an SVG logo shown this way cannot run script.
-            # data-vouch-logo: -Verify accepts this one image without a hash, and no other.
-            [void]$sb.Append("<img class=""logo"" data-vouch-logo alt=""Company logo"" src=""$(Encode-Html $Options.LogoDataUri)"">")
+            # data-vouch-logo: -Verify accepts one such image without a hash, before the
+            # <h1> (Get-ReportImageList). Only name="value" attributes, as every <img> here.
+            [void]$sb.Append("<img class=""logo"" data-vouch-logo=""true"" alt=""Company logo"" src=""$(Encode-Html $Options.LogoDataUri)"">")
         }
         [void]$sb.Append('<div class="company-text">')
         if ($Options.CompanyName) { [void]$sb.Append("<div class=""company-name"">$(Encode-Html $Options.CompanyName)</div>") }
@@ -5754,49 +5755,95 @@ function ConvertTo-RunSummaryJson {
     return ($summary | ConvertTo-Json -Depth 6)
 }
 
-function Remove-HtmlComment {
-    # Text inside <!-- --> is never shown, so it is neither checked nor counted. An
-    # unclosed comment hides the rest of the page in a browser, and so here.
-    param([AllowEmptyString()][string]$Html)
-    return [regex]::Replace($Html, '<!--.*?(?:-->|\z)', '', [System.Text.RegularExpressions.RegexOptions]::Singleline)
-}
-
 function Get-ReportImageList {
     <#
-        The images of a report: each <img> outside comments, with its attributes read one
-        by one, in whatever order they come, and HTML-decoded. Reading them individually
-        is what lets a linked report (relative src) and a report written by another tool
-        or version be checked; a fixed pattern could not. The tag is found the way a
-        browser reads it: a ">" inside a quoted value does not end it, and "<img/src=..."
-        is an image too - otherwise an image could be shown that -Verify never sees.
-        Without -All only the screenshots (data-sha256) are returned.
-        Returns a list of { Attributes (name -> value, case-insensitive); Position; Hashed }.
+        The pictures of a report, read by a whitelist instead of the way a browser parses
+        HTML: a report is written by New-HtmlReport (Vouch 1.2 to 2.x), so anything it
+        never writes is a reason to refuse the report, not something to interpret.
+        Comments, CDATA, <base> and every element that can show or load a picture other
+        than <img> are refused outright. Every raw "<img" or "<image", wherever it is (also
+        inside what may look like an attribute value or style text - user text in a real
+        report is HTML-encoded, so "<" never appears raw there), must start a tag in the
+        generator's exact form: <img, then one or more ' name="value"' (one space, a
+        lower-case name, double quotes, no raw " < > in the value, no name twice),
+        optionally " /", then ">". Such a tag must be a screenshot (exactly the generator's
+        screenshot attributes) or the one company logo (exactly the logo attributes, a
+        data:image/ src, before the first <h1>). Anything else is listed in Problems.
+        Returns { Images (each { Attributes; Position; Kind = screenshot|logo }); Problems }.
     #>
-    param(
-        [Parameter(Mandatory)][AllowEmptyString()][string]$Html,
-        [switch]$All
-    )
-    $list = [System.Collections.Generic.List[object]]::new()
-    $Html = Remove-HtmlComment -Html $Html
-    $attributePattern = [regex]'[\s/]+([^\s=/>"'']+)(?:\s*=\s*(?:"([^"]*)"|''([^'']*)''|([^\s"''>]+)))?'
-    $tagPattern = '<img(?=[\s/>])(?:[^>"'']|"[^"]*"|''[^'']*'')*>'
-    foreach ($tag in [regex]::Matches($Html, $tagPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
-        $attributes = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        # Group 0 starts with "<img"; the attributes follow it.
-        foreach ($match in $attributePattern.Matches($tag.Value.Substring(4))) {
-            $name = $match.Groups[1].Value
-            if ($attributes.ContainsKey($name)) { continue }   # the first one counts, as in a browser
-            $raw = if ($match.Groups[2].Success) { $match.Groups[2].Value }
-            elseif ($match.Groups[3].Success) { $match.Groups[3].Value }
-            else { $match.Groups[4].Value }
-            $attributes[$name] = [System.Net.WebUtility]::HtmlDecode($raw)
-        }
-        $hashed = $attributes.ContainsKey('data-sha256')
-        if ($hashed -or $All) {
-            $list.Add([pscustomobject]@{ Attributes = $attributes; Position = $tag.Index; Hashed = $hashed })
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Html)
+    $ignoreCase = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+    $images = [System.Collections.Generic.List[object]]::new()
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $where = {
+        param([int]$Index)
+        $line = 1 + ([regex]::Matches($Html.Substring(0, $Index), "`n")).Count
+        $snippet = $Html.Substring($Index, [Math]::Min(70, $Html.Length - $Index)) -replace '\s+', ' '
+        "line $line, at '$snippet'"
+    }
+
+    # Never written by the generator; each could hide, redirect or add a picture.
+    $forbidden = [ordered]@{
+        '<!--'                 = 'an HTML comment'
+        '<!\[CDATA\['          = 'a CDATA section'
+        '<base'                = 'a <base> element, which makes a browser load images from somewhere else'
+        '<picture'             = 'a <picture> element'
+        '<source'              = 'a <source> element'
+        '<object'              = 'an <object> element'
+        '<embed'               = 'an <embed> element'
+        '<iframe'              = 'an <iframe> element'
+        '<frame'               = 'a <frame> element'
+        '<svg'                 = 'an <svg> element'
+        '<video'               = 'a <video> element'
+        '<canvas'              = 'a <canvas> element'
+        '<script'              = 'a <script> element'
+        '<link'                = 'a <link> element'
+        '<input'               = 'an <input> element'
+        '<meta[^>]*http-equiv' = 'a <meta http-equiv> element'
+    }
+    foreach ($pattern in $forbidden.Keys) {
+        foreach ($match in [regex]::Matches($Html, $pattern, $ignoreCase)) {
+            $problems.Add("The report contains $($forbidden[$pattern]) ($(& $where $match.Index)). A report made by Vouch never contains one.")
         }
     }
-    return , $list
+
+    $tagPattern = [regex]'\G<img((?: [a-z][a-z0-9-]*="[^"<>]*")+)(?: /)?>'
+    $attributePattern = [regex]' ([a-z][a-z0-9-]*)="([^"<>]*)"'
+    $screenshotNames = @('alt', 'data-file', 'data-sha256', 'data-captured', 'data-url', 'src')
+    $logoNames = @('class', 'data-vouch-logo', 'alt', 'src')
+    $firstHeading = $Html.IndexOf('<h1', [System.StringComparison]::OrdinalIgnoreCase)
+    $logoSeen = $false
+    foreach ($occurrence in [regex]::Matches($Html, '<im(?:g|age)', $ignoreCase)) {
+        $tag = $tagPattern.Match($Html, $occurrence.Index)
+        if ($occurrence.Value -cne '<img' -or $occurrence.Value.Length -ne 4 -or -not $tag.Success) {
+            $problems.Add("An image tag is not in the form Vouch writes ($(& $where $occurrence.Index)).")
+            continue
+        }
+        $attributes = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $duplicate = $false
+        foreach ($match in $attributePattern.Matches($tag.Groups[1].Value)) {
+            if ($attributes.ContainsKey($match.Groups[1].Value)) { $duplicate = $true; break }
+            $attributes[$match.Groups[1].Value] = [System.Net.WebUtility]::HtmlDecode($match.Groups[2].Value)
+        }
+        if ($duplicate) { $problems.Add("An image tag names an attribute twice ($(& $where $occurrence.Index))."); continue }
+        $names = @($attributes.Keys | Sort-Object)
+        if (-not (Compare-Object -ReferenceObject @($screenshotNames | Sort-Object) -DifferenceObject $names)) {
+            $images.Add([pscustomobject]@{ Attributes = $attributes; Position = $occurrence.Index; Kind = 'screenshot' })
+            continue
+        }
+        if (-not (Compare-Object -ReferenceObject @($logoNames | Sort-Object) -DifferenceObject $names)) {
+            if ($logoSeen) { $problems.Add("The report has a second company logo ($(& $where $occurrence.Index)); Vouch writes at most one."); continue }
+            if ($firstHeading -lt 0 -or $occurrence.Index -gt $firstHeading) { $problems.Add("The company logo is not at the top of the report, before its title ($(& $where $occurrence.Index))."); continue }
+            if ($attributes['src'] -notmatch '^data:image/(?:png|jpeg|gif|svg\+xml);base64,[A-Za-z0-9+/=]+$') {
+                $problems.Add("The company logo is not an image stored inside the report ($(& $where $occurrence.Index))."); continue
+            }
+            $logoSeen = $true
+            $images.Add([pscustomobject]@{ Attributes = $attributes; Position = $occurrence.Index; Kind = 'logo' })
+            continue
+        }
+        $problems.Add("An image is neither a screenshot with its hash nor the company logo (attributes: $($names -join ', '); $(& $where $occurrence.Index)). A report made by Vouch never contains one.")
+    }
+    return [pscustomobject]@{ Images = $images; Problems = $problems }
 }
 function Resolve-ReportImagePath {
     <#
@@ -5860,24 +5907,12 @@ function Test-ReportIntegrity {
     $results = [System.Collections.Generic.List[object]]::new()
     $add = { param($Check, $Ok, $Detail) $results.Add([pscustomobject]@{ Check = $Check; Ok = [bool]$Ok; Detail = $Detail }) }
 
-    # A <base> element sends a browser to another place for every relative image, while
-    # -Verify reads the files next to the report. Vouch never writes one.
-    if ([regex]::IsMatch((Remove-HtmlComment -Html $html), '<base(?=[\s/>])', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
-        & $add 'Report' $false 'The report contains a <base> element, which makes a browser load the images from somewhere else than the files checked here. A report made by Vouch never contains one.'
-    }
-    $allImages = Get-ReportImageList -Html $html -All
-    $images = @($allImages | Where-Object Hashed)
+    # Whitelist: every picture the report can show must be a screenshot checked below or
+    # the one company logo; anything the generator never writes fails the report.
+    $scan = Get-ReportImageList -Html $html
+    foreach ($problem in $scan.Problems) { & $add 'Report markup' $false $problem }
+    $images = @($scan.Images | Where-Object Kind -eq 'screenshot')
     if ($images.Count -eq 0) { & $add 'Report' $false 'No hashed screenshots found - not a Vouch 1.2+ report, or it has no captures.' }
-    # Every image a browser would show must be one that is checked; only the company
-    # logo (data-vouch-logo) is shown without a hash.
-    $unhashed = 0
-    foreach ($image in @($allImages | Where-Object { -not $_.Hashed })) {
-        if ($image.Attributes.ContainsKey('data-vouch-logo')) { continue }
-        $unhashed++
-        $source = if ($image.Attributes.ContainsKey('src')) { [string]$image.Attributes['src'] } else { '' }
-        if ($source.Length -gt 60) { $source = $source.Substring(0, 60) + '...' }
-        & $add "Unverified image $unhashed" $false "the report shows an image ($(if ($source) { $source } else { 'no src' })) that has no SHA-256, so it cannot be checked. A report made by Vouch never contains one."
-    }
 
     $manifestLines = [System.Collections.Generic.List[string]]::new()
     $number = 0
@@ -5894,11 +5929,7 @@ function Test-ReportIntegrity {
             continue
         }
 
-        # srcset lets a browser show another picture than src, which is the one checked.
-        if ($attributes.ContainsKey('srcset')) {
-            & $add "Image $label" $false 'it has a srcset, so a browser may show another picture than the one checked'
-            continue
-        }
+
         $bytes = $null
         $source = & $read 'src'
         try {

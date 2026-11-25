@@ -1928,7 +1928,7 @@ Describe 'Report content (-Options)' {
     }
 
     It 'shows the company block with the logo as an image and the details on their own lines' {
-        $script:Html | Should -Match '<header class="company"><img class="logo" data-vouch-logo alt="Company logo" src="data:image/png;base64,iVBORw0KGgo=">'
+        $script:Html | Should -Match '<header class="company"><img class="logo" data-vouch-logo="true" alt="Company logo" src="data:image/png;base64,iVBORw0KGgo=">'
         $script:Html | Should -Match '<div class="company-name">ACME &lt;script&gt;'
         $script:Html | Should -Match "<div class=""company-details"">1 Main St`nSpringfield &lt;b&gt;x&lt;/b&gt;</div>"
         $script:Html | Should -Match 'white-space: pre-line'
@@ -2152,7 +2152,7 @@ Describe 'Get-LogoDataUri' {
             -Options (New-ReportOptions -LogoDataUri $logo.DataUri -CompanyName 'ACME')
         $html | Should -Not -Match '<svg'
         $html | Should -Not -Match '<script>'
-        $html | Should -Match '<img class="logo" data-vouch-logo alt="Company logo" src="data:image/svg\+xml;base64,'
+        $html | Should -Match '<img class="logo" data-vouch-logo="true" alt="Company logo" src="data:image/svg\+xml;base64,'
     }
 
     It 'warns and gives no logo for <Case>' -ForEach @(
