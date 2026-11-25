@@ -2458,44 +2458,458 @@ function Start-RunLog {
     }
 }
 
+function Get-RunSettingDefinition {
+    <#
+        The one list of run-level settings: the script parameter each one comes from, the
+        type it is used as, and where a configuration file keeps it. Resolve-RunSettings
+        and Invoke-Main both read it, so a setting added here is picked up by both.
+        Settings without a config location (CsvPath, Verify, LoginSetup) are command-line
+        only: they choose what the run does, not how it captures.
+    #>
+    return @(
+        [pscustomobject]@{ Name = 'CsvPath';              Type = 'string'; Section = '';         Key = '' }
+        [pscustomobject]@{ Name = 'OutputDir';            Type = 'string'; Section = 'output';   Key = 'dir' }
+        [pscustomobject]@{ Name = 'ReportName';           Type = 'string'; Section = 'output';   Key = 'reportName' }
+        [pscustomobject]@{ Name = 'EdgeProfileDir';       Type = 'string'; Section = 'browser';  Key = 'profileDir' }
+        [pscustomobject]@{ Name = 'DebugPort';            Type = 'int';    Section = 'browser';  Key = 'debugPort' }
+        [pscustomobject]@{ Name = 'NavigationTimeoutSec'; Type = 'int';    Section = 'defaults'; Key = 'navigationTimeoutSec' }
+        [pscustomobject]@{ Name = 'SettleSeconds';        Type = 'double'; Section = 'defaults'; Key = 'settleSeconds' }
+        [pscustomobject]@{ Name = 'ScrollSettleSeconds';  Type = 'double'; Section = 'defaults'; Key = 'scrollSettleSeconds' }
+        [pscustomobject]@{ Name = 'MaxScrollSegments';    Type = 'int';    Section = 'defaults'; Key = 'maxScrollSegments' }
+        [pscustomobject]@{ Name = 'ImageFormat';          Type = 'string'; Section = 'output';   Key = 'imageFormat' }
+        [pscustomobject]@{ Name = 'JpegQuality';          Type = 'int';    Section = 'output';   Key = 'jpegQuality' }
+        [pscustomobject]@{ Name = 'SaveImages';           Type = 'bool';   Section = 'output';   Key = 'saveImages' }
+        [pscustomobject]@{ Name = 'KeepBrowserOpen';      Type = 'bool';   Section = 'browser';  Key = 'keepBrowserOpen' }
+        [pscustomobject]@{ Name = 'FailOnWarning';        Type = 'bool';   Section = 'output';   Key = 'failOnWarning' }
+        [pscustomobject]@{ Name = 'LogDir';               Type = 'string'; Section = 'output';   Key = 'logDir' }
+        [pscustomobject]@{ Name = 'JsonSummary';          Type = 'bool';   Section = 'output';   Key = 'jsonSummary' }
+        [pscustomobject]@{ Name = 'UseVirtualDesktop';    Type = 'bool';   Section = 'browser';  Key = 'useVirtualDesktop' }
+        [pscustomobject]@{ Name = 'Verify';               Type = 'string'; Section = '';         Key = '' }
+        [pscustomobject]@{ Name = 'LoginSetup';           Type = 'bool';   Section = '';         Key = '' }
+    )
+}
+
+function Get-ConfigValue {
+    <#
+        Reads one value from a configuration object that may be a parsed JSON object
+        (ConvertFrom-Json) or a hashtable. Returns $found = $false for a missing section
+        or key, a null value, or a blank string: the config file template writes "" for
+        "use the default", so blank must not override the parameter default.
+    #>
+    param(
+        [AllowNull()][object]$Config,
+        [Parameter(Mandatory)][string]$Section,
+        [Parameter(Mandatory)][string]$Key
+    )
+
+    $notFound = [pscustomobject]@{ Found = $false; Value = $null }
+    if ($null -eq $Config) { return $notFound }
+
+    $container = $null
+    if ($Config -is [System.Collections.IDictionary]) {
+        if (@($Config.Keys) -contains $Section) { $container = $Config[$Section] }
+    }
+    elseif ($Config.PSObject.Properties[$Section]) { $container = $Config.$Section }
+    if ($null -eq $container) { return $notFound }
+
+    $value = $null
+    if ($container -is [System.Collections.IDictionary]) {
+        if (@($container.Keys) -notcontains $Key) { return $notFound }
+        $value = $container[$Key]
+    }
+    elseif ($container.PSObject.Properties[$Key]) { $value = $container.$Key }
+    else { return $notFound }
+
+    if ($null -eq $value) { return $notFound }
+    if ($value -is [string] -and [string]::IsNullOrWhiteSpace($value)) { return $notFound }
+    return [pscustomobject]@{ Found = $true; Value = $value }
+}
+
+function Resolve-RunSettings {
+    <#
+        One place where every run-level value is decided, so the capture code never reads
+        script parameters and a single page can be run on its own (Designer, -Only).
+        Precedence: a parameter the user typed > the configuration file > the parameter's
+        default. "Typed" means present in the bound parameters, so -SaveImages:$false
+        still beats "saveImages": true in a config. Pure: no variables outside its own
+        parameters are read.
+    #>
+    param(
+        # $PSBoundParameters of the script (or any dictionary of explicitly chosen values).
+        [AllowNull()][System.Collections.IDictionary]$BoundParameters,
+        # The parameter defaults, by parameter name.
+        [AllowNull()][System.Collections.IDictionary]$Defaults,
+        # A parsed configuration (sections browser / defaults / output); $null for none.
+        [AllowNull()][object]$Config = $null
+    )
+
+    $settings = [ordered]@{}
+    foreach ($definition in Get-RunSettingDefinition) {
+        $name = $definition.Name
+        $value = $null
+        if ($null -ne $BoundParameters -and @($BoundParameters.Keys) -contains $name) {
+            $value = $BoundParameters[$name]
+        }
+        else {
+            $fromConfig = [pscustomobject]@{ Found = $false; Value = $null }
+            if ($definition.Section) {
+                $fromConfig = Get-ConfigValue -Config $Config -Section $definition.Section -Key $definition.Key
+            }
+            if ($fromConfig.Found) { $value = $fromConfig.Value }
+            elseif ($null -ne $Defaults -and @($Defaults.Keys) -contains $name) { $value = $Defaults[$name] }
+        }
+
+        # [bool] turns a [switch] into a plain true/false; [string] turns a missing value
+        # into '' - both read the same way the script's own parameters did.
+        $settings[$name] = switch ($definition.Type) {
+            'bool'   { [bool]$value }
+            'int'    { [int]$value }
+            'double' { [double]$value }
+            default  { [string]$value }
+        }
+    }
+    return [pscustomobject]$settings
+}
+
+function New-CaptureItem {
+    <#
+        The result record for one page. Built before the page is visited, so the page
+        still appears in the report (as FAILED) whatever goes wrong while capturing it.
+    #>
+    param([Parameter(Mandatory)][object]$Definition)
+
+    return [pscustomobject]@{
+        Index          = $Definition.Index
+        Name           = $Definition.Name
+        Url            = $Definition.Url
+        FinalUrl       = ''
+        Notes          = $Definition.Notes
+        StepsText      = $Definition.StepsText
+        ScrollFullPage = $Definition.ScrollFullPage
+        ScrollArea     = ''
+        Status         = 'OK'
+        HttpStatus     = 0
+        Details        = [System.Collections.Generic.List[string]]::new()
+        StepLog        = [System.Collections.Generic.List[object]]::new()
+        Captures       = [System.Collections.Generic.List[object]]::new()
+    }
+}
+
+function Invoke-ScrollCapture {
+    <#
+        Takes the screenshots for a page that is already loaded and in the foreground:
+        one screen, or (ScrollFullPage) one per screen of whatever scrolls - the page, a
+        panel inside it or a frame. Errors from scrolling itself are left to the caller
+        (Invoke-CaptureItem marks the page FAILED and the run moves on).
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Item,
+        [Parameter(Mandatory)][bool]$ScrollFullPage,
+        # The browser's own error page is shown: its URL is not the page's, so keep FinalUrl.
+        [Parameter(Mandatory)][bool]$BrowserErrorPage,
+        [Parameter(Mandatory)][object]$Settings,
+        [Parameter(Mandatory)][hashtable]$CaptureContext
+    )
+
+    $item = $Item
+    $maxScrollSegments = $Settings.MaxScrollSegments
+    $scrollSettleMs = [int]($Settings.ScrollSettleSeconds * 1000)
+
+    $segmentCount = 1
+    $viewportHeight = 0.0
+    if ($ScrollFullPage) {
+        try {
+            # Find what scrolls - the page, a panel inside it, or a frame - and start at its top.
+            $scrollTarget = Invoke-CdpEval -Expression (Get-ScrollTargetScript) -TimeoutSec 20
+            Start-Sleep -Milliseconds $scrollSettleMs
+
+            $viewportHeight = [double]$scrollTarget.view
+            $pageHeight = [double]$scrollTarget.total
+            $item.ScrollArea = switch ([string]$scrollTarget.kind) {
+                'window'  { 'the page' }
+                'none'    { 'nothing to scroll - the content fits on one screen' }
+                default   { [string]$scrollTarget.description }
+            }
+            foreach ($other in @($scrollTarget.others)) {
+                if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
+                $item.Details.Add("Another scrolling area ($other) was not scrolled; content hidden in it is not captured.")
+            }
+            foreach ($frameName in @($scrollTarget.blockedFrames)) {
+                if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
+                $item.Details.Add("A frame from another site ($frameName) cannot be scrolled; content hidden in it is not captured.")
+            }
+
+            if ($viewportHeight -gt 0 -and $pageHeight -gt 0) {
+                $segmentCount = [int][Math]::Ceiling($pageHeight / $viewportHeight)
+            }
+            if ($segmentCount -lt 1) { $segmentCount = 1 }
+        }
+        catch {
+            if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
+            $item.Details.Add("The page height could not be measured, so only the first screen was captured: $($_.Exception.Message)")
+            $segmentCount = 1
+            $viewportHeight = 0
+        }
+    }
+
+    $truncationMessage = "Page truncated at $maxScrollSegments segments (raise -MaxScrollSegments to capture more)."
+    $truncationNoted = $false
+    if ($segmentCount -gt $maxScrollSegments) {
+        $segmentCount = $maxScrollSegments
+        if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
+        $item.Details.Add($truncationMessage)
+        $truncationNoted = $true
+    }
+
+    if ($ScrollFullPage -and $segmentCount -gt 1 -and $viewportHeight -gt 0) {
+        $recheckDone = $false
+        for ($segment = 0; $segment -lt $segmentCount; $segment++) {
+            $offset = [int]([Math]::Round($segment * $viewportHeight))
+            [void](Invoke-CdpEval -Expression "window.__vouchTarget.to($offset)" -TimeoutSec 10)
+            Start-Sleep -Milliseconds $scrollSettleMs
+
+            # Lazy-loading pages grow after the first scroll; re-measure once only.
+            if (-not $recheckDone) {
+                $recheckDone = $true
+                try {
+                    $grownHeight = [double](Invoke-CdpEval -Expression 'window.__vouchTarget.measure().total' -TimeoutSec 10)
+                    if ($grownHeight -gt 0) {
+                        $recomputed = [int][Math]::Ceiling($grownHeight / $viewportHeight)
+                        if ($recomputed -gt $segmentCount) {
+                            if ($recomputed -gt $maxScrollSegments) {
+                                $recomputed = $maxScrollSegments
+                                if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
+                                if (-not $truncationNoted) {
+                                    $item.Details.Add($truncationMessage)
+                                    $truncationNoted = $true
+                                }
+                            }
+                            $segmentCount = $recomputed
+                        }
+                    }
+                }
+                catch {
+                    Write-Verbose "Could not re-measure the page height: $($_.Exception.Message)"
+                }
+            }
+
+            $segmentUrl = if ($BrowserErrorPage) { $item.FinalUrl } else { Get-CurrentPageUrl }
+            Add-ItemCapture -Item $item -SegmentIndex ($segment + 1) -SegmentCount $segmentCount -PageUrl $segmentUrl -Context $CaptureContext
+        }
+
+        try { [void](Invoke-CdpEval -Expression 'window.__vouchTarget.to(0)' -TimeoutSec 10) }
+        catch { Write-Verbose "Could not scroll back to the top: $($_.Exception.Message)" }
+    }
+    else {
+        Add-ItemCapture -Item $item -SegmentIndex 1 -SegmentCount 1 -PageUrl $item.FinalUrl -Context $CaptureContext
+    }
+}
+
+function Invoke-CaptureItem {
+    <#
+        Captures one page in the tab the CDP socket is connected to: navigate, wait until
+        ready, check for errors and sign-in redirects, run the steps, bring Edge to the
+        front and take the screenshots. Never throws: whatever goes wrong is recorded on
+        the item, because one failing page must not stop a run.
+        Pass -Item to fill a record the caller already holds (Invoke-Main adds it to the
+        run before visiting the page); otherwise a new one is made. Returns the item.
+    #>
+    param(
+        # One row from Import-CaptureDefinition.
+        [Parameter(Mandatory)][object]$Definition,
+        # From Resolve-RunSettings.
+        [Parameter(Mandatory)][object]$Settings,
+        # Run-wide capture values for Add-ItemCapture (RunId, Format, ImagesDir, ...).
+        [Parameter(Mandatory)][hashtable]$CaptureContext,
+        # Only for the "[n/total]" progress line.
+        [int]$ItemCount = 1,
+        [object]$Item = $null
+    )
+
+    if ($null -eq $Item) { $Item = New-CaptureItem -Definition $Definition }
+    $item = $Item
+    $definition = $Definition
+    $navigationTimeoutSec = $Settings.NavigationTimeoutSec
+    $settleSeconds = $Settings.SettleSeconds
+
+    Write-Host ("[{0}/{1}] {2} - {3}" -f $definition.Index, $ItemCount, $definition.Name, $definition.Url)
+
+    try {
+        Set-NavigationMarker
+        $navigation = Send-CdpCommand -Method 'Page.navigate' -Params @{ url = $definition.Url } -TimeoutSec $navigationTimeoutSec
+        $browserErrorPage = $false
+        if ($null -ne $navigation -and $navigation.PSObject.Properties['errorText'] -and
+            -not [string]::IsNullOrWhiteSpace([string]$navigation.errorText)) {
+            $errorText = [string]$navigation.errorText
+            $item.Status = 'FAILED'
+            if ($errorText -eq 'net::ERR_HTTP_RESPONSE_CODE_FAILURE') {
+                # An HTTP error with an empty body: Edge shows its own error page
+                # instead, which is evidence like any other error page.
+                $browserErrorPage = $true
+                $item.Details.Add("The server returned an HTTP error with an empty body ($errorText). The browser's error page is captured below as evidence.")
+            }
+            else {
+                $item.Details.Add("The page could not be loaded: $errorText")
+                Write-RowStatus -Message "    FAILED - $errorText" -Status 'FAILED'
+                return $item
+            }
+        }
+
+        if (-not (Wait-PageReady -TimeoutSec $navigationTimeoutSec)) {
+            if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
+            $item.Details.Add("The page did not finish loading within $navigationTimeoutSec seconds; it was captured in whatever state it had reached.")
+        }
+
+        Start-Sleep -Milliseconds ([int]($settleSeconds * 1000))
+
+        # Chromium exposes the HTTP status of the main document on the
+        # PerformanceNavigationTiming entry; older builds return 0.
+        try {
+            $statusValue = Invoke-CdpEval -Expression "(performance.getEntriesByType('navigation')[0]||{}).responseStatus||0" -TimeoutSec 10
+            if ($null -ne $statusValue) { $item.HttpStatus = [int]$statusValue }
+        }
+        catch {
+            $item.Details.Add("The HTTP status could not be read from the page: $($_.Exception.Message)")
+        }
+
+        if ($item.HttpStatus -ge 400) {
+            $item.Status = 'FAILED'
+            $item.Details.Add("The server returned HTTP $($item.HttpStatus). The error page is captured below as evidence.")
+        }
+
+        # Edge's error page lives at chrome-error://; the browser stayed on the
+        # requested URL, so record that rather than report a redirect.
+        $item.FinalUrl = if ($browserErrorPage) { $definition.Url } else { Get-CurrentPageUrl }
+        $requestedOrigin = Get-OriginFromUrl -Url $definition.Url
+        $finalOrigin = Get-OriginFromUrl -Url $item.FinalUrl
+        if (-not [string]::IsNullOrWhiteSpace($finalOrigin) -and
+            -not [string]::IsNullOrWhiteSpace($requestedOrigin) -and
+            $finalOrigin -ne $requestedOrigin -and
+            -not (Test-HttpsUpgrade -RequestedUrl $definition.Url -FinalUrl $item.FinalUrl)) {
+            if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
+            $item.Details.Add("Redirected to $finalOrigin - possible login required.")
+        }
+        elseif (-not $browserErrorPage -and -not [string]::IsNullOrWhiteSpace($item.FinalUrl)) {
+            $hasPasswordField = $false
+            try {
+                $hasPasswordField = [bool](Invoke-CdpEval -TimeoutSec 10 -Expression (
+                    "Array.prototype.some.call(document.querySelectorAll('input[type=password]'), " +
+                    "function (e) { var r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; })"))
+            }
+            catch {
+                Write-Verbose "Could not look for a password field: $($_.Exception.Message)"
+            }
+            if (Test-LoginRedirect -RequestedUrl $definition.Url -FinalUrl $item.FinalUrl -HasPasswordField $hasPasswordField) {
+                if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
+                $item.Details.Add("Redirected to a sign-in page ($(([Uri]$item.FinalUrl).AbsolutePath)) - the session has probably expired. Run -LoginSetup.")
+            }
+        }
+
+        if ($definition.Steps.Count -gt 0) {
+            $stepLog = Invoke-RowSteps -Steps @($definition.Steps) -SettleSeconds $settleSeconds -NavigationTimeoutSec $navigationTimeoutSec
+            foreach ($entry in $stepLog) { $item.StepLog.Add($entry) }
+            $failedSteps = @($stepLog | Where-Object { -not $_.Ok })
+            if ($failedSteps.Count -gt 0) {
+                if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
+                $item.Details.Add("Completed with errors: $($failedSteps.Count) of $($stepLog.Count) step(s) failed.")
+            }
+            if (-not $browserErrorPage) { $item.FinalUrl = Get-CurrentPageUrl }
+        }
+
+        try { [void](Send-CdpCommand -Method 'Page.bringToFront' -TimeoutSec 10) }
+        catch { Write-Verbose "Page.bringToFront failed: $($_.Exception.Message)" }
+
+        $pageTitle = ''
+        try { $pageTitle = [string](Invoke-CdpEval -Expression 'document.title' -TimeoutSec 10) }
+        catch { Write-Verbose "Could not read the page title: $($_.Exception.Message)" }
+
+        $focusWarning = Set-EdgeForeground -ExpectedTitle $pageTitle
+        if ($null -ne $focusWarning) {
+            if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
+            $item.Details.Add($focusWarning)
+        }
+
+        Invoke-ScrollCapture -Item $item -ScrollFullPage ([bool]$definition.ScrollFullPage) -BrowserErrorPage $browserErrorPage `
+            -Settings $Settings -CaptureContext $CaptureContext
+
+        $summary = "    $($item.Status) - $($item.Captures.Count) capture(s)"
+        if ($item.Details.Count -gt 0) { $summary += " - $($item.Details[0])" }
+        Write-RowStatus -Message $summary -Status $item.Status
+    }
+    catch {
+        $item.Status = 'FAILED'
+        $item.Details.Add("Unhandled error while capturing this item: $($_.Exception.Message)")
+        Write-RowStatus -Message "    FAILED - $($_.Exception.Message)" -Status 'FAILED'
+    }
+    return $item
+}
+
 function Invoke-Main {
+    <#
+        Runs the whole job: verify, login setup, or a capture run.
+        Settings come from Resolve-RunSettings. The script passes -BoundParameters
+        $PSBoundParameters; the parameter defaults are then the values of the script
+        parameters it did not bind, read from the calling scope.
+        Without -BoundParameters (the end-to-end tests set the parameters as plain
+        variables and call Invoke-Main with no arguments), every value visible in the
+        calling scope counts as explicitly chosen, so it would also beat a config file.
+        Nothing below the settings resolution reads a script parameter directly.
+    #>
+    param([AllowNull()][System.Collections.IDictionary]$BoundParameters = $null)
+
+    $inScope = @{}
+    foreach ($definition in Get-RunSettingDefinition) {
+        $variable = Get-Variable -Name $definition.Name -ErrorAction SilentlyContinue
+        if ($null -ne $variable) { $inScope[$definition.Name] = $variable.Value }
+    }
+    if ($null -eq $BoundParameters) {
+        $settings = Resolve-RunSettings -BoundParameters $inScope -Defaults @{} -Config $null
+    }
+    else {
+        $defaults = @{}
+        foreach ($name in $inScope.Keys) {
+            if (@($BoundParameters.Keys) -notcontains $name) { $defaults[$name] = $inScope[$name] }
+        }
+        $settings = Resolve-RunSettings -BoundParameters $BoundParameters -Defaults $defaults -Config $null
+    }
+
     Assert-Environment
 
     Add-Type -AssemblyName System.Drawing
     Add-Type -AssemblyName System.Windows.Forms
     Initialize-NativeInterop
 
-    if ($Verify) {
+    if ($settings.Verify) {
         # Needs no browser: works on any Windows machine the report is copied to.
-        $script:ExitCode = Invoke-VerifyReport -Path $Verify
+        $script:ExitCode = Invoke-VerifyReport -Path $settings.Verify
         return
     }
 
     $edgePath = Find-EdgeExecutable
 
     # Absolute, so Edge receives the same path the process lookups search for.
-    $profileDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($EdgeProfileDir)
+    $profileDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($settings.EdgeProfileDir)
 
-    if ($LoginSetup) {
+    if ($settings.LoginSetup) {
         Invoke-LoginSetup -EdgePath $edgePath -ProfileDir $profileDir
         $script:ExitCode = 0
         return
     }
 
-    if (-not (Test-Path -LiteralPath $CsvPath -PathType Leaf)) {
-        throw "Capture definition CSV not found: $CsvPath`nCreate one from captures.sample.csv, or pass -CsvPath."
+    if (-not (Test-Path -LiteralPath $settings.CsvPath -PathType Leaf)) {
+        throw "Capture definition CSV not found: $($settings.CsvPath)`nCreate one from captures.sample.csv, or pass -CsvPath."
     }
-    $resolvedCsvPath = (Resolve-Path -LiteralPath $CsvPath).Path
+    $resolvedCsvPath = (Resolve-Path -LiteralPath $settings.CsvPath).Path
 
     $definitions = Import-CaptureDefinition -Path $resolvedCsvPath
     Write-Host "Loaded $($definitions.Count) capture item(s) from $resolvedCsvPath" -ForegroundColor Cyan
 
-    if (-not (Test-Path -LiteralPath $OutputDir)) {
-        [void](New-Item -ItemType Directory -Path $OutputDir -Force)
+    if (-not (Test-Path -LiteralPath $settings.OutputDir)) {
+        [void](New-Item -ItemType Directory -Path $settings.OutputDir -Force)
     }
-    $resolvedOutputDir = (Resolve-Path -LiteralPath $OutputDir).Path
+    $resolvedOutputDir = (Resolve-Path -LiteralPath $settings.OutputDir).Path
 
-    $effectiveReportName = $ReportName
+    $effectiveReportName = $settings.ReportName
     if ([string]::IsNullOrWhiteSpace($effectiveReportName)) {
         $effectiveReportName = "VouchReport_$((Get-Date).ToString('yyyy-MM-dd_HHmmss')).html"
     }
@@ -2505,21 +2919,21 @@ function Invoke-Main {
     # One folder per report, so a later run never overwrites the images (and with them
     # the hashes) of an earlier one.
     $imagesDir = ''
-    if ($SaveImages) {
+    if ($settings.SaveImages) {
         $imagesDir = Join-Path -Path $resolvedOutputDir -ChildPath (Join-Path 'images' ([System.IO.Path]::GetFileNameWithoutExtension($effectiveReportName)))
         if (-not (Test-Path -LiteralPath $imagesDir)) {
             [void](New-Item -ItemType Directory -Path $imagesDir -Force)
         }
     }
 
-    $imageExtension = if ($ImageFormat -eq 'png') { 'png' } else { 'jpg' }
+    $imageExtension = if ($settings.ImageFormat -eq 'png') { 'png' } else { 'jpg' }
     $screenBounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
     $captureContext = @{
         RunId      = [guid]::NewGuid().ToString()
-        Format     = $ImageFormat
-        Quality    = $JpegQuality
+        Format     = $settings.ImageFormat
+        Quality    = $settings.JpegQuality
         Extension  = $imageExtension
-        SaveImages = [bool]$SaveImages
+        SaveImages = [bool]$settings.SaveImages
         ImagesDir  = $imagesDir
         Screen     = "$($screenBounds.Width)x$($screenBounds.Height)"
     }
@@ -2529,8 +2943,8 @@ function Invoke-Main {
     $desktopNote = 'The signed-in desktop (-UseVirtualDesktop not set)'
 
     try {
-        if ($UseVirtualDesktop) {
-            if ($null -ne (Get-DebugEndpointInfo -Port $DebugPort)) {
+        if ($settings.UseVirtualDesktop) {
+            if ($null -ne (Get-DebugEndpointInfo -Port $settings.DebugPort)) {
                 # An Edge that is already running keeps its window on its own desktop.
                 $desktopNote = 'No separate virtual desktop: an already running Edge was reused.'
             }
@@ -2542,8 +2956,8 @@ function Invoke-Main {
             if (-not ($captureDesktop -and $captureDesktop.Verified)) { Write-Host "WARNING: $desktopNote" -ForegroundColor Yellow }
         }
 
-        $versionInfo = Start-EdgeDebug -EdgePath $edgePath -ProfileDir $profileDir -Port $DebugPort
-        $script:CdpPort = $DebugPort
+        $versionInfo = Start-EdgeDebug -EdgePath $edgePath -ProfileDir $profileDir -Port $settings.DebugPort
+        $script:CdpPort = $settings.DebugPort
 
         if ($null -ne $captureDesktop -and $captureDesktop.Verified -and -not (Test-EdgeOnCaptureDesktop)) {
             $desktopNote = 'A separate virtual desktop was opened, but Edge did not appear on it; other applications may appear in the taskbar.'
@@ -2556,231 +2970,24 @@ function Invoke-Main {
         }
         Write-Host "Connected to $edgeVersion"
 
-        $target = Get-CdpPageTarget -Port $DebugPort -WaitSeconds 10
+        $target = Get-CdpPageTarget -Port $settings.DebugPort -WaitSeconds 10
         if ($null -eq $target -or -not $target.PSObject.Properties['webSocketDebuggerUrl']) {
             throw 'Could not obtain a DevTools page target from Edge.'
         }
         Connect-CdpSocket -WebSocketUrl ([string]$target.webSocketDebuggerUrl)
-        if ($script:LaunchedEdge) { Close-OtherPageTargets -Port $DebugPort -KeepId ([string]$target.id) }
+        if ($script:LaunchedEdge) { Close-OtherPageTargets -Port $settings.DebugPort -KeepId ([string]$target.id) }
 
         foreach ($definition in $definitions) {
-            $item = [pscustomobject]@{
-                Index          = $definition.Index
-                Name           = $definition.Name
-                Url            = $definition.Url
-                FinalUrl       = ''
-                Notes          = $definition.Notes
-                StepsText      = $definition.StepsText
-                ScrollFullPage = $definition.ScrollFullPage
-                ScrollArea     = ''
-                Status         = 'OK'
-                HttpStatus     = 0
-                Details        = [System.Collections.Generic.List[string]]::new()
-                StepLog        = [System.Collections.Generic.List[object]]::new()
-                Captures       = [System.Collections.Generic.List[object]]::new()
-            }
+            # Added before the page is visited, so it is reported whatever happens to it.
+            $item = New-CaptureItem -Definition $definition
             $items.Add($item)
-
-            Write-Host ("[{0}/{1}] {2} - {3}" -f $definition.Index, $definitions.Count, $definition.Name, $definition.Url)
-
-            try {
-                Set-NavigationMarker
-                $navigation = Send-CdpCommand -Method 'Page.navigate' -Params @{ url = $definition.Url } -TimeoutSec $NavigationTimeoutSec
-                $browserErrorPage = $false
-                if ($null -ne $navigation -and $navigation.PSObject.Properties['errorText'] -and
-                    -not [string]::IsNullOrWhiteSpace([string]$navigation.errorText)) {
-                    $errorText = [string]$navigation.errorText
-                    $item.Status = 'FAILED'
-                    if ($errorText -eq 'net::ERR_HTTP_RESPONSE_CODE_FAILURE') {
-                        # An HTTP error with an empty body: Edge shows its own error page
-                        # instead, which is evidence like any other error page.
-                        $browserErrorPage = $true
-                        $item.Details.Add("The server returned an HTTP error with an empty body ($errorText). The browser's error page is captured below as evidence.")
-                    }
-                    else {
-                        $item.Details.Add("The page could not be loaded: $errorText")
-                        Write-RowStatus -Message "    FAILED - $errorText" -Status 'FAILED'
-                        continue
-                    }
-                }
-
-                if (-not (Wait-PageReady -TimeoutSec $NavigationTimeoutSec)) {
-                    if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-                    $item.Details.Add("The page did not finish loading within $NavigationTimeoutSec seconds; it was captured in whatever state it had reached.")
-                }
-
-                Start-Sleep -Milliseconds ([int]($SettleSeconds * 1000))
-
-                # Chromium exposes the HTTP status of the main document on the
-                # PerformanceNavigationTiming entry; older builds return 0.
-                try {
-                    $statusValue = Invoke-CdpEval -Expression "(performance.getEntriesByType('navigation')[0]||{}).responseStatus||0" -TimeoutSec 10
-                    if ($null -ne $statusValue) { $item.HttpStatus = [int]$statusValue }
-                }
-                catch {
-                    $item.Details.Add("The HTTP status could not be read from the page: $($_.Exception.Message)")
-                }
-
-                if ($item.HttpStatus -ge 400) {
-                    $item.Status = 'FAILED'
-                    $item.Details.Add("The server returned HTTP $($item.HttpStatus). The error page is captured below as evidence.")
-                }
-
-                # Edge's error page lives at chrome-error://; the browser stayed on the
-                # requested URL, so record that rather than report a redirect.
-                $item.FinalUrl = if ($browserErrorPage) { $definition.Url } else { Get-CurrentPageUrl }
-                $requestedOrigin = Get-OriginFromUrl -Url $definition.Url
-                $finalOrigin = Get-OriginFromUrl -Url $item.FinalUrl
-                if (-not [string]::IsNullOrWhiteSpace($finalOrigin) -and
-                    -not [string]::IsNullOrWhiteSpace($requestedOrigin) -and
-                    $finalOrigin -ne $requestedOrigin -and
-                    -not (Test-HttpsUpgrade -RequestedUrl $definition.Url -FinalUrl $item.FinalUrl)) {
-                    if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-                    $item.Details.Add("Redirected to $finalOrigin - possible login required.")
-                }
-                elseif (-not $browserErrorPage -and -not [string]::IsNullOrWhiteSpace($item.FinalUrl)) {
-                    $hasPasswordField = $false
-                    try {
-                        $hasPasswordField = [bool](Invoke-CdpEval -TimeoutSec 10 -Expression (
-                            "Array.prototype.some.call(document.querySelectorAll('input[type=password]'), " +
-                            "function (e) { var r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; })"))
-                    }
-                    catch {
-                        Write-Verbose "Could not look for a password field: $($_.Exception.Message)"
-                    }
-                    if (Test-LoginRedirect -RequestedUrl $definition.Url -FinalUrl $item.FinalUrl -HasPasswordField $hasPasswordField) {
-                        if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-                        $item.Details.Add("Redirected to a sign-in page ($(([Uri]$item.FinalUrl).AbsolutePath)) - the session has probably expired. Run -LoginSetup.")
-                    }
-                }
-
-                if ($definition.Steps.Count -gt 0) {
-                    $stepLog = Invoke-RowSteps -Steps @($definition.Steps) -SettleSeconds $SettleSeconds -NavigationTimeoutSec $NavigationTimeoutSec
-                    foreach ($entry in $stepLog) { $item.StepLog.Add($entry) }
-                    $failedSteps = @($stepLog | Where-Object { -not $_.Ok })
-                    if ($failedSteps.Count -gt 0) {
-                        if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-                        $item.Details.Add("Completed with errors: $($failedSteps.Count) of $($stepLog.Count) step(s) failed.")
-                    }
-                    if (-not $browserErrorPage) { $item.FinalUrl = Get-CurrentPageUrl }
-                }
-
-                try { [void](Send-CdpCommand -Method 'Page.bringToFront' -TimeoutSec 10) }
-                catch { Write-Verbose "Page.bringToFront failed: $($_.Exception.Message)" }
-
-                $pageTitle = ''
-                try { $pageTitle = [string](Invoke-CdpEval -Expression 'document.title' -TimeoutSec 10) }
-                catch { Write-Verbose "Could not read the page title: $($_.Exception.Message)" }
-
-                $focusWarning = Set-EdgeForeground -ExpectedTitle $pageTitle
-                if ($null -ne $focusWarning) {
-                    if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-                    $item.Details.Add($focusWarning)
-                }
-
-                $segmentCount = 1
-                $viewportHeight = 0.0
-                if ($definition.ScrollFullPage) {
-                    try {
-                        # Find what scrolls - the page, a panel inside it, or a frame - and start at its top.
-                        $scrollTarget = Invoke-CdpEval -Expression (Get-ScrollTargetScript) -TimeoutSec 20
-                        Start-Sleep -Milliseconds ([int]($ScrollSettleSeconds * 1000))
-
-                        $viewportHeight = [double]$scrollTarget.view
-                        $pageHeight = [double]$scrollTarget.total
-                        $item.ScrollArea = switch ([string]$scrollTarget.kind) {
-                            'window'  { 'the page' }
-                            'none'    { 'nothing to scroll - the content fits on one screen' }
-                            default   { [string]$scrollTarget.description }
-                        }
-                        foreach ($other in @($scrollTarget.others)) {
-                            if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-                            $item.Details.Add("Another scrolling area ($other) was not scrolled; content hidden in it is not captured.")
-                        }
-                        foreach ($frameName in @($scrollTarget.blockedFrames)) {
-                            if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-                            $item.Details.Add("A frame from another site ($frameName) cannot be scrolled; content hidden in it is not captured.")
-                        }
-
-                        if ($viewportHeight -gt 0 -and $pageHeight -gt 0) {
-                            $segmentCount = [int][Math]::Ceiling($pageHeight / $viewportHeight)
-                        }
-                        if ($segmentCount -lt 1) { $segmentCount = 1 }
-                    }
-                    catch {
-                        if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-                        $item.Details.Add("The page height could not be measured, so only the first screen was captured: $($_.Exception.Message)")
-                        $segmentCount = 1
-                        $viewportHeight = 0
-                    }
-                }
-
-                $truncationMessage = "Page truncated at $MaxScrollSegments segments (raise -MaxScrollSegments to capture more)."
-                $truncationNoted = $false
-                if ($segmentCount -gt $MaxScrollSegments) {
-                    $segmentCount = $MaxScrollSegments
-                    if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-                    $item.Details.Add($truncationMessage)
-                    $truncationNoted = $true
-                }
-
-                if ($definition.ScrollFullPage -and $segmentCount -gt 1 -and $viewportHeight -gt 0) {
-                    $recheckDone = $false
-                    for ($segment = 0; $segment -lt $segmentCount; $segment++) {
-                        $offset = [int]([Math]::Round($segment * $viewportHeight))
-                        [void](Invoke-CdpEval -Expression "window.__vouchTarget.to($offset)" -TimeoutSec 10)
-                        Start-Sleep -Milliseconds ([int]($ScrollSettleSeconds * 1000))
-
-                        # Lazy-loading pages grow after the first scroll; re-measure once only.
-                        if (-not $recheckDone) {
-                            $recheckDone = $true
-                            try {
-                                $grownHeight = [double](Invoke-CdpEval -Expression 'window.__vouchTarget.measure().total' -TimeoutSec 10)
-                                if ($grownHeight -gt 0) {
-                                    $recomputed = [int][Math]::Ceiling($grownHeight / $viewportHeight)
-                                    if ($recomputed -gt $segmentCount) {
-                                        if ($recomputed -gt $MaxScrollSegments) {
-                                            $recomputed = $MaxScrollSegments
-                                            if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-                                            if (-not $truncationNoted) {
-                                                $item.Details.Add($truncationMessage)
-                                                $truncationNoted = $true
-                                            }
-                                        }
-                                        $segmentCount = $recomputed
-                                    }
-                                }
-                            }
-                            catch {
-                                Write-Verbose "Could not re-measure the page height: $($_.Exception.Message)"
-                            }
-                        }
-
-                        $segmentUrl = if ($browserErrorPage) { $item.FinalUrl } else { Get-CurrentPageUrl }
-                        Add-ItemCapture -Item $item -SegmentIndex ($segment + 1) -SegmentCount $segmentCount -PageUrl $segmentUrl -Context $captureContext
-                    }
-
-                    try { [void](Invoke-CdpEval -Expression 'window.__vouchTarget.to(0)' -TimeoutSec 10) }
-                    catch { Write-Verbose "Could not scroll back to the top: $($_.Exception.Message)" }
-                }
-                else {
-                    Add-ItemCapture -Item $item -SegmentIndex 1 -SegmentCount 1 -PageUrl $item.FinalUrl -Context $captureContext
-                }
-
-                $summary = "    $($item.Status) - $($item.Captures.Count) capture(s)"
-                if ($item.Details.Count -gt 0) { $summary += " - $($item.Details[0])" }
-                Write-RowStatus -Message $summary -Status $item.Status
-            }
-            catch {
-                $item.Status = 'FAILED'
-                $item.Details.Add("Unhandled error while capturing this item: $($_.Exception.Message)")
-                Write-RowStatus -Message "    FAILED - $($_.Exception.Message)" -Status 'FAILED'
-            }
+            [void](Invoke-CaptureItem -Definition $definition -Item $item -ItemCount $definitions.Count `
+                -Settings $settings -CaptureContext $captureContext)
         }
     }
     finally {
         Close-CdpSocket
-        if ($KeepBrowserOpen) {
+        if ($settings.KeepBrowserOpen) {
             if ($script:LaunchedEdge) { Write-Host 'Leaving Edge open (-KeepBrowserOpen).' }
         }
         else {
@@ -2805,12 +3012,12 @@ function Invoke-Main {
         Write-Verbose "Could not read the screen resolution: $($_.Exception.Message)"
     }
 
-    $imageDescription = if ($ImageFormat -eq 'png') { 'PNG (lossless)' } else { "JPEG (quality $JpegQuality)" }
+    $imageDescription = if ($settings.ImageFormat -eq 'png') { 'PNG (lossless)' } else { "JPEG (quality $($settings.JpegQuality))" }
     $browserInstance = if ($script:ReusedEdge) {
-        "Existing Edge instance reused on port $DebugPort (not launched by this run)"
+        "Existing Edge instance reused on port $($settings.DebugPort) (not launched by this run)"
     }
     else {
-        "Launched by this run on port $DebugPort using profile $profileDir"
+        "Launched by this run on port $($settings.DebugPort) using profile $profileDir"
     }
 
     $run = [pscustomobject]@{
@@ -2825,7 +3032,7 @@ function Invoke-Main {
         CaptureDesktop   = $desktopNote
         ToolVersion      = $script:ToolVersion
         CsvPath          = $resolvedCsvPath
-        ImageFormat      = $ImageFormat
+        ImageFormat      = $settings.ImageFormat
         ImageDescription = $imageDescription
         ScreenResolution = $screenResolution
         Total            = $items.Count
@@ -2839,7 +3046,7 @@ function Invoke-Main {
 
     $manifest = Get-CaptureManifest -Items @($items)
     $run.ManifestSha256 = Get-Sha256Hex -Bytes ([System.Text.Encoding]::UTF8.GetBytes($manifest))
-    if ($SaveImages) {
+    if ($settings.SaveImages) {
         [System.IO.File]::WriteAllText((Join-Path -Path $imagesDir -ChildPath 'SHA256SUMS'), $manifest, [System.Text.UTF8Encoding]::new($false))
     }
 
@@ -2847,10 +3054,10 @@ function Invoke-Main {
     [System.IO.File]::WriteAllText($reportPath, $html, [System.Text.UTF8Encoding]::new($false))
 
     $reportSizeMb = [Math]::Round((Get-Item -LiteralPath $reportPath).Length / 1MB, 1)
-    $script:ExitCode = if ($failCount -gt 0) { 2 } elseif ($FailOnWarning -and $warnCount -gt 0) { 3 } else { 0 }
+    $script:ExitCode = if ($failCount -gt 0) { 2 } elseif ($settings.FailOnWarning -and $warnCount -gt 0) { 3 } else { 0 }
 
     $summaryPath = ''
-    if ($JsonSummary) {
+    if ($settings.JsonSummary) {
         $summaryPath = [System.IO.Path]::ChangeExtension($reportPath, '.json')
         $json = ConvertTo-RunSummaryJson -Items @($items) -Run $run -ReportPath $reportPath -ExitCode $script:ExitCode
         [System.IO.File]::WriteAllText($summaryPath, $json, [System.Text.UTF8Encoding]::new($false))
@@ -2858,14 +3065,14 @@ function Invoke-Main {
 
     Write-Host ''
     Write-Host "Done. $($items.Count) item(s): $okCount OK, $warnCount warning(s), $failCount failed. $captureCount screenshot(s)." -ForegroundColor Cyan
-    if ($SaveImages) { Write-Host "Individual images: $imagesDir" }
+    if ($settings.SaveImages) { Write-Host "Individual images: $imagesDir" }
     Write-Host "Report: $reportPath ($reportSizeMb MB)" -ForegroundColor Cyan
     if ($summaryPath) { Write-Host "Summary: $summaryPath" }
 }
 
 $transcribing = Start-RunLog -Directory $LogDir
 try {
-    Invoke-Main
+    Invoke-Main -BoundParameters $PSBoundParameters
 }
 catch {
     Write-Host ''

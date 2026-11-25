@@ -326,6 +326,94 @@ Describe 'New-HtmlReport' {
     }
 }
 
+Describe 'Resolve-RunSettings' {
+    BeforeAll {
+        # The script's own parameter defaults (paths shortened).
+        $defaults = @{
+            CsvPath = 'C:\v\captures.csv'; OutputDir = 'C:\v\reports'; ReportName = ''
+            EdgeProfileDir = 'C:\p'; DebugPort = 9222; NavigationTimeoutSec = 30
+            SettleSeconds = [double]2; ScrollSettleSeconds = [double]1; MaxScrollSegments = 30
+            ImageFormat = 'jpeg'; JpegQuality = 85; SaveImages = [switch]$false
+            KeepBrowserOpen = [switch]$false; FailOnWarning = [switch]$false; LogDir = ''
+            JsonSummary = [switch]$false; UseVirtualDesktop = [switch]$false; Verify = ''
+            LoginSetup = [switch]$false
+        }
+        $config = '{
+            "browser":  { "profileDir": "C:\\cfg-profile", "debugPort": 9333, "keepBrowserOpen": true },
+            "defaults": { "navigationTimeoutSec": 45, "settleSeconds": 0.5, "maxScrollSegments": 12 },
+            "output":   { "dir": "C:\\cfg-out", "reportName": "", "imageFormat": "png", "saveImages": true }
+        }' | ConvertFrom-Json
+    }
+
+    It 'returns the parameter defaults unchanged when nothing is bound and there is no config' {
+        $settings = Resolve-RunSettings -BoundParameters @{} -Defaults $defaults -Config $null
+        foreach ($name in $defaults.Keys) {
+            $settings.$name | Should -Be $defaults[$name] -Because $name
+        }
+        @($settings.PSObject.Properties).Count | Should -Be $defaults.Count
+    }
+
+    It 'uses plain types: switches become booleans, numbers keep their type' {
+        $settings = Resolve-RunSettings -BoundParameters @{} -Defaults $defaults -Config $null
+        $settings.SaveImages | Should -BeOfType [bool]
+        $settings.SettleSeconds | Should -BeOfType [double]
+        $settings.DebugPort | Should -BeOfType [int]
+    }
+
+    It 'takes config values over the defaults' {
+        $settings = Resolve-RunSettings -BoundParameters @{} -Defaults $defaults -Config $config
+        $settings.EdgeProfileDir | Should -Be 'C:\cfg-profile'
+        $settings.DebugPort | Should -Be 9333
+        $settings.NavigationTimeoutSec | Should -Be 45
+        $settings.SettleSeconds | Should -Be 0.5
+        $settings.MaxScrollSegments | Should -Be 12
+        $settings.OutputDir | Should -Be 'C:\cfg-out'
+        $settings.ImageFormat | Should -Be 'png'
+        $settings.SaveImages | Should -BeTrue
+        $settings.KeepBrowserOpen | Should -BeTrue
+    }
+
+    It 'keeps the default where the config is silent or blank' {
+        $settings = Resolve-RunSettings -BoundParameters @{} -Defaults $defaults -Config $config
+        $settings.ReportName | Should -Be ''
+        $settings.ScrollSettleSeconds | Should -Be 1
+        $settings.JpegQuality | Should -Be 85
+        $settings.CsvPath | Should -Be 'C:\v\captures.csv'
+    }
+
+    It 'takes a bound parameter over the config and the default' {
+        $bound = @{ DebugPort = 9444; ImageFormat = 'jpeg'; SettleSeconds = [double]3 }
+        $settings = Resolve-RunSettings -BoundParameters $bound -Defaults $defaults -Config $config
+        $settings.DebugPort | Should -Be 9444
+        $settings.ImageFormat | Should -Be 'jpeg'
+        $settings.SettleSeconds | Should -Be 3
+        $settings.NavigationTimeoutSec | Should -Be 45
+    }
+
+    It 'lets a switch bound to $false beat a config true' {
+        $bound = @{ SaveImages = [switch]$false; KeepBrowserOpen = [switch]$false }
+        $settings = Resolve-RunSettings -BoundParameters $bound -Defaults $defaults -Config $config
+        $settings.SaveImages | Should -BeFalse
+        $settings.KeepBrowserOpen | Should -BeFalse
+    }
+
+    It 'reads a real $PSBoundParameters dictionary' {
+        # The script passes its own $PSBoundParameters, a generic Dictionary, not a hashtable.
+        function Get-TestBoundParameters { param([switch]$SaveImages, [int]$DebugPort) return , $PSBoundParameters }
+        $bound = Get-TestBoundParameters -SaveImages:$false -DebugPort 9555
+        $bound | Should -Not -BeOfType [hashtable]
+        $settings = Resolve-RunSettings -BoundParameters $bound -Defaults $defaults -Config $config
+        $settings.SaveImages | Should -BeFalse
+        $settings.DebugPort | Should -Be 9555
+        $settings.KeepBrowserOpen | Should -BeTrue
+    }
+
+    It 'accepts a config given as nested hashtables' {
+        $settings = Resolve-RunSettings -BoundParameters @{} -Defaults $defaults -Config @{ output = @{ jpegQuality = 60 } }
+        $settings.JpegQuality | Should -Be 60
+    }
+}
+
 Describe 'Get-ScreenCapture' -Tag 'Desktop' {
     # Reads the pixels of the primary display into memory only; nothing is saved.
     BeforeAll {
