@@ -1737,6 +1737,66 @@ Describe 'Browser link and picker: routes and rules without a browser' {
         }
     }
 
+    It 'looks at other tabs at most every 4 seconds, and stops a sweep at the first tab that does not answer' {
+        $script:State.Browser.Connected = $true
+        $script:State.Browser.Port = 9555
+        $script:State.Browser.TabId = 'own'
+        $tab = { param($id) [pscustomobject]@{ id = $id; type = 'page'; url = "https://a.example/$id"; title = $id; webSocketDebuggerUrl = "ws://x/$id" } }
+        Mock Get-DevToolsTargetList { @((& $tab 'own'), (& $tab 'a'), (& $tab 'b'), (& $tab 'c')) }
+        Mock Invoke-CdpEval { 'hidden' }
+        Mock Get-DesignerTabVisibility { $script:Probes++; '' }
+        $script:Probes = 0
+        Update-DesignerBrowser -State $script:State -Force
+        $script:Probes | Should -Be 1
+        Update-DesignerBrowser -State $script:State -Force
+        $script:Probes | Should -Be 1
+        $script:State.Browser.LastSweep = (Get-Date).AddSeconds(-5)
+        Update-DesignerBrowser -State $script:State -Force
+        $script:Probes | Should -Be 2
+        $script:State.Browser.TabId | Should -Be 'own'
+        # A sweep also ends when its time is used up.
+        Mock Get-DesignerTabVisibility { $script:Probes++; Start-Sleep -Milliseconds 300; 'hidden' }
+        $script:Probes = 0
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        [void](Find-DesignerVisibleTab -State $script:State -Tabs @((& $tab 'a'), (& $tab 'b'), (& $tab 'c'), (& $tab 'd')) -Skip 'own' -BudgetMs 500)
+        $script:Probes | Should -BeLessOrEqual 2
+        $watch.ElapsedMilliseconds | Should -BeLessThan 1500
+    }
+
+    It 'reads the saved configuration again only when the file changed' {
+        $path = Join-Path $TestDrive 'cache.json'
+        Set-Content -LiteralPath $path -Value '{ "schemaVersion": 1, "browser": { "debugPort": 9333 }, "pages": [] }' -Encoding utf8NoBOM
+        $script:State.ConfigPath = $path
+        Mock Read-DesignerConfigFile { $script:Reads++; [pscustomobject]@{ Config = (ConvertFrom-VouchJson -Text ([System.IO.File]::ReadAllText($Path))); Text = '' } }
+        $script:Reads = 0
+        (Get-DesignerBrowserSetting -State $script:State).Port | Should -Be 9333
+        (Get-DesignerBrowserSetting -State $script:State).Port | Should -Be 9333
+        [void](Get-DesignerBrowserData -State $script:State)
+        $script:Reads | Should -Be 1
+        Set-Content -LiteralPath $path -Value '{ "schemaVersion": 1, "browser": { "debugPort": 9444 }, "pages": [] }' -Encoding utf8NoBOM
+        [System.IO.File]::SetLastWriteTimeUtc($path, (Get-Date).ToUniversalTime().AddMinutes(1))
+        (Get-DesignerBrowserSetting -State $script:State).Port | Should -Be 9444
+        $script:Reads | Should -Be 2
+    }
+
+    It 'checks a pick''s proposals within one deadline, and says so when it ran out' {
+        $element = [ordered]@{ kind = 'element'; noun = 'button'; frame = '' }
+        $proposals = @(1..16 | ForEach-Object { [pscustomobject]@{ kind = 'path'; value = "div:nth-of-type($_)"; anchorId = '' } })
+        Mock Test-ElementPickProposal { $script:Checks++; Start-Sleep -Milliseconds 400; [pscustomobject]@{ Ok = $false; Exact = $false } }
+        $script:Checks = 0
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $r = Get-ElementPickCandidate -Mode click -Token 't' -Proposals $proposals -Element $element -DeadlineSec 1
+        $watch.ElapsedMilliseconds | Should -BeLessThan 2500
+        $r.TimedOut | Should -BeTrue
+        $r.Candidates.Count | Should -Be 0
+        $script:Checks | Should -BeLessOrEqual 4
+        Mock Test-ElementPickProposal { Start-Sleep -Milliseconds 400; [pscustomobject]@{ Ok = $true; Exact = $true } }
+        $r = Get-ElementPickCandidate -Mode click -Token 't' -Proposals $proposals -Element $element -DeadlineSec 0.6
+        $r.TimedOut | Should -BeTrue
+        $r.Candidates.Count | Should -BeGreaterThan 0
+        Should -Invoke Test-ElementPickProposal -ParameterFilter { $TimeoutSec -ge 1 -and $TimeoutSec -le 1 }
+    }
+
     It 'puts mode, token and words into the picker only as JavaScript literals' {
         $script = Get-DesignerPickerScript -State $script:State -Mode click -Token 'x"); alert(1); ("'
         $script | Should -Match ([regex]::Escape('token: "x\"); alert(1); (\""'))
@@ -1843,7 +1903,17 @@ Describe 'Browser link and picker in headless Edge (functions called directly)' 
         function Assert-SiteUntouched([string]$Title = 'Pick me') {
             Invoke-CdpEval -Expression 'JSON.stringify(window.__hits || [])' | Should -Be '[]'
             Invoke-CdpEval -Expression 'window.__downs || 0' | Should -Be 0
+            # The site's own window capture listeners (registered before the picker) saw no control as a target.
+            Invoke-CdpEval -Expression 'JSON.stringify(window.__winHits || [])' | Should -Be '[]'
+            Invoke-CdpEval -Expression 'window.__submits || 0' | Should -Be 0
             Invoke-CdpEval -Expression 'document.title' | Should -Be $Title
+        }
+        function Send-TestKey([string]$Key, [int]$Code) {
+            foreach ($type in 'keyDown', 'keyUp') {
+                $params = @{ type = $type; key = $Key; code = $(if ($Key -eq ' ') { 'Space' } else { $Key }); windowsVirtualKeyCode = $Code; nativeVirtualKeyCode = $Code }
+                if ($type -eq 'keyDown' -and $Key -eq 'Enter') { $params.text = "`r" }
+                [void](Send-CdpCommand -Method 'Input.dispatchKeyEvent' -Params $params)
+            }
         }
         function Assert-FramesFree {
             # After a pick, a click inside the same-site frame reaches the site's handler: the
@@ -2037,9 +2107,13 @@ Describe 'Browser link and picker in headless Edge (functions called directly)' 
         Invoke-CdpEval -Expression 'window.__keys' | Should -Be 0
         (Get-PageTrace) | Should -BeExactly $before
         [void](Start-ElementPick -State $script:B -Mode scroll)
-        # Control: while picking, a click inside the frame is swallowed by the picker.
+        # Control: while picking, a scripted click inside the frame is swallowed - and,
+        # being the page's own doing, picks nothing: the pick goes on.
         Invoke-CdpEval -Expression "document.getElementById('sameframe').contentDocument.getElementById('framebtn').click(); JSON.stringify(window.__hits)" | Should -Be '[]'
+        Start-Sleep -Milliseconds 400
+        (Get-ElementPickResult -State $script:B).state | Should -Be 'picking'
         (Invoke-TestRoute POST '/api/pick/cancel' -State $script:B).Data.state | Should -Be 'cancelled'
+        [void](Invoke-CdpEval -Expression 'window.__winHits = []; true')
         Assert-SiteUntouched
         (Get-PageTrace) | Should -BeExactly $before
         Assert-FramesFree
@@ -2065,6 +2139,69 @@ Describe 'Browser link and picker in headless Edge (functions called directly)' 
         Send-TestClick (Get-TestPoint "document.querySelector('[data-testid=save-settings]')")
         $r = Wait-TestPick
         $r.state | Should -Be 'done'
+        Assert-SiteUntouched
+        # Nothing is left behind by the picker put back after the reload either.
+        $after = Get-PageTrace
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        $after | Should -BeExactly (Get-PageTrace)
+    }
+
+    It 'never lets the page pick or cancel by itself: scripted clicks, dispatched events and a scripted Esc' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        [void](Invoke-CdpEval -Expression @'
+(function () {
+  document.getElementById('fav').click();
+  var b = document.querySelector('[data-testid=save-settings]'), r = b.getBoundingClientRect();
+  b.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, clientX: r.left + 2, clientY: r.top + 2 }));
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+  document.getElementById('fav').focus();
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+  return true;
+})()
+'@)
+        Start-Sleep -Milliseconds 500
+        (Get-ElementPickResult -State $script:B).state | Should -Be 'picking'
+        Invoke-CdpEval -Expression 'JSON.stringify(window.__hits)' | Should -Be '[]'
+        # The person can still pick afterwards.
+        Send-TestClick (Get-TestPoint "document.getElementById('reports-a')")
+        $r = Wait-TestPick
+        $r.state | Should -Be 'done'
+        $r.result.candidates[0].value | Should -Be 'Reports'
+    }
+
+    It 'picks with the keyboard (Enter on a focused control) without activating it: <Case>' -ForEach @(
+        @{ Case = 'a button'; Focus = "document.getElementById('fav')"; Value = '#fav' }
+        @{ Case = 'a field in a form with no submit button (no implicit submission)'; Focus = "document.getElementById('q')"; Value = '#q' }
+        @{ Case = 'a button inside the same-site frame'; Focus = "document.getElementById('sameframe').contentDocument.getElementById('framebtn')"; Value = '#framebtn' }
+    ) {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        $before = Get-PageTrace
+        [void](Invoke-CdpEval -Expression "($Focus).focus(); true")
+        [void](Start-ElementPick -State $script:B -Mode click)
+        Send-TestKey -Key 'Enter' -Code 13
+        $r = Wait-TestPick
+        $r.state | Should -Be 'done' -Because $r['message']
+        @($r.result.candidates | ForEach-Object { $_.value }) | Should -Contain $Value
+        Assert-SiteUntouched
+        (Get-PageTrace) | Should -BeExactly $before
+    }
+
+    It 'keeps scrolling possible during a pick: the wheel reaches the panel, the frame and the page under the pointer' {
+        Open-TestPage "/pickme?x=$($script:Web2)"
+        [void](Start-ElementPick -State $script:B -Mode click)
+        foreach ($case in @(
+                @{ El = "document.querySelector('#leftpanel div')"; Probe = "document.getElementById('leftpanel').scrollTop" },
+                @{ El = "document.getElementById('sameframe').contentDocument.querySelector('div')"; Probe = "document.getElementById('sameframe').contentWindow.scrollY" },
+                @{ El = "document.getElementById('spacer')"; Probe = 'window.scrollY' })) {
+            $p = Get-TestPoint $case.El
+            $was = [double](Invoke-CdpEval -Expression $case.Probe)
+            [void](Send-CdpCommand -Method 'Input.dispatchMouseEvent' -Params @{ type = 'mouseWheel'; x = [double]$p.x; y = [double]$p.y; deltaX = 0; deltaY = 120 })
+            Start-Sleep -Milliseconds 300
+            [double](Invoke-CdpEval -Expression $case.Probe) | Should -BeGreaterThan $was -Because "$($case.El) must scroll"
+        }
+        (Get-ElementPickResult -State $script:B).state | Should -Be 'picking'
+        [void](Invoke-TestRoute POST '/api/pick/cancel' -State $script:B)
         Assert-SiteUntouched
     }
 
@@ -2118,6 +2255,7 @@ Describe 'Browser link and picker in headless Edge (functions called directly)' 
         $second = Invoke-RestMethod -Method Put -Uri "http://127.0.0.1:$($script:PickCdp)/json/new?$($script:Base)/tabs" -NoProxy
         [void](Invoke-RestMethod -Uri "http://127.0.0.1:$($script:PickCdp)/json/activate/$($second.id)" -NoProxy)
         Start-Sleep -Milliseconds 500
+        $script:B.Browser.LastSweep = [datetime]::MinValue   # the 4 s sweep throttle
         Update-DesignerBrowser -State $script:B -Force
         $script:B.Browser.TabId | Should -Be $second.id
         $script:B.Browser.Title | Should -Be 'Tabs'
@@ -2125,6 +2263,7 @@ Describe 'Browser link and picker in headless Edge (functions called directly)' 
             $other = Invoke-RestMethod -Method Put -Uri "http://127.0.0.1:$($script:PickCdp)/json/new?$url" -NoProxy
             [void](Invoke-RestMethod -Uri "http://127.0.0.1:$($script:PickCdp)/json/activate/$($other.id)" -NoProxy)
             Start-Sleep -Milliseconds 500
+            $script:B.Browser.LastSweep = [datetime]::MinValue   # the 4 s sweep throttle
             Update-DesignerBrowser -State $script:B -Force
             $script:B.Browser.TabId | Should -Be $second.id -Because "$url must be ignored"
             @($script:B.Browser.Tabs | ForEach-Object { $_.id }) | Should -Not -Contain $other.id
@@ -2132,6 +2271,7 @@ Describe 'Browser link and picker in headless Edge (functions called directly)' 
         }
         [void](Invoke-RestMethod -Uri "http://127.0.0.1:$($script:PickCdp)/json/activate/$first" -NoProxy)
         Start-Sleep -Milliseconds 500
+        $script:B.Browser.LastSweep = [datetime]::MinValue   # the 4 s sweep throttle
         Update-DesignerBrowser -State $script:B -Force
         $script:B.Browser.TabId | Should -Be $first
         [void](Invoke-RestMethod -Uri "http://127.0.0.1:$($script:PickCdp)/json/close/$($second.id)" -NoProxy)
@@ -2141,6 +2281,7 @@ Describe 'Browser link and picker in headless Edge (functions called directly)' 
         $extra = Invoke-RestMethod -Method Put -Uri "http://127.0.0.1:$($script:PickCdp)/json/new?$($script:Base)/ok" -NoProxy
         [void](Invoke-RestMethod -Uri "http://127.0.0.1:$($script:PickCdp)/json/activate/$($script:B.Browser.TabId)" -NoProxy)
         Start-Sleep -Milliseconds 300
+        $script:B.Browser.LastSweep = [datetime]::MinValue   # the 4 s sweep throttle
         Update-DesignerBrowser -State $script:B -Force
         $picked = $script:B.Browser.TabId
         Open-TestPage "/pickme?x=$($script:Web2)"
@@ -2150,6 +2291,7 @@ Describe 'Browser link and picker in headless Edge (functions called directly)' 
         $r.state | Should -Be 'error'
         $r.code | Should -Be 'tab'
         $r.message | Should -Match 'was closed'
+        $script:B.Browser.LastSweep = [datetime]::MinValue   # the 4 s sweep throttle
         Update-DesignerBrowser -State $script:B -Force
         $script:B.Browser.Connected | Should -BeTrue
         $script:B.Browser.TabId | Should -Be $extra.id
@@ -2296,7 +2438,11 @@ return { added: S.config.pages.length - before, name: p.name, url: p.url, select
 const n = S.config.pages.length - 1;
 S.config.pages[n].url = '$($script:WebBase)/ok';
 S.config.pages[n].overrides = { zoomPercent: 50 };
-await D.goToUrl(n);
+D.selectPage(n);
+const going = D.goToUrl(n);
+const busyGo = { text: btnByKey('go').textContent, disabled: btnByKey('go').getAttribute('aria-disabled') };
+await going;
+const idleGo = btnByKey('go').textContent;
 await until(() => S.browser.zoom && S.browser.zoom.percent === 50, 6000);
 const zoomText = document.querySelector('#browser-strip').textContent;
 btnByKey('bs-zoomoff').click();
@@ -2305,10 +2451,15 @@ const after = document.querySelector('#browser-strip').textContent;
 delete S.config.pages[n].overrides;
 S.config.pages[n].url = '$($script:WebBase)/tabs';
 await D.goToUrl(n);
-return { zoomText, after };
+return { zoomText, after, busyGo, idleGo };
 "@
+        $r.busyGo.text | Should -Be 'Opening…'
+        $r.busyGo.disabled | Should -Be 'true'
+        $r.idleGo | Should -Be 'Go'
         $r.zoomText | Should -Match 'Zoom preview'
         $r.zoomText | Should -Match '50%'
+        $r.zoomText | Should -Match 'the run.s zoom'
+        $r.zoomText | Should -Match 'layout may differ'
         $r.after | Should -Not -Match 'Zoom preview'
         Invoke-Audit 'location.pathname' | Should -Be '/tabs'
         Invoke-Audit 'window.innerWidth' | Should -Be $width
@@ -2380,6 +2531,32 @@ return { closed: !!closed, toast: document.querySelector('#toast').textContent }
 '@
         $r.closed | Should -BeTrue
         $r.toast | Should -Match 'cancelled'
+        Invoke-Audit "typeof window.__vouchPicker + '|' + document.querySelectorAll('vouch-picker-ui').length" | Should -Be 'undefined|0'
+    }
+
+    It 'cancels the pick in the browser and says so when the Designer stops answering the poll' {
+        $r = Invoke-UiPanel @'
+const realFetch = window.fetch;
+let cancelled = 0;
+try {
+  btnByKey('pick-click').click();
+  await until(() => document.querySelector('#picking').open, 8000);
+  window.fetch = (url, options) => {
+    if (url === '/api/pick' && (!options || options.method === 'GET')) return Promise.reject(new TypeError('network down'));
+    if (url === '/api/pick/cancel') cancelled++;
+    return realFetch(url, options);
+  };
+  const shown = await until(() => document.querySelector('#modal').open, 8000);
+  const title = document.querySelector('#modal-title').textContent;
+  document.querySelector('#modal-buttons .btn').click();
+  return { shown: !!shown, title, cancelled, picking: document.querySelector('#picking').open };
+} finally { window.fetch = realFetch; }
+'@
+        $r.shown | Should -BeTrue
+        $r.title | Should -Match 'Picking stopped'
+        $r.cancelled | Should -Be 1
+        $r.picking | Should -BeFalse
+        Start-Sleep -Milliseconds 500
         Invoke-Audit "typeof window.__vouchPicker + '|' + document.querySelectorAll('vouch-picker-ui').length" | Should -Be 'undefined|0'
     }
 

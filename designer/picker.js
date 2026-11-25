@@ -10,8 +10,11 @@
   What it does, and what it does not:
   - It shows what the person points at (a banner and an outline in a closed shadow root,
     styled through the CSSOM so neither the site's CSS nor its Content-Security-Policy
-    gets in the way), swallows the click and the pointer events around it so the site
-    never acts on it, and marks the element it was given with a temporary property.
+    gets in the way). A transparent hit layer covers the window, so pointer events land
+    on the picker, never on the site's elements; what lies beneath is found by
+    hit-testing. Clicks, keys and the events around them are swallowed so the site never
+    acts on them, and only the person's own (trusted) events pick or cancel. The picked
+    element is marked with a temporary property.
   - It PROPOSES text and selectors. It never decides: the server keeps a proposal only
     when the engine's own find-only scripts, run against this page, resolve it to the
     marked element. There is no second matcher here.
@@ -30,7 +33,11 @@
   var mode = cfg.mode === 'scroll' || cfg.mode === 'waitFor' ? cfg.mode : 'click';
   var texts = cfg.texts || {};
   var INTERACTIVE = 'a[href],button,[role=button],[role=tab],[role=menuitem],[role=link],[role=checkbox],[role=radio],[role=switch],[role=option],input,select,textarea,summary,label';
-  var SWALLOW = ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'dblclick', 'auxclick', 'contextmenu', 'touchstart', 'touchend'];
+  // Everything that could make the site act. Pointer events never reach the site's
+  // elements anyway (they land on the hit layer below); these are swallowed as well for
+  // keyboard activation, events inside frames, and implicit form submission.
+  var SWALLOW = ['pointerdown', 'pointerup', 'pointercancel', 'mousedown', 'mouseup', 'click', 'dblclick', 'auxclick', 'contextmenu',
+    'touchstart', 'touchend', 'touchcancel', 'dragstart', 'drop', 'submit'];
   var hadTarget = Object.prototype.hasOwnProperty.call(window, '__vouchTarget');
   var savedTarget = hadTarget ? window.__vouchTarget : undefined;
 
@@ -62,6 +69,20 @@
   banner.appendChild(bannerTitle);
   banner.appendChild(bannerStatus);
   var overlayLayer = css(document.createElement('div'), { position: 'fixed', left: '0', top: '0', width: '0', height: '0', 'z-index': '1', margin: '0' });
+  /*
+    The hit layer: transparent, over the whole window, frames included. Every pointer
+    event's target is therefore this picker's own host, so no listener of the site - not
+    even one registered on window in the capture phase before the picker came - ever
+    sees the real element as the target. What lies under the pointer is found by
+    hit-testing beneath the layer (hitTest), through same-site frames. One layer in the
+    top document is enough: it covers the frames too, so they get no pointer events at
+    all. The wheel is passed on to what lies beneath (onWheel), so the person can still
+    scroll the page, its panels and its frames to reach what they want to pick.
+  */
+  var hitLayer = css(document.createElement('div'), {
+    position: 'fixed', left: '0', top: '0', width: '100vw', height: '100vh', 'z-index': '0', margin: '0', padding: '0',
+    background: 'transparent', cursor: 'crosshair', 'pointer-events': 'auto' });
+  root.appendChild(hitLayer);
   root.appendChild(overlayLayer);
   root.appendChild(outline);
   root.appendChild(label);
@@ -91,29 +112,19 @@
   }
 
   // ---------------------------------------------------------------- frames from another site
-  var blockedRects = [];
   function refreshOverlays() {
     var docs = vouchDocs();
     while (overlayLayer.firstChild) { overlayLayer.removeChild(overlayLayer.firstChild); }
-    blockedRects = [];
     docs.blocked.forEach(function (b) {
       var r = b.frame.getBoundingClientRect(), off = frameOffset(b.parent);
       var rect = { left: r.left + off.x, top: r.top + off.y, width: r.width, height: r.height };
-      blockedRects.push({ rect: rect, name: vouchFrameName(b.frame) });
       var box = css(document.createElement('div'), {
-        position: 'fixed', 'box-sizing': 'border-box', border: '2px dashed #a8201a', 'pointer-events': 'auto', cursor: 'not-allowed',
+        position: 'fixed', 'box-sizing': 'border-box', border: '2px dashed #a8201a', 'pointer-events': 'none',
         background: 'repeating-linear-gradient(45deg, rgba(168,32,26,0.06) 0 10px, rgba(168,32,26,0.14) 10px 20px)', margin: '0' });
       place(box, rect);
       overlayLayer.appendChild(box);
     });
     return docs;
-  }
-  function blockedAt(x, y) {
-    for (var i = 0; i < blockedRects.length; i++) {
-      var r = blockedRects[i].rect;
-      if (x >= r.left && x <= r.left + r.width && y >= r.top && y <= r.top + r.height) { return blockedRects[i]; }
-    }
-    return null;
   }
 
   // ---------------------------------------------------------------- what the pointer is on
@@ -159,13 +170,70 @@
     }
     return { kind: 'none' };
   }
+  /*
+    What lies under a point of the top window, beneath the hit layer: elementsFromPoint
+    lists the elements there from the top; the picker's own host is skipped. A frame from
+    the same site is entered (its document, with the point in its own coordinates); a
+    frame from another site cannot be, and says so. An open shadow root is looked into
+    (ShadowRoot.elementFromPoint), only to be able to say that it cannot be recorded.
+    Identification only: what is recorded is still decided by the engine on the server.
+  */
+  function hitTest(x, y) {
+    var doc = document, win = window, ox = 0, oy = 0;
+    for (var depth = 0; depth < 12; depth++) {
+      var list = doc.elementsFromPoint(x - ox, y - oy), el = null;
+      for (var i = 0; i < list.length; i++) { if (list[i] !== host) { el = list[i]; break; } }
+      if (!el) { return null; }
+      var tag = el.tagName.toLowerCase();
+      if (tag === 'iframe' || tag === 'frame') {
+        var inner = null;
+        try { inner = el.contentDocument; } catch (e) { inner = null; }
+        if (!inner || !inner.documentElement) { return { el: el, real: el, win: win, crossorigin: true }; }
+        var r = el.getBoundingClientRect();
+        ox += r.left + el.clientLeft; oy += r.top + el.clientTop;
+        doc = inner; win = el.contentWindow;
+        continue;
+      }
+      var real = el;
+      for (var k = 0; k < 12 && real.shadowRoot && real.shadowRoot.elementFromPoint; k++) {
+        var deeper = real.shadowRoot.elementFromPoint(x - ox, y - oy);
+        if (!deeper || deeper === real) { break; }
+        real = deeper;
+      }
+      return { el: el, real: real, win: win, crossorigin: false };
+    }
+    return null;
+  }
+  // The element that has the keyboard focus, through same-site frames and open shadow roots.
+  function focusedTarget() {
+    var doc = document, win = window, el = doc.activeElement;
+    for (var depth = 0; depth < 12 && el; depth++) {
+      var tag = el.tagName.toLowerCase();
+      if (tag !== 'iframe' && tag !== 'frame') { break; }
+      var inner = null;
+      try { inner = el.contentDocument; } catch (e) { inner = null; }
+      if (!inner) { return { el: el, real: el, win: win, crossorigin: true }; }
+      doc = inner; win = el.contentWindow; el = doc.activeElement;
+    }
+    if (!el || el === doc.body || el === doc.documentElement || el === host) { return null; }
+    var real = el;
+    for (var k = 0; k < 12 && real.shadowRoot && real.shadowRoot.activeElement; k++) { real = real.shadowRoot.activeElement; }
+    return { el: el, real: real, win: win, crossorigin: false };
+  }
+  function resolveHit(hit) {
+    if (!hit) { return { blocked: 'ours' }; }
+    if (hit.crossorigin) { return { blocked: 'crossorigin', frameName: vouchFrameName(hit.el) }; }
+    return resolveElement(hit.el, hit.real, hit.win);
+  }
   function resolve(ev, win) {
     var t = ev.target;
-    if (t === host) {
-      var hit = blockedAt(ev.clientX, ev.clientY);
-      return hit ? { blocked: 'crossorigin', frameName: hit.name } : { blocked: 'ours' };
-    }
+    if (t === host) { return resolveHit(hitTest(ev.clientX, ev.clientY)); }
     if (!t || t.nodeType !== 1) { return { blocked: 'ours' }; }
+    var path = typeof ev.composedPath === 'function' ? ev.composedPath() : [];
+    var real = path.length && path[0] && path[0].nodeType === 1 ? path[0] : t;
+    return resolveElement(t, real, win);
+  }
+  function resolveElement(t, real, win) {
     var entry = entryForWindow(win);
     if (!entry) { return { blocked: 'ours' }; }
     var tag = t.tagName.toLowerCase();
@@ -173,8 +241,6 @@
       var reachable = vouchDocs().list.some(function (x) { return x.frame === t; });
       if (!reachable) { return { blocked: 'crossorigin', frameName: vouchFrameName(t) }; }
     }
-    var path = typeof ev.composedPath === 'function' ? ev.composedPath() : [];
-    var real = path.length && path[0] && path[0].nodeType === 1 ? path[0] : t;
     if (mode === 'scroll') {
       var s = findScroller(real, entry);
       if (s.kind === 'shadow') { return { blocked: 'shadow' }; }
@@ -256,34 +322,86 @@
   }
   function onMove(win) {
     return function (ev) {
-      if (state.phase !== 'picking') { return; }
+      if (state.phase !== 'picking' || !ev.isTrusted) { return; }
       state.hover = resolve(ev, win);
       draw();
     };
   }
+  // The person's choice: mark the element (the server's proof looks for this mark).
+  function accept(info) {
+    if (info.blocked === 'ours') { return; }
+    if (info.blocked) { state.hover = info; finish('blocked', info.blocked, describeHover(info)); return; }
+    if (mode === 'scroll' && info.scroll.kind === 'none') { state.hover = info; draw(); return; }
+    var target = mode === 'scroll' ? (info.scroll.kind === 'window' ? null : info.scroll.node) : info.el;
+    if (target) {
+      try { Object.defineProperty(target, MARK, { value: String(cfg.token), configurable: true, enumerable: false, writable: true }); }
+      catch (e) { finish('error', 'mark', 'The element could not be marked.'); return; }
+    }
+    state.picked = info;
+    state.saved = saveScroll(info);
+    finish('picked', '', '');
+  }
+  /*
+    Only what the person does counts. Events the page makes itself (el.click(),
+    dispatchEvent - isTrusted false) are swallowed like the others but never pick or
+    cancel: a page that clicks something by script (an auto-refresh, a carousel, or a
+    hostile page) must not choose what Vouch records.
+  */
   function onSwallowed(win) {
     return function (ev) {
       swallow(ev);
-      if (ev.type !== 'click' || state.phase !== 'picking') { return; }
-      var info = resolve(ev, win);
-      if (info.blocked === 'ours') { return; }
-      if (info.blocked) { state.hover = info; finish('blocked', info.blocked, describeHover(info)); return; }
-      if (mode === 'scroll' && info.scroll.kind === 'none') { state.hover = info; draw(); return; }
-      var target = mode === 'scroll' ? (info.scroll.kind === 'window' ? null : info.scroll.node) : info.el;
-      if (target) {
-        try { Object.defineProperty(target, MARK, { value: String(cfg.token), configurable: true, enumerable: false, writable: true }); }
-        catch (e) { finish('error', 'mark', 'The element could not be marked.'); return; }
-      }
-      state.picked = info;
-      state.saved = saveScroll(info);
-      finish('picked', '', '');
+      if (!ev.isTrusted || ev.type !== 'click' || state.phase !== 'picking') { return; }
+      accept(resolve(ev, win));
     };
   }
+  /*
+    Keys: Esc cancels. Enter or Space on a focused control picks that control (keyboard
+    picking) and is swallowed, so it is neither activated nor submits a form. With
+    nothing focused, Space and every other key keep their normal job - scrolling the
+    page is never blocked.
+  */
   function onKey(ev) {
-    if (ev.key !== 'Escape') { return; }
+    var key = ev.key;
+    if (key === 'Escape') {
+      swallow(ev);
+      if (ev.isTrusted && ev.type === 'keydown' && state.phase === 'picking') { finish('cancelled', 'esc', ''); }
+      return;
+    }
+    if (key !== 'Enter' && key !== ' ' && key !== 'Spacebar') { return; }
+    var focused = focusedTarget();
+    if (!focused) { return; }
     swallow(ev);
-    if (ev.type === 'keydown' && state.phase === 'picking') { finish('cancelled', 'esc', ''); }
+    if (ev.isTrusted && ev.type === 'keydown' && !ev.repeat && state.phase === 'picking') { accept(resolveHit(focused)); }
   }
+  /*
+    The wheel over the hit layer would only scroll the top page; it is passed on to what
+    lies beneath the pointer instead: the nearest panel that can still scroll that way,
+    then the frame's page, then the window - the order the browser itself uses.
+  */
+  function onWheel(ev) {
+    if (!ev.isTrusted) { return; }
+    var hit = hitTest(ev.clientX, ev.clientY);
+    if (!hit || hit.crossorigin) { return; }
+    var scale = ev.deltaMode === 1 ? 16 : (ev.deltaMode === 2 ? window.innerHeight : 1);
+    var dy = ev.deltaY * scale, dx = ev.deltaX * scale;
+    var entry = entryForWindow(hit.win);
+    var node = hit.el;
+    for (var e = entry; e; e = e.parent) {
+      for (var n = node; n && n.nodeType === 1; n = n.parentElement) {
+        if (n === e.doc.documentElement || n === e.doc.body) { break; }
+        var oy = e.win.getComputedStyle(n).overflowY;
+        var can = (oy === 'auto' || oy === 'scroll' || oy === 'overlay') &&
+          ((dy > 0 && n.scrollTop + n.clientHeight < n.scrollHeight - 1) || (dy < 0 && n.scrollTop > 0));
+        if (can) { n.scrollBy(dx, dy); ev.preventDefault(); return; }
+      }
+      var fs = e.doc.scrollingElement || e.doc.documentElement;
+      if (fs && ((dy > 0 && e.win.scrollY + e.win.innerHeight < fs.scrollHeight - 1) || (dy < 0 && e.win.scrollY > 0) || !e.frame)) {
+        e.win.scrollBy(dx, dy); ev.preventDefault(); return;
+      }
+      node = e.frame;
+    }
+  }
+  hitLayer.addEventListener('wheel', onWheel, { passive: false });
   function listen(win) {
     if (windows.indexOf(win) >= 0) { return; }
     windows.push(win);

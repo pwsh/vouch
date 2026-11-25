@@ -164,6 +164,8 @@
     capabilities: { browser: false, pick: false, test: false, run: false },
     browser: { connected: false },
     connecting: false,
+    // A page is being opened with Go (the server waits for it to load).
+    going: false,
     // Results of "Test" per action (key: testKey()), and the one being tested now.
     tests: {},
     testing: '',
@@ -924,7 +926,7 @@
       btn('Move down', () => movePage(i, i + 1, true), { small: true, disabled: i === pages.length - 1, fkey: 'page-down' }),
       btn('Duplicate', () => duplicatePage(i), { small: true, fkey: 'page-dup' }),
       btn('Delete', () => deletePage(i), { small: true, danger: true, fkey: 'page-del' }));
-    const goButton = btn('Go', () => goToUrl(i), { small: true, later: S.capabilities.browser ? null : LATER_BROWSER, title: 'Open this address in the audit browser, at the zoom the run will use', fkey: 'go' });
+    const goButton = btn(S.going ? 'Opening…' : 'Go', () => goToUrl(i), { small: true, later: S.capabilities.browser ? null : LATER_BROWSER, disabled: S.going, title: 'Open this address in the audit browser, at the zoom the run will use', fkey: 'go' });
     const accountInfo = effOverride(i, 'account');
     const details = h('div', { class: 'card page-card' },
       h('div', { class: 'card-head' },
@@ -1481,7 +1483,7 @@
       if (b.zoom && b.zoom.percent && b.zoom.percent !== 100) {
         parts.push(h('p', { class: 'bs-zoom' },
           h('strong', { text: 'Zoom preview: ' }),
-          (b.zoom.page ? '“' + b.zoom.page + '”' : 'This page') + ' is shown at ' + b.zoom.percent + '%, as the run will show it. ',
+          (b.zoom.page ? '“' + b.zoom.page + '”' : 'This page') + ' is shown at ' + b.zoom.percent + '%, the run’s zoom. The layout may differ at the run’s full window width. ',
           btn('Show at 100%', () => zoomOff(), { small: true, fkey: 'bs-zoomoff' })));
       }
       if (b.settingsChanged) {
@@ -1531,13 +1533,17 @@
     catch (e) { showError(e); }
   }
   async function goToUrl(i) {
+    if (S.going) return;
     const page = pageAt(i);
-    toast('Opening the page in the browser…');
+    S.going = true;
+    keepFocus(renderAll);
+    announce('Opening the page in the browser…');
     try {
       const r = await api('POST', '/api/browser/navigate', { url: page && typeof page.url === 'string' ? page.url : '', config: S.config, pageIndex: i });
       toast((r.status === 'loaded' ? 'Opened: ' : '') + (r.status === 'loaded' ? (r.title || r.url) : r.message));
       await poll(true);
     } catch (e) { showError(e, 'The page was not opened.'); }
+    finally { S.going = false; keepFocus(renderAll); }
   }
   async function addPageFromCurrentTab() {
     try {
@@ -1569,9 +1575,11 @@
   async function startPick(mode, target) {
     if (S.picking) return;
     let release = null;
+    let started = false;
     S.picking = { mode: mode, target: target };
     try {
       await api('POST', '/api/pick/start', { mode: mode });
+      started = true;
       $('#picking-text').textContent = PICK_TEXT[mode];
       $('#picking-notice').hidden = true;
       release = holdOpen($('#picking'));
@@ -1584,6 +1592,7 @@
         if (state.notice) { $('#picking-notice').textContent = state.notice; $('#picking-notice').hidden = false; }
       }
       release(); release = null;
+      started = false;
       if (state.state === 'done' && state.result) {
         const choice = await chooseCandidate(mode, state.result);
         if (choice) applyPick(mode, target, choice);
@@ -1591,7 +1600,15 @@
       }
       else if (state.state === 'cancelled') { toast(state.message || 'Picking was cancelled.'); announce(state.message || 'Picking was cancelled.'); }
       else await ask({ title: 'Nothing was recorded', body: [state.message || 'Picking stopped.'], buttons: [{ label: 'OK', value: true, primary: true }], cancelValue: true });
-    } catch (e) { showError(e, 'Picking did not work.'); }
+    } catch (e) {
+      // The page may still be waiting for a click: end the pick there too (best effort).
+      if (started) {
+        if (release) { release(); release = null; }
+        try { await api('POST', '/api/pick/cancel', {}); } catch (e2) { /* the Designer is not answering */ }
+        await showError(e, 'Picking stopped: the Designer did not answer, so the pick was cancelled in the browser too.');
+      }
+      else showError(e, 'Picking did not work.');
+    }
     finally { if (release) release(); S.picking = null; }
   }
   async function cancelPick() {
@@ -1641,6 +1658,7 @@
     const body = [
       h('p', {}, 'You picked ', h('strong', { text: what }), '. Vouch checked each way below in the page: replaying it reaches exactly that.'),
       element.climbedNote ? h('p', { class: 'help', text: element.climbedNote }) : null,
+      result.note ? h('p', { class: 'help warning-text', text: result.note }) : null,
       h('p', { class: 'legend', id: legendId, text: cands.length === 1 ? 'The way Vouch can record it:' : 'Choose how Vouch records it (the first is the most robust):' }),
       group,
       valueBlock,

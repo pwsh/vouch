@@ -190,9 +190,18 @@ iframe{width:260px;height:110px;border:1px solid #888} #spacer{height:2500px;bac
 <div class="row"><div><div><div><div><div><em onclick="hit('deep')">Deep target</em></div></div></div></div></div></div>
 <div class="row"><iframe id="sameframe" name="sameframe" src="/pickframe"></iframe><iframe id="otherframe" src="http://localhost:$other/pickframe"></iframe><div id="shadowhost"></div></div>
 <div><div class="panel" id="leftpanel">$rows</div> <div class="panel" id="rightpanel">$rows</div> <div id="clipbox"><div style="height:400px">Clipped content</div></div></div>
+<form id="lonely" action="/ok" onsubmit="window.__submits++; document.title = 'SUBMITTED'; return false;"><input id="q" name="q" value="find"></form>
 <div id="spacer">The rest of a tall page</div>
 <script>
-window.__hits = []; window.__downs = 0; window.__keys = 0;
+window.__hits = []; window.__downs = 0; window.__keys = 0; window.__submits = 0; window.__winHits = [];
+// A site that acts in the capture phase on window, registered before any picker: it
+// records whenever one of its own controls is the target of a click, mousedown or pointerdown.
+['click', 'mousedown', 'pointerdown'].forEach(function (type) {
+  window.addEventListener(type, function (e) {
+    var t = e.target;
+    if (t && t.nodeType === 1 && t.closest && t.closest('a,button,input,em,form,[role]')) { window.__winHits.push(type + ':' + (t.id || t.tagName)); }
+  }, true);
+});
 function hit(n) { window.__hits.push(n); document.title = 'HIT ' + n; return false; }
 document.addEventListener('mousedown', function () { window.__downs++; });
 document.addEventListener('keydown', function () { window.__keys++; });
@@ -205,7 +214,9 @@ shadowButton.onclick = function () { hit('shadow'); }; shadowRoot.appendChild(sh
             }
             '^/pickframe$' {
                 $rows = (1..8 | ForEach-Object { "<div style='height:50px'>Frame row $_</div>" }) -join ''
-                $body = "<button id='framebtn' onclick=""try { top.__hits.push('frame'); top.document.title = 'HIT frame'; } catch (e) { document.title = 'HIT other frame'; }"">Frame action</button>$rows"
+                $body = "<button id='framebtn' onclick=""try { top.__hits.push('frame'); top.document.title = 'HIT frame'; } catch (e) { document.title = 'HIT other frame'; }"">Frame action</button>$rows" +
+                    "<script>['click', 'mousedown', 'pointerdown'].forEach(function (type) { window.addEventListener(type, function (e) { var t = e.target;" +
+                    " if (t && t.closest && t.closest('button')) { try { top.__winHits.push('frame-' + type + ':' + t.id); } catch (x) { } } }, true); });</script>"
                 Send-Response $context 200 (Page 'Pick frame' $body)
             }
             '^/slow$' {

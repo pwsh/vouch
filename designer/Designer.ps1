@@ -79,6 +79,8 @@ function New-DesignerState {
         # How long a request body may take to arrive once its headers are in: the loop
         # serves one request at a time, so a sender that stalls must not hold it up.
         BodyTimeoutMs        = 5000
+        # The saved configuration as last read (Get-DesignerSavedConfig).
+        ConfigCache          = $null
         # The link to the audit Edge (Connect-DesignerBrowser) and the pick in progress.
         Browser              = New-DesignerBrowserState
         Pick                 = New-DesignerPickState
@@ -121,6 +123,7 @@ function New-DesignerBrowserState {
         ZoomPage           = ''
         LastCheck          = [datetime]::MinValue
         LastProbe          = [datetime]::MinValue
+        LastSweep          = [datetime]::MinValue
     }
 }
 
@@ -1754,11 +1757,7 @@ function Get-DesignerBrowserSetting {
     #>
     param([Parameter(Mandatory)][object]$State)
     $browser = $State.Browser
-    $config = $null
-    if ($State.ConfigPath -and [System.IO.File]::Exists($State.ConfigPath)) {
-        try { $config = (Read-DesignerConfigFile -Path $State.ConfigPath).Config }
-        catch { Write-Verbose "Browser settings not read from the configuration: $($_.Exception.Message)" }
-    }
+    $config = Get-DesignerSavedConfig -State $State
     $port = 9222
     if ($browser.TypedPort -gt 0) { $port = [int]$browser.TypedPort }
     else {
@@ -1776,6 +1775,27 @@ function Get-DesignerBrowserSetting {
     $configPath = if ($null -ne $config) { $State.ConfigPath } else { '' }
     $profileDir = Get-DesignerAuditProfile -EdgeProfileDir $browser.TypedProfileDir -Config $config -ConfigPath $configPath
     return [pscustomobject]@{ Port = $port; ProfileDir = $profileDir; KeepOpen = $keep }
+}
+
+function Get-DesignerSavedConfig {
+    <#
+        The configuration file as saved, read again only when it changed (path, last
+        write time and size): GET /api/state asks for the browser settings on every
+        poll of the panel, and parsing the file each time would be wasted work. $null
+        when there is no file or it cannot be read.
+    #>
+    param([Parameter(Mandatory)][object]$State)
+    $path = $State.ConfigPath
+    if (-not $path -or -not [System.IO.File]::Exists($path)) { return $null }
+    $info = [System.IO.FileInfo]::new($path)
+    $stamp = "$($info.LastWriteTimeUtc.Ticks)|$($info.Length)"
+    $cache = $State.ConfigCache
+    if ($null -ne $cache -and $cache.Path -eq $path -and $cache.Stamp -eq $stamp) { return $cache.Config }
+    $config = $null
+    try { $config = (Read-DesignerConfigFile -Path $path).Config }
+    catch { Write-Verbose "Browser settings not read from the configuration: $($_.Exception.Message)" }
+    $State.ConfigCache = [pscustomobject]@{ Path = $path; Stamp = $stamp; Config = $config }
+    return $config
 }
 
 function Get-EdgeDebugPolicy {
@@ -1904,7 +1924,7 @@ function Use-DesignerProbeSocket {
     $script:PageZoomPercent = 100
     $script:CdpTabId = ''
     try {
-        Connect-CdpSocket -WebSocketUrl $WebSocketUrl -TimeoutSec 3
+        Connect-CdpSocket -WebSocketUrl $WebSocketUrl -TimeoutSec 2
         return (& $Script)
     }
     finally {
@@ -1923,7 +1943,7 @@ function Get-DesignerTabVisibility {
     param([Parameter(Mandatory)][object]$Target)
     try {
         return [string](Use-DesignerProbeSocket -WebSocketUrl ([string](Get-DesignerValue -Object $Target -Name 'webSocketDebuggerUrl')) -Script {
-                Invoke-CdpEval -Expression 'document.visibilityState' -TimeoutSec 2 })
+                Invoke-CdpEval -Expression 'document.visibilityState' -TimeoutSec 1 })
     }
     catch { return '' }
 }
@@ -1934,10 +1954,15 @@ function Find-DesignerVisibleTab {
         Edge shows one tab per window). The attached tab is asked over the open socket,
         the others over a short socket each. $null when none is visible - a minimised
         window has every tab hidden, and the Designer then stays where it is.
+        The loop waits while this runs, so a sweep is bounded: it stops at the first tab
+        that does not answer (a sleeping background tab can take its full timeout every
+        time) and when -BudgetMs is used up; the next sweep tries again.
     #>
-    param([Parameter(Mandatory)][object]$State, [AllowNull()][object[]]$Tabs, [string]$Skip = '')
+    param([Parameter(Mandatory)][object]$State, [AllowNull()][object[]]$Tabs, [string]$Skip = '', [int]$BudgetMs = 2500)
+    $deadline = (Get-Date).AddMilliseconds($BudgetMs)
     foreach ($tab in @($Tabs)) {
         if ($null -eq $tab) { continue }
+        if ((Get-Date) -ge $deadline) { break }
         $id = [string](Get-DesignerValue -Object $tab -Name 'id')
         if ($Skip -and $id -eq $Skip) { continue }
         $visibility = ''
@@ -1945,7 +1970,10 @@ function Find-DesignerVisibleTab {
             try { $visibility = [string](Invoke-CdpEval -Expression 'document.visibilityState' -TimeoutSec 2) }
             catch { $visibility = '' }
         }
-        else { $visibility = Get-DesignerTabVisibility -Target $tab }
+        else {
+            $visibility = Get-DesignerTabVisibility -Target $tab
+            if (-not $visibility) { break }
+        }
         if ($visibility -eq 'visible') { return $tab }
     }
     return $null
@@ -2161,7 +2189,9 @@ function Update-DesignerBrowser {
         $visibility = ''
         try { $visibility = [string](Invoke-CdpEval -Expression 'document.visibilityState' -TimeoutSec 2) }
         catch { $visibility = '' }
-        if ($visibility -eq 'hidden') {
+        # Looking at the other tabs costs a connection each, so at most every 4 seconds.
+        if ($visibility -eq 'hidden' -and ((Get-Date) - $browser.LastSweep).TotalSeconds -ge 4) {
+            $browser.LastSweep = Get-Date
             $next = Find-DesignerVisibleTab -State $State -Tabs $tabs -Skip $browser.TabId
             if ($null -ne $next) {
                 try { Connect-DesignerTab -State $State -Target $next }
@@ -2830,7 +2860,8 @@ function Test-DesignerShadowHost {
         if (-not $objectId) { return $false }
         $described = Send-CdpCommand -Method 'DOM.describeNode' -Params @{ objectId = $objectId; depth = 1 } -TimeoutSec 5
         $roots = Get-DesignerValue -Object (Get-DesignerValue -Object $described -Name 'node') -Name 'shadowRoots'
-        return (@($roots | Where-Object { $null -ne $_ }).Count -gt 0)
+        # Form fields have a browser-made ("user-agent") shadow root; only the page's own count.
+        return (@($roots | Where-Object { $null -ne $_ -and [string](Get-DesignerValue -Object $_ -Name 'shadowRootType') -ne 'user-agent' }).Count -gt 0)
     }
     catch { return $false }
     finally {
@@ -2857,26 +2888,29 @@ function Test-ElementPickProposal {
         [Parameter(Mandatory)][string]$Kind,
         [AllowEmptyString()][string]$Value,
         [Parameter(Mandatory)][string]$Token,
-        [string]$ScrollKind = ''
+        [string]$ScrollKind = '',
+        # Each evaluation's limit (what is left of the pick's overall deadline).
+        [int]$TimeoutSec = 10
     )
     $no = [pscustomobject]@{ Ok = $false; Exact = $false }
+    $TimeoutSec = [Math]::Max(1, $TimeoutSec)
     try {
         if ($Mode -eq 'scroll' -and $Kind -eq 'page') {
-            $target = Invoke-CdpEval -Expression (Get-ScrollTargetScript -Mode page) -TimeoutSec 10
+            $target = Invoke-CdpEval -Expression (Get-ScrollTargetScript -Mode page) -TimeoutSec $TimeoutSec
             return [pscustomobject]@{ Ok = ([string](Get-DesignerValue -Object $target -Name 'kind') -eq 'window'); Exact = $true }
         }
         if ($Kind -eq 'text') {
             if ($Mode -ne 'click') { return $no }
-            $found = Invoke-CdpEval -Expression (Get-ClickTextScript -Text $Value -FindOnly) -TimeoutSec 10
+            $found = Invoke-CdpEval -Expression (Get-ClickTextScript -Text $Value -FindOnly) -TimeoutSec $TimeoutSec
             $hit = ((Get-DesignerValue -Object $found -Name 'found') -eq $true) -and ([string](Get-DesignerValue -Object $found -Name 'mark') -ceq $Token)
             return [pscustomobject]@{ Ok = $hit; Exact = ((Get-DesignerValue -Object $found -Name 'exact') -eq $true) }
         }
-        $found = Invoke-CdpEval -Expression (Get-ClickSelectorScript -Selector $Value -FindOnly) -TimeoutSec 10
+        $found = Invoke-CdpEval -Expression (Get-ClickSelectorScript -Selector $Value -FindOnly) -TimeoutSec $TimeoutSec
         $hit = ((Get-DesignerValue -Object $found -Name 'found') -eq $true) -and ([string](Get-DesignerValue -Object $found -Name 'mark') -ceq $Token)
         if (-not $hit) { return $no }
         if ($Mode -eq 'waitFor') { return [pscustomobject]@{ Ok = [bool](Wait-PageElement -Selector $Value -TimeoutSec 0); Exact = $true } }
         if ($Mode -eq 'scroll') {
-            $target = Invoke-CdpEval -Expression (Get-ScrollTargetScript -Mode area -Selector $Value) -TimeoutSec 10
+            $target = Invoke-CdpEval -Expression (Get-ScrollTargetScript -Mode area -Selector $Value) -TimeoutSec $TimeoutSec
             $ok = ([string](Get-DesignerValue -Object $target -Name 'fallback') -eq '') -and ([string](Get-DesignerValue -Object $target -Name 'kind') -eq $ScrollKind)
             return [pscustomobject]@{ Ok = $ok; Exact = $true }
         }
@@ -2942,19 +2976,27 @@ function Get-ElementPickCandidate {
         only when Test-ElementPickProposal proves the engine replays it onto the picked
         element. At most one text and three candidates; generated-looking ids are never
         offered, nor paths anchored on them. Proposal values are page data: only strings
-        of a sane length are even tried.
+        of a sane length are even tried. Returns { Candidates; TimedOut } - TimedOut when
+        -DeadlineSec ran out before every proposal was checked.
     #>
     param(
         [Parameter(Mandatory)][ValidateSet('click', 'scroll', 'waitFor')][string]$Mode,
         [Parameter(Mandatory)][string]$Token,
         [AllowNull()][object[]]$Proposals,
-        [Parameter(Mandatory)][System.Collections.IDictionary]$Element
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Element,
+        # One limit for the whole check: a page that answers slowly must not hold the
+        # Designer for proposals x checks x their own timeouts.
+        [double]$DeadlineSec = 10
     )
     $list = [System.Collections.Generic.List[object]]::new()
     $values = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     $haveText = $false
+    $deadline = (Get-Date).AddSeconds($DeadlineSec)
+    $timedOut = $false
     foreach ($proposal in @($Proposals) | Select-Object -First 16) {
         if ($list.Count -ge 3) { break }
+        $left = ($deadline - (Get-Date)).TotalSeconds
+        if ($left -le 0) { $timedOut = $true; break }
         $kind = [string](Get-DesignerValue -Object $proposal -Name 'kind')
         $value = Get-DesignerValue -Object $proposal -Name 'value'
         if ($kind -notin 'text', 'testid', 'id', 'attribute', 'path', 'page') { continue }
@@ -2967,13 +3009,15 @@ function Get-ElementPickCandidate {
         if ($kind -eq 'id' -and (Test-DesignerGeneratedId -Id $attrValue)) { continue }
         $anchor = Get-DesignerValue -Object $proposal -Name 'anchorId'
         if ($kind -eq 'path' -and $anchor -is [string] -and $anchor -and (Test-DesignerGeneratedId -Id $anchor)) { continue }
-        $check = Test-ElementPickProposal -Mode $Mode -Kind $kind -Value $value -Token $Token -ScrollKind ([string]$Element['kind'])
-        if (-not $check.Ok) { continue }
+        $check = Test-ElementPickProposal -Mode $Mode -Kind $kind -Value $value -Token $Token -ScrollKind ([string]$Element['kind']) -TimeoutSec ([int][Math]::Ceiling($left))
+        if ((Get-Date) -ge $deadline) { $timedOut = $true }
+        if (-not $check.Ok) { if ($timedOut) { break }; continue }
         if ($kind -eq 'text') { $haveText = $true }
         [void]$values.Add("$kind|$value")
         $list.Add((New-ElementPickCandidate -Mode $Mode -Kind $kind -Value $value -Exact $check.Exact -Attr $attr -AttrValue $attrValue -Element $Element))
+        if ($timedOut) { break }
     }
-    return , $list
+    return [pscustomobject]@{ Candidates = $list; TimedOut = $timedOut }
 }
 
 function ConvertTo-ElementPickInfo {
@@ -3090,9 +3134,14 @@ function Complete-ElementPick {
         Close-ElementPick -State $State -Outcome error -Code 'shadow' -Message 'This cannot be recorded: it is inside a page component (shadow DOM) that Vouch cannot look into, so a run could not find it. Pick something outside it, or use a wait instead.'
         return
     }
-    $candidates = Get-ElementPickCandidate -Mode $pick.Mode -Token $pick.Token -Proposals $proposals -Element $element
+    $checked = Get-ElementPickCandidate -Mode $pick.Mode -Token $pick.Token -Proposals $proposals -Element $element
+    $candidates = $checked.Candidates
     try { [void](Invoke-CdpEval -Expression '(window.__vouchPicker && typeof window.__vouchPicker.restore === "function") ? window.__vouchPicker.restore() : false' -TimeoutSec 5) }
     catch { Write-Verbose "Scroll positions not restored: $($_.Exception.Message)" }
+    if ($candidates.Count -eq 0 -and $checked.TimedOut) {
+        Close-ElementPick -State $State -Outcome error -Code 'slow' -Message 'The page stopped answering while Vouch checked what you picked. Wait until the page has settled, then pick again.'
+        return
+    }
     if ($candidates.Count -eq 0) {
         $what = switch ($pick.Mode) { 'scroll' { 'scroll this area' } 'waitFor' { 'find this element' } default { 'click this' } }
         Close-ElementPick -State $State -Outcome error -Code 'nocandidate' -Message "Vouch found no way to $what that it can replay exactly. Pick another part of it, or type a selector yourself."
@@ -3104,6 +3153,7 @@ function Complete-ElementPick {
         candidates = $candidates.ToArray()
         url        = $State.Browser.Url
         title      = $State.Browser.Title
+        note       = $(if ($checked.TimedOut) { 'The page answered slowly, so Vouch stopped checking after these; each one shown was checked.' } else { '' })
     }
     Close-ElementPick -State $State -Outcome done -Result $result
 }
