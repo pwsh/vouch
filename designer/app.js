@@ -1566,10 +1566,7 @@
     if (c.run) {
       parts.push(copyBlock('Run it', 'Paste into a PowerShell window. Every setting and page comes from the file.', c.run, c.runCmd, 'run'));
       parts.push(copyBlock('Run it with every setting spelled out', 'The same run, with each setting that differs from Vouch’s default written as a switch. Change a switch to override the file for one run.', c.runExpanded, c.runExpandedCmd, 'expanded'));
-      // The schedule command stays in the API (c.schedule) but is not shown until
-      // Install-VouchSchedule.ps1 can take a configuration file.
-      parts.push(h('div', { class: 'command' }, h('h3', { class: 'sub-title', text: 'Schedule it' }),
-        h('p', { class: 'later-note', text: 'Running this file on a schedule comes in a later step of the Designer.' })));
+      if (c.schedule) parts.push(copyBlock('Schedule it', c.scheduleNote, c.schedule, c.scheduleCmd, 'schedule'));
     }
     if (c.notes && c.notes.length) parts.push(h('ul', { class: 'notes' }, c.notes.map(n => h('li', { text: n }))));
     keepFocus(() => box.replaceChildren(...parts));

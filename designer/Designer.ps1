@@ -1515,11 +1515,10 @@ function Get-VouchCommandLine {
     $runExpanded = (@($run) + $psParts) -join ' '
     $runExpandedCmd = if ($cmdSafe) { (@($runCmd) + $cmdParts) -join ' ' } else { '' }
 
-    # The panel does not show this yet: Install-VouchSchedule.ps1 learns -ConfigPath in
-    # Task 10. Until then the command stops with a parameter error (ScheduleNote).
+    # Only a command to copy: the Designer never sets up a scheduled task itself.
     $schedule = "$head $(& $ps $installer) -ConfigPath $(& $ps $configFull) -Schedule AtLogOn"
     $scheduleCmd = if ($cmdSafe) { "$head $(& $cmd $installer) -ConfigPath $(& $cmd $configFull) -Schedule AtLogOn" } else { '' }
-    $scheduleNote = 'Install-VouchSchedule.ps1 learns -ConfigPath in a later step; until then this command stops with an error. Change -Schedule AtLogOn to -At 07:30 (every weekday) for a set time.'
+    $scheduleNote = 'Paste into a PowerShell window to set up a Windows scheduled task that runs the saved file 3 minutes after you sign in, without asking anything. It checks the file first and sets up nothing if the file has problems. For a set time instead, replace -Schedule AtLogOn with -At 07:30 (every weekday at 07:30). The Designer itself does not set up the task.'
 
     return [pscustomobject]@{
         Run            = $run

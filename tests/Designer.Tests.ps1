@@ -757,6 +757,28 @@ Describe 'Command lines (Get-VouchCommandLine)' {
             $binding.BoundParameters['OutputDir'].ConstantValue | Should -Be (Join-Path $script:CmdFolder 'out')
             foreach ($name in 'JpegQuality', 'SaveImages', 'Classification', 'LinkImages', 'NoCaptureLog', 'SettleSeconds') { @($binding.BoundParameters.Keys) | Should -Contain $name }
         }
+
+        It 'gives a schedule command that parses as PowerShell and binds to the real param block of Install-VouchSchedule.ps1' {
+            $installer = Join-Path (Split-Path $script:VouchPath -Parent) 'Install-VouchSchedule.ps1'
+            $script:Cmd.ScheduleNote | Should -Not -Match 'later step'
+            $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseInput($script:Cmd.Schedule, [ref]$null, [ref]$errors)
+            $errors.Count | Should -Be 0
+            $elements = $ast.EndBlock.Statements[0].PipelineElements[0].CommandElements
+            $elements[0].Value | Should -Be 'pwsh'
+            $fileIndex = @($elements | ForEach-Object { $_.Extent.Text }).IndexOf('-File')
+            $elements[$fileIndex + 1].Value | Should -Be $installer
+            $rest = @($elements | Select-Object -Skip ($fileIndex + 2) | ForEach-Object { $_.Extent.Text }) -join ' '
+            $call = [System.Management.Automation.Language.Parser]::ParseInput("& '$($installer.Replace("'", "''"))' $rest", [ref]$null, [ref]$null)
+            $command = $call.Find({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)
+            $binding = [System.Management.Automation.Language.StaticParameterBinder]::BindCommand($command, $true)
+            $binding.BindingExceptions.Count | Should -Be 0
+            @($binding.BoundParameters.Keys | Sort-Object) | Should -Be @('ConfigPath', 'Schedule')
+            $binding.BoundParameters['ConfigPath'].ConstantValue | Should -Be $script:CmdConfigPath
+            $binding.BoundParameters['Schedule'].ConstantValue | Should -Be 'AtLogOn'
+            # The cmd.exe form names the same file and the same schedule.
+            $script:Cmd.ScheduleCmd | Should -Be ('pwsh -NoProfile -ExecutionPolicy Bypass -File "' + $installer + '" -ConfigPath "' + $script:CmdConfigPath + '" -Schedule AtLogOn')
+        }
     }
 }
 
@@ -1207,10 +1229,13 @@ let copied = null;
 Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: text => { copied = text; return Promise.resolve(); } } });
 Array.from(document.querySelectorAll('#command-box button')).find(b => b.dataset.fkey === 'copy:expanded').click();
 await new Promise(r => setTimeout(r, 50));
+const expandedCopy = copied;
+Array.from(document.querySelectorAll('#command-box button')).find(b => b.dataset.fkey === 'copy:schedule').click();
+await new Promise(r => setTimeout(r, 50));
 const pre = document.querySelectorAll('#command-box pre.command-text')[1];
 const lines = Array.from(pre.querySelectorAll('.cmd-line')).map(e => e.textContent);
 const box = document.querySelector('#command-box');
-return { copied, api: S.command.runExpanded, lines, schedule: S.command.schedule, shown: box.textContent,
+return { copied: expandedCopy, scheduleCopied: copied, api: S.command.runExpanded, lines, schedule: S.command.schedule, shown: box.textContent,
   later: document.querySelector('#panel-run .later-note').textContent };
 '@
         $r.copied | Should -BeExactly $r.api
@@ -1219,9 +1244,13 @@ return { copied, api: S.command.runExpanded, lines, schedule: S.command.schedule
         $r.lines[1] | Should -BeLike '-File *vouch.ps1"'
         foreach ($line in $r.lines | Select-Object -Skip 1) { $line | Should -Match '^-[A-Za-z]+( |$)' }
         $r.lines | Should -Contain '-SaveImages'
-        $r.schedule | Should -Not -BeNullOrEmpty
-        $r.shown | Should -Not -Match 'Install-VouchSchedule'
-        $r.shown | Should -Match 'on a schedule comes in a later step'
+        # The schedule box is live: the installer command, its explanation, and Copy gives it exactly.
+        $r.schedule | Should -BeLike '*Install-VouchSchedule.ps1" -ConfigPath *-Schedule AtLogOn'
+        $r.scheduleCopied | Should -BeExactly $r.schedule
+        $r.shown | Should -Match 'Install-VouchSchedule'
+        $r.shown | Should -Match 'Paste into a PowerShell window to set up a Windows scheduled task'
+        $r.shown | Should -Match 'replace -Schedule AtLogOn with -At 07:30'
+        $r.shown | Should -Not -Match 'later step'
         $r.later | Should -Match 'copy the command below'
     }
 
