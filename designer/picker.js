@@ -15,13 +15,16 @@
     shows above it) is refused with a plain note in the banner.
   - The hit layer is a transparent box over the whole window inside a closed shadow
     root, shown as a manual popover so it sits in the browser's top layer (above modal
-    dialogs, popovers and full-screen elements that opened before it) and is placed
-    inside the topmost open modal dialog when there is one (everything outside a modal
-    dialog is inert). Every refresh checks that it is still there, last, on top and
-    covering the whole window; what cannot be restored ends the pick.
-  - The keyboard never reaches the page: focus is parked on the hit layer and every key
-    event is swallowed. Esc cancels; scroll keys scroll what lies under the pointer,
-    by the picker's own code, like the wheel. There is no keyboard picking.
+    dialogs and popovers that opened before it), placed inside the modal dialog that is
+    really on top (everything outside it is inert) and inside the innermost open auto
+    popover (so a press does not light-dismiss the page's menu). Every refresh checks
+    that it is still there, last, on top and covering the whole window; repairs are
+    bounded, and what cannot be restored ends the pick.
+  - Keys never reach the page: every key event is swallowed at window capture (the
+    browser's own shortcuts keep their default). The focus is taken once at the start;
+    the page may move it within its own documents (never fought over), but a focus in a
+    frame from another site is taken back, boundedly, or the pick ends. Esc cancels;
+    scroll keys scroll what lies under the pointer, like the wheel. No keyboard picking.
   - It PROPOSES text and selectors. It never decides: the server keeps a proposal only
     when the engine's own find-only scripts, run against this page, resolve it to the
     marked element. There is no second matcher here.
@@ -46,7 +49,6 @@
   var KEYS = ['keydown', 'keypress', 'keyup'];
   var hadTarget = Object.prototype.hasOwnProperty.call(window, '__vouchTarget');
   var savedTarget = hadTarget ? window.__vouchTarget : undefined;
-  var previousFocus = document.activeElement;
   var NONE = {};
 
   var state = { phase: 'picking', code: '', message: '', note: '', picked: null, hover: null, down: NONE, downMoves: 0, saved: null };
@@ -99,19 +101,57 @@
   root.appendChild(banner);
 
   // ---------------------------------------------------------------- staying on top
-  // The topmost open modal dialog: while one is open, everything outside it is inert.
-  function topModal() {
-    var list = document.querySelectorAll('dialog[open]'), found = null;
+  // Whether an element is what lies on top at its own centre (the picker's host skipped).
+  function onTopAtCentre(el) {
+    var r = el.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0)) { return false; }
+    var list = document.elementsFromPoint(r.left + r.width / 2, r.top + r.height / 2);
     for (var i = 0; i < list.length; i++) {
-      try { if (list[i].matches(':modal')) { found = list[i]; } } catch (e) { /* :modal unknown */ }
+      if (list[i] === host) { continue; }
+      return list[i] === el || el.contains(list[i]);
     }
-    return found;
+    return false;
   }
-  function wantedParent() { return topModal() || document.documentElement; }
+  /*
+    The open modal dialog that is really on top (everything outside it is inert): not the
+    last one in the page, but the one whose own centre is not covered - a lower modal is
+    covered by the upper one's backdrop. Document order only decides when none can tell.
+  */
+  function topModal() {
+    var list = document.querySelectorAll('dialog[open]'), last = null, top = null;
+    for (var i = 0; i < list.length; i++) {
+      var modal = false;
+      try { modal = list[i].matches(':modal'); } catch (e) { modal = false; }
+      if (!modal) { continue; }
+      last = list[i];
+      if (onTopAtCentre(list[i])) { top = list[i]; }
+    }
+    return top || last;
+  }
+  /*
+    The innermost open auto popover (a native menu): a press outside the auto popover
+    stack closes them all, and the press target is the picker's host - so the host goes
+    inside it, which keeps the menu open while the person points (established in Edge:
+    with the host outside, the press closed the menu and the site saw it close).
+  */
+  function topAutoPopover(within) {
+    var list = (within || document).querySelectorAll('[popover]'), open = [];
+    for (var i = 0; i < list.length; i++) {
+      var el = list[i];
+      if (el === host || el.popover !== 'auto') { continue; }
+      try { if (el.matches(':popover-open')) { open.push(el); } } catch (e) { /* popovers unknown */ }
+    }
+    var inner = open.filter(function (el) { return !open.some(function (o) { return o !== el && el.contains(o); }); });
+    return inner.length ? inner[inner.length - 1] : null;
+  }
+  function wantedParent() {
+    var modal = topModal();
+    return topAutoPopover(modal) || modal || document.documentElement;
+  }
   function showOnTop(again) {
     if (!canPopover || !host.isConnected) { return; }
     try {
-      if (host.matches(':popover-open')) { if (again) { host.hidePopover(); host.showPopover(); } }
+      if (host.matches(':popover-open')) { if (again && repaired()) { host.hidePopover(); host.showPopover(); } }
       else { host.showPopover(); }
     }
     catch (e) { /* not possible now; coverage checks decide */ }
@@ -120,12 +160,28 @@
     var parent = wantedParent();
     if (!parent) { return; }
     if (host.parentNode !== parent || parent.lastElementChild !== host) {
-      parent.appendChild(host);
       // The first placement is the picker's own; later ones are the page changing things.
+      if (placed && !repaired()) { return; }
+      parent.appendChild(host);
       if (placed) { moves++; lastMove = Date.now(); }
       placed = true;
     }
     showOnTop(false);
+  }
+  /*
+    Every repair (putting the layer back, moving it, showing it on top again) is counted:
+    a page that keeps undoing them (an observer that throws the layer out, a script that
+    keeps raising its own pop-up) would otherwise ping-pong with the guard and hang the
+    tab. More than 8 repairs in a second end the pick ("coverage"). Returns whether this
+    repair may go ahead.
+  */
+  var repairs = [];
+  function repaired() {
+    var now = Date.now();
+    repairs = repairs.filter(function (t) { return now - t < 1000; });
+    repairs.push(now);
+    if (repairs.length > 8) { finish('error', 'coverage', ''); return false; }
+    return true;
   }
   // How often the layer had to be put back or moved: a move between press and release
   // means the page changed under the pointer.
@@ -145,10 +201,33 @@
   }
 
   // ---------------------------------------------------------------- the keyboard focus
+  /*
+    The focus is taken ONCE, at the start, so the page's own controls are not focused
+    when the person starts. After that the page may keep or move the focus wherever it
+    likes in its own document or a same-site frame - every key there is swallowed at
+    window capture anyway - and the picker never fights it (focus traps would fight back
+    until the stack overflows). Only a focus inside a frame from another site matters,
+    because keys there never pass the picker: it is taken back out of the event, at most
+    3 times a second, and if it will not stay out the pick ends ("focus").
+  */
   function park() {
     if (document.activeElement === host) { return true; }
     try { hitLayer.focus({ preventScroll: true }); } catch (e) { /* not focusable now */ }
     return document.activeElement === host;
+  }
+  var takeBacks = [], takeBackTimer = 0;
+  function takeBackFocus() {
+    if (takeBackTimer || !focusInForeignFrame()) { return; }
+    var now = Date.now();
+    takeBacks = takeBacks.filter(function (t) { return now - t < 1000; });
+    if (takeBacks.length >= 3) { finish('error', 'focus', ''); return; }
+    takeBackTimer = setTimeout(function () {
+      takeBackTimer = 0;
+      if (state.phase !== 'picking' && state.phase !== 'picked') { return; }
+      if (!focusInForeignFrame()) { return; }
+      takeBacks.push(Date.now());
+      park();
+    }, 0);
   }
   function focusInForeignFrame() {
     var a = document.activeElement;
@@ -163,12 +242,49 @@
 
   // ---------------------------------------------------------------- geometry
   /*
+    Whether an element is drawn without scaling, mirroring or turning: no CSS rotate or
+    scale, and a transform that is at most a translation (which the bounding rect
+    already includes). Anything else would make a frame's inside map to other points.
+  */
+  function onlyMoved(el) {
+    var cs = el.ownerDocument.defaultView.getComputedStyle(el);
+    if ((cs.rotate && cs.rotate !== 'none') || (cs.scale && cs.scale !== 'none')) { return false; }
+    if (cs.zoom && cs.zoom !== '1' && cs.zoom !== 'normal') { return false; }
+    var t = cs.transform;
+    if (!t || t === 'none') { return true; }
+    var m = /^matrix\(([^)]*)\)$/.exec(t);
+    if (m) {
+      var v = m[1].split(',').map(parseFloat);
+      return v[0] === 1 && v[1] === 0 && v[2] === 0 && v[3] === 1;
+    }
+    var m3 = /^matrix3d\(([^)]*)\)$/.exec(t);
+    if (m3) {
+      var w = m3[1].split(',').map(parseFloat), id = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0];
+      for (var i = 0; i < 12; i++) { if (w[i] !== id[i]) { return false; } }
+      return w[15] === 1;
+    }
+    return false;
+  }
+  // The frame and every element around it, up through the frames to the top page, only moved.
+  function mappable(frame) {
+    for (var el = frame, depth = 0; el && depth < 200; depth++) {
+      if (!onlyMoved(el)) { return false; }
+      if (el.parentElement) { el = el.parentElement; continue; }
+      var w = el.ownerDocument.defaultView;
+      el = null;
+      try { el = w.frameElement; } catch (e) { el = null; }
+    }
+    return true;
+  }
+  /*
     Where a frame's content starts, in its parent's window: the frame's box plus its
-    border and padding. A frame shown scaled or turned (its box on screen differs from
-    its layout size) cannot be mapped exactly, so it gives null and is refused.
+    border and padding. A frame drawn scaled, mirrored or turned - itself or anything
+    around it - cannot be mapped exactly, so it gives null and is refused. (Points in
+    the documents themselves need no such care: elementsFromPoint is transform-aware.)
   */
   function frameOrigin(frame) {
     var r = frame.getBoundingClientRect();
+    if (!mappable(frame)) { return null; }
     if (Math.abs(r.width - frame.offsetWidth) > 1 || Math.abs(r.height - frame.offsetHeight) > 1) { return null; }
     var cs = frame.ownerDocument.defaultView.getComputedStyle(frame);
     return { x: r.left + (parseFloat(cs.borderLeftWidth) || 0) + (parseFloat(cs.paddingLeft) || 0),
@@ -431,7 +547,16 @@
     state.phase = phase; state.code = code || ''; state.message = message || '';
     draw();
   }
-  function setNote(code) { state.note = code; draw(); }
+  /*
+    A short note while picking goes on. "changed" more than twice in a row means the page
+    changes under every click: say instead that pointing does not work here.
+  */
+  var changedRun = 0;
+  function setNote(code) {
+    if (code === 'changed') { changedRun++; if (changedRun >= 3) { code = 'changed-again'; } }
+    state.note = code;
+    draw();
+  }
   // The person's choice: mark the element (the server's proof looks for this mark).
   function accept(info) {
     if (info.blocked === 'ours') { return; }
@@ -444,6 +569,7 @@
     }
     state.picked = info;
     state.saved = saveScroll(info);
+    changedRun = 0;
     finish('picked', '', '');
   }
   function onMove(win) {
@@ -477,6 +603,8 @@
         state.down = onLayer && ev.button === 0 && !fresh ? keyOf(resolveHit(hitTest(ev.clientX, ev.clientY))) : NONE;
         state.spoiled = onLayer && ev.button === 0 && fresh;
         state.downMoves = moves;
+        // A new press starts afresh: the last note no longer applies.
+        if (onLayer && state.note) { state.note = ''; draw(); }
         return;
       }
       if (ev.type === 'pointerup' && state.spoiled) { state.spoiled = false; setNote('changed'); return; }
@@ -499,6 +627,32 @@
       accept(info);
     };
   }
+  // The element with the keyboard focus can be typed in (so a key's default would change it).
+  function focusEditable() {
+    var doc = document, a = doc.activeElement;
+    for (var depth = 0; depth < 12 && a && /^i?frame$/i.test(a.tagName); depth++) {
+      var d = null;
+      try { d = a.contentDocument; } catch (e) { d = null; }
+      if (!d) { return false; }
+      doc = d; a = d.activeElement;
+    }
+    if (!a || a === host) { return false; }
+    return a.isContentEditable || /^(input|textarea|select)$/i.test(a.tagName);
+  }
+  /*
+    The browser's own shortcuts keep working (reload, find, zoom, back, the address bar,
+    function keys): their key events still never reach the page, but their default is
+    not prevented. In a field the page has focused, only shortcuts that cannot change
+    the field pass (no paste, cut, undo, select-all or deleting by word).
+  */
+  function browserShortcut(ev) {
+    var fn = /^F([1-9]|1[0-9]|2[0-4])$/.test(ev.key);
+    if (fn) { return true; }
+    if (!(ev.ctrlKey || ev.altKey || ev.metaKey)) { return false; }
+    if (!focusEditable()) { return true; }
+    if ((ev.ctrlKey || ev.metaKey) && /^(r|f|l|t|n|w|0|=|\+|-|Tab|PageUp|PageDown)$/i.test(ev.key)) { return true; }
+    return ev.altKey && !ev.ctrlKey && !ev.metaKey && /^(ArrowLeft|ArrowRight|Home)$/.test(ev.key);
+  }
   /*
     Keys never reach the page. Esc cancels; the scroll keys (arrows, Page Up/Down,
     Home/End, Space and Shift+Space) scroll what is under the pointer; every other key
@@ -506,10 +660,11 @@
     Designer instead.
   */
   function onKey(ev) {
+    if (browserShortcut(ev)) { ev.stopImmediatePropagation(); ev.stopPropagation(); return; }
     swallow(ev);
     if (!ev.isTrusted || ev.type !== 'keydown') { return; }
     if (ev.key === 'Escape') { if (state.phase === 'picking') { finish('cancelled', 'esc', ''); } return; }
-    if (state.phase !== 'picking') { return; }
+    if (state.phase !== 'picking' || ev.ctrlKey || ev.altKey || ev.metaKey) { return; }
     var step = 40, page = Math.max(40, window.innerHeight * 0.875), dx = 0, dy = 0;
     switch (ev.key) {
       case 'ArrowDown': dy = step; break;
@@ -525,10 +680,12 @@
     }
     scrollAt(pointer.x, pointer.y, dx, dy);
   }
-  function onFocusIn(ev) {
-    if (ev.target !== host && (state.phase === 'picking' || state.phase === 'picked')) { park(); }
+  // Never a focus change inside a focus event: only a focus gone into another site's frame is taken back, later.
+  function onFocusIn() {
+    if (state.phase === 'picking' || state.phase === 'picked') { takeBackFocus(); }
   }
-  function onTopLayerChange() { guard(); }
+  // The picker's own popover toggling must not start the guard again (it would loop).
+  function onTopLayerChange(ev) { if (ev.target !== host) { guard(); } }
   function listen(win) {
     if (windows.indexOf(win) >= 0) { return; }
     windows.push(win);
@@ -550,7 +707,7 @@
     The guard, run on every refresh, on DOM changes at the top of the page and when
     top-layer content opens or closes: the host must be connected, last in its parent
     (the topmost modal dialog or the page), on top, covering the whole window, and
-    holding the focus. A host the page removed is put back and the listeners are added
+    keeping the focus out of other sites' frames. A host the page removed is put back and the listeners are added
     again (document.open() drops every listener). What cannot be restored ends the pick
     rather than going on unprotected.
   */
@@ -575,7 +732,7 @@
       if (!document.fullscreenElement && !onTopEverywhere()) { showOnTop(true); }
       if (!coversWindow()) { placeHost(); }
       if (!host.isConnected || !coversWindow()) { finish('error', 'coverage', ''); return; }
-      if (!park() && focusInForeignFrame()) { finish('error', 'focus', ''); }
+      if (focusInForeignFrame()) { takeBackFocus(); }
     }
     finally { guarding = false; }
   }
@@ -699,14 +856,12 @@
     var p = state.picked;
     var target = p ? (mode === 'scroll' ? (p.scroll && p.scroll.node) : p.el) : null;
     if (target) { try { delete target[MARK]; } catch (e) { /* gone */ } }
-    var hadFocus = document.activeElement === host;
+    if (takeBackTimer) { clearTimeout(takeBackTimer); takeBackTimer = 0; }
     try { if (canPopover && host.matches(':popover-open')) { host.hidePopover(); } } catch (e) { /* not shown */ }
+    // The focus is NOT given back to what the page had focused: focusing fires the page's
+    // focus handlers, which can open focus-driven widgets (date pickers, menus). It falls
+    // to the page body as the layer goes; the person clicks where they want to work.
     if (host.parentNode) { host.parentNode.removeChild(host); }
-    // Focus goes back where it was; focusing activates nothing. Not into a frame.
-    if (hadFocus && previousFocus && previousFocus.isConnected && previousFocus !== document.body &&
-      !/^i?frame$/i.test(previousFocus.tagName) && typeof previousFocus.focus === 'function') {
-      try { previousFocus.focus({ preventScroll: true }); } catch (e) { /* not focusable any more */ }
-    }
     if (window[NS] === api) { try { delete window[NS]; } catch (e) { window[NS] = undefined; } }
     return true;
   }

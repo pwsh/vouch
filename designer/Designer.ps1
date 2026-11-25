@@ -138,6 +138,8 @@ function New-DesignerPickState {
         Message   = ''
         Code      = ''
         Notice    = ''
+        # The picker's current note (Get-DesignerPickNote words), '' when it has none.
+        PageNote  = ''
         Reinjects = 0
         Failures  = 0
         StartedAt = [datetime]::MinValue
@@ -2798,6 +2800,7 @@ function Get-DesignerPickerText {
         transformed = 'This frame is shown scaled or turned, so Vouch cannot tell exactly what you point at in it.'
         shadow      = 'This is inside a page component (shadow DOM) that Vouch cannot look into.'
         changed     = (Get-DesignerPickNote -Code 'changed')
+        'changed-again' = (Get-DesignerPickNote -Code 'changed-again')
         uncovered   = (Get-DesignerPickNote -Code 'uncovered')
         'uncovered-dialog'     = (Get-DesignerPickNote -Code 'uncovered-dialog')
         'uncovered-popup'      = (Get-DesignerPickNote -Code 'uncovered-popup')
@@ -2820,6 +2823,7 @@ function Get-DesignerPickNote {
     $type = 'Type its words or selector in the Designer instead.'
     switch -CaseSensitive ($Code) {
         'changed' { return 'The page changed under the pointer between press and release, so nothing was picked. Click again.' }
+        'changed-again' { return "The page keeps changing under the pointer, so pointing does not work here. $type" }
         'uncovered' { return "That part of the page is shown above Vouch's picking layer, so it cannot be picked by pointing. $type" }
         'uncovered-dialog' { return "That is in a pop-up dialog the page shows above everything else, so it cannot be picked by pointing. $type" }
         'uncovered-popup' { return "That is in a pop-up the page shows above everything else, so it cannot be picked by pointing. $type" }
@@ -3244,8 +3248,8 @@ function Update-ElementPick {
         'picking' {
             # A short note while picking goes on (the page changed, or the click landed on
             # something above the picking layer): known codes only, words from here.
-            $note = Get-DesignerPickNote -Code ([string](Get-DesignerValue -Object $status -Name 'note'))
-            if ($note) { $pick.Notice = $note }
+            # It follows the page: when the picker's note clears, so does this one.
+            $pick.PageNote = Get-DesignerPickNote -Code ([string](Get-DesignerValue -Object $status -Name 'note'))
             return
         }
         'picked' { Complete-ElementPick -State $State }
@@ -3280,7 +3284,7 @@ function Get-ElementPickResult {
     $pick = $State.Pick
     $data = [ordered]@{ state = $pick.State; mode = $pick.Mode }
     switch ($pick.State) {
-        'picking' { $data['message'] = 'Waiting for you to click in the browser… (Esc there cancels.)'; $data['notice'] = $pick.Notice }
+        'picking' { $data['message'] = 'Waiting for you to click in the browser… (Esc there cancels.)'; $data['notice'] = $(if ($pick.PageNote) { $pick.PageNote } else { $pick.Notice }) }
         'done' { $data['result'] = $pick.Result }
         'cancelled' { $data['message'] = $pick.Message; $data['code'] = $pick.Code }
         'error' { $data['message'] = $pick.Message; $data['code'] = $pick.Code }

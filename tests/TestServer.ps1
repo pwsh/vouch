@@ -192,6 +192,9 @@ iframe{width:260px;height:110px;border:1px solid #888} #spacer{height:2500px;bac
 <div><div class="panel" id="leftpanel">$rows</div> <div class="panel" id="rightpanel">$rows</div> <div id="clipbox"><div style="height:400px">Clipped content</div></div> <div id="hscroll" style="width:200px;overflow-x:auto;display:inline-block;vertical-align:top"><div style="width:1200px;height:60px">Wide content</div></div></div>
 <dialog id="dlg"><p>A dialog</p><button id="dlgbtn" onclick="hit('dialog')">Dialog action</button></dialog>
 <div popover="manual" id="pop"><button id="popbtn" onclick="hit('popover')">Popover action</button></div>
+<div popover id="autopop"><button id="autobtn" onclick="hit('auto')">Menu item</button></div>
+<dialog id="dlg2"><p>A second dialog</p><button id="dlg2btn" onclick="hit('dialog2')">Second dialog action</button></dialog>
+<div id="trapbox" hidden style="position:fixed;left:400px;top:120px;width:260px;padding:12px;background:#eef;border:2px solid #446;z-index:10"><button id="trapfirst" onclick="hit('trap1')">Trap first</button> <button id="trapsecond" onclick="hit('trap2')">Trap second</button></div>
 <form id="lonely" action="/ok" onsubmit="window.__submits++; document.title = 'SUBMITTED'; return false;"><input id="q" name="q" value="find"></form>
 <div id="spacer">The rest of a tall page</div>
 <script>
@@ -217,6 +220,29 @@ if (q.get('transform') === '1') { document.documentElement.style.transform = 'tr
 // A page that opens a modal dialog at the press, or rebuilds what is under the pointer
 // between press and release - both from capture listeners on window, before any picker.
 if (q.get('openOnDown') === '1') { window.addEventListener('pointerdown', function () { var d = document.getElementById('dlg'); if (!d.open) { d.showModal(); } }, true); }
+// A native menu (popover="auto": light-dismissed by a press outside it).
+window.__toggles = [];
+document.getElementById('autopop').addEventListener('toggle', function (e) { window.__toggles.push(e.newState); });
+if (q.get('autopop') === '1') { document.getElementById('autopop').showPopover(); }
+// A div-based modal with a synchronous focus trap (as focus-trap libraries do), focused at load.
+window.__trapEvents = 0;
+if (q.get('trap') === '1') {
+  var trap = document.getElementById('trapbox'); trap.hidden = false;
+  trap.addEventListener('focusin', function () { window.__trapEvents++; });
+  trap.addEventListener('focusout', function (e) { window.__trapEvents++; if (!trap.contains(e.relatedTarget)) { document.getElementById('trapfirst').focus(); } });
+  document.getElementById('trapfirst').focus();
+}
+// A field with blur and change handlers.
+window.__blurs = 0; window.__changes = 0;
+document.getElementById('q').addEventListener('blur', function () { window.__blurs++; });
+document.getElementById('q').addEventListener('change', function () { window.__changes++; });
+// Two modal dialogs where the one earlier in the page is opened last (so it is on top).
+if (q.get('nested') === '1') { document.getElementById('dlg2').showModal(); document.getElementById('dlg').showModal(); }
+// A page whose observer throws out anything added to <html> (it fights the picking layer).
+if (q.get('fight') === '1') {
+  new MutationObserver(function (list) { list.forEach(function (m) { m.addedNodes.forEach(function (n) { if (n.nodeType === 1 && n.tagName !== 'BODY' && n.tagName !== 'HEAD' && n.parentNode === document.documentElement) { n.remove(); } }); }); })
+    .observe(document.documentElement, { childList: true });
+}
 if (q.get('swapOnUp') === '1') { window.addEventListener('pointerup', function () { var a = document.getElementById('reports-a'); if (a) { var s = document.createElement('span'); s.id = 'swapped'; s.textContent = 'Swapped'; a.replaceWith(s); } }, true); }
 var shadowRoot = document.getElementById('shadowhost').attachShadow({ mode: 'open' });
 var shadowButton = document.createElement('button'); shadowButton.id = 'shadowbtn'; shadowButton.textContent = 'Shadow button';
@@ -233,10 +259,20 @@ shadowButton.onclick = function () { hit('shadow'); }; shadowRoot.appendChild(sh
                 Send-Response $context 200 (Page 'Pick frame' $body)
             }
             '^/framegeom$' {
-                # A frame with a thick border and padding, and one shown scaled.
-                $body = "<iframe id='padframe' src='/pickframe' style='width:300px;height:150px;border:6px solid #888;padding:24px'></iframe>" +
-                    "<iframe id='scaledframe' src='/pickframe' style='width:300px;height:150px;border:0;transform:scale(0.8);transform-origin:0 0'></iframe>"
-                Send-Response $context 200 (Page 'Frame geometry' $body)
+                # One frame (?kind=): thick border and padding; or shown scaled, mirrored,
+                # turned (180, or 90 on a square), inside a turned box, or only moved.
+                $style = switch ([string]$query['kind']) {
+                    'scaled' { 'width:300px;height:150px;transform:scale(0.8);transform-origin:0 0' }
+                    'mirror' { 'width:300px;height:150px;transform:scaleX(-1)' }
+                    'rot180' { 'width:300px;height:150px;transform:rotate(180deg)' }
+                    'rot90' { 'width:200px;height:200px;transform:rotate(90deg)' }
+                    'ancestor' { 'width:300px;height:150px' }
+                    'translate' { 'width:300px;height:150px;transform:translate(40px,30px)' }
+                    default { 'width:300px;height:150px;border:6px solid #888;padding:24px' }
+                }
+                $frame = "<iframe id='geomframe' src='/pickframe' style='$style'></iframe>"
+                if ([string]$query['kind'] -eq 'ancestor') { $frame = "<div id='turned' style='display:inline-block;transform:rotate(180deg)'>$frame</div>" }
+                Send-Response $context 200 (Page 'Frame geometry' "<div style='margin:20px'>$frame</div>")
             }
             '^/slow$' {
                 $seconds = if ($query['s']) { [int]$query['s'] } else { 10 }

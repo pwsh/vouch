@@ -1589,7 +1589,8 @@
         await new Promise(r => setTimeout(r, 400));
         state = await api('GET', '/api/pick');
         if (state.state !== 'picking') break;
-        if (state.notice) { $('#picking-notice').textContent = state.notice; $('#picking-notice').hidden = false; }
+        $('#picking-notice').textContent = state.notice || '';
+        $('#picking-notice').hidden = !state.notice;
       }
       release(); release = null;
       started = false;
