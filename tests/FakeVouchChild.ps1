@@ -19,7 +19,11 @@ $all = [Environment]::GetCommandLineArgs()
 $self = [Array]::FindIndex($all, [Predicate[string]] { param($a) [string]::Equals([System.IO.Path]::GetFullPath($a), $PSCommandPath, [StringComparison]::OrdinalIgnoreCase) -and $a.EndsWith('.ps1') })
 $arguments = @($all | Select-Object -Skip ($self + 1))
 function Get-FakeArgument([string]$Name) {
-    for ($i = 0; $i -lt $arguments.Count - 1; $i++) { if ($arguments[$i] -eq $Name) { return $arguments[$i + 1] } }
+    # "-Name value" or "-Name:value" (the Designer passes free-text values in the second form).
+    for ($i = 0; $i -lt $arguments.Count; $i++) {
+        if ($arguments[$i] -eq $Name -and $i -lt $arguments.Count - 1) { return $arguments[$i + 1] }
+        if ($arguments[$i].StartsWith("${Name}:", [StringComparison]::OrdinalIgnoreCase)) { return $arguments[$i].Substring($Name.Length + 1) }
+    }
     return ''
 }
 $configPath = Get-FakeArgument '-ConfigPath'

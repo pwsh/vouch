@@ -3470,7 +3470,7 @@ Describe 'Runs from the panel: routes, plan and rules (no browser, no child)' {
         ($r.Data.sessionFlags -join ' ') | Should -Match '-DebugPort 9555'
         $page = Invoke-TestRoute POST '/api/run/plan' ([ordered]@{ config = (New-RunConfig); kind = 'page'; pageId = 'p002' }) -State $script:R
         $page.Data.pageName | Should -Be 'Two'
-        ($page.Data.sessionFlags -join ' ') | Should -Match '-Only p002'
+        ($page.Data.sessionFlags -join ' ') | Should -Match '-Only:p002'
         ($page.Data.sessionFlags -join ' ') | Should -Match '-Zip:\$false'
         ($page.Data.sessionFlags -join ' ') | Should -Match '-OpenReport:\$false'
         ($page.Data.notes -join ' ') | Should -Match 'temporary preview folder'
@@ -3514,7 +3514,7 @@ Describe 'Runs from the panel: routes, plan and rules (no browser, no child)' {
         $flags = Get-DesignerRunSessionFlag -State $script:R -Plan $plan -EventPath 'e' -PreviewFolder 'p' -TabId 'T'
         $arguments = @($flags | ForEach-Object { $_.Arguments })
         ($arguments -contains '-UseVirtualDesktop:$false') | Should -Be $Flag
-        ($arguments -contains '-TabId') | Should -Be ($Expect -ne 'used')
+        (@($arguments | Where-Object { $_ -like '-TabId:*' }).Count -gt 0) | Should -Be ($Expect -ne 'used')
         $script:R.Browser.LaunchedByDesigner = $false; $script:R.Browser.LaunchedPid = 0
     }
 
@@ -3583,7 +3583,9 @@ Describe 'Runs from the panel: routes, plan and rules (no browser, no child)' {
         $run.Pages['id:p1'].name | Should -Be "Ä & 'b'"
         # A line over the limit, read in small pieces, is dropped as a whole; the next one counts.
         & $append (('{"type":"detail","text":"' + ('y' * 300) + '"}') + "`n" + '{"type":"pageEnd","pageId":"p1","status":"OK","details":[],"captureCount":0}' + "`n")
-        Read-DesignerRunEvent -State $state -Run $run -MaxBytes 64 -MaxLineBytes 100 | Should -Be 1
+        $added = 0
+        for ($turn = 0; $turn -lt 20; $turn++) { $added += Read-DesignerRunEvent -State $state -Run $run -MaxBytes 64 -MaxLineBytes 100 }
+        $added | Should -Be 1
         $run.Skipped | Should -Be 3
         $run.Pages['id:p1'].status | Should -Be 'OK'
         $state.PageResults['p1'].status | Should -Be 'OK'
@@ -3693,7 +3695,7 @@ Describe 'Runs with a stand-in child process (the run state machine)' -Tag 'Inte
         $data = Wait-TestRun $state
         $data.state | Should -Be 'done'
         $command = Get-VouchCommandLine -Config (New-RunTestConfig 'normal') -ConfigPath $run.ConfigTempPath -ScriptPath $script:FakeChildPath
-        $flags = @('-EventLogPath', $run.EventPath, '-TabId', 'TAB-1', '-DebugPort', '9555', '-EdgeProfileDir', $state.Browser.ProfileDir)
+        $flags = @("-EventLogPath:$($run.EventPath)", '-TabId:TAB-1', '-DebugPort:9555', "-EdgeProfileDir:$($state.Browser.ProfileDir)")
         $run.Arguments | Should -Be (@($command.RunArguments) + $flags)
         $received = @(Get-Content -Raw -LiteralPath "$($run.EventPath).args.json" | ConvertFrom-Json)
         $received | Should -Be (@($command.RunArguments | Select-Object -Skip 5) + $flags)
@@ -3764,6 +3766,11 @@ Describe 'Runs with a stand-in child process (the run state machine)' -Tag 'Inte
         $r.Status | Should -Be 200
         $r.Data.state | Should -Be 'failed'
         $r.Data.message | Should -Match 'force-stopped the run. Its report may be missing'
+        $r.Data.nextStep | Should -Match 'Run it again'
+        # The page that was going is not shown as captured.
+        $r.Data.pages[0].status | Should -Be 'NOTFINISHED'
+        $r.Data.pages[0].details | Should -Contain 'The run ended before this page finished.'
+        $state.PageResults['p001'].status | Should -Be 'NOTFINISHED'
         Get-Process -Id $childId -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
         $run.StopPath | Should -Not -Exist
     }
@@ -3779,7 +3786,148 @@ Describe 'Runs with a stand-in child process (the run state machine)' -Tag 'Inte
         $data.state | Should -Be 'failed'
         $data.message | Should -Match $Words
         $data.errorText | Should -Not -BeNullOrEmpty
+        $data.nextStep | Should -Match 'copy the command below into a PowerShell window'
         $state.OpenTargets.Contains('report') | Should -BeFalse
+        foreach ($page in @($data.pages)) { $page.status | Should -Be 'NOTFINISHED' }
+        if ($Scenario -eq 'die') { $data.pages[0].name | Should -Be 'Doomed'; $data.pageResults['p001'].status | Should -Be 'NOTFINISHED' }
+    }
+
+    It 'reads non-ASCII text from a run that fails before it can say why (the child''s console code page)' {
+        $state = New-RunTestState 'Sitzung Ärger é'
+        $folder = Join-Path $TestDrive 'Prüfung Ärger'
+        [void](New-Item -ItemType Directory -Path $folder -Force)
+        # A script whose -ConfigPath is a number: pwsh itself refuses the path, naming it.
+        $script = Join-Path $folder 'refuses.ps1'
+        [System.IO.File]::WriteAllText($script, "param([int]`$ConfigPath, [Parameter(ValueFromRemainingArguments)]`$Rest)`n'never'`n", [System.Text.UTF8Encoding]::new($false))
+        $state.RunScriptPath = $script
+        $script:Started.Add((Start-TestRun $state 'normal'))
+        $data = Wait-TestRun $state
+        $data.state | Should -Be 'failed'
+        $data.message | Should -Match '^The run could not start: '
+        $data.errorText | Should -Match ([regex]::Escape('Sitzung Ärger é'))
+    }
+
+    It 'always ends a run and hands the browser back, even when handling its end fails' {
+        $state = New-RunTestState 'complete-fails'
+        $state.Browser.Connected = $true
+        $state.Browser.TabId = 'TAB-1'
+        Mock Register-DesignerPreview { throw 'The preview could not be registered.' }
+        Mock Connect-DesignerBrowser { $State.Browser.Connected = $true; $State.Browser.TabId = 'TAB-1' }
+        Mock Set-DesignerLayout { [pscustomobject]@{ Ok = $true; Message = '' } }
+        Mock Clear-PageZoom { }
+        $run = Start-TestRun $state 'normal' -Kind page -PageId 'p001'
+        $script:Started.Add($run)
+        $data = Wait-TestRun $state
+        Test-DesignerRunActive -State $state | Should -BeFalse
+        $data.state | Should -Be 'done'
+        ($data.notes -join ' ') | Should -Match 'could not finish reading'
+        Should -Invoke Connect-DesignerBrowser -Times 1 -Exactly
+        $state.Browser.Connected | Should -BeTrue
+        $run.ConfigTempPath | Should -Not -Exist
+        # And when the outcome itself fails, the run is failed, never "running".
+        Mock Get-DesignerRunOutcome { throw 'broken' }
+        $run = Start-TestRun $state 'normal'
+        $script:Started.Add($run)
+        $data = Wait-TestRun $state
+        $data.state | Should -Be 'failed'
+        $data.message | Should -Match 'could not read its result'
+        Should -Invoke Connect-DesignerBrowser -Times 2 -Exactly
+    }
+
+    It 'keeps the older preview of a page when the new test cannot start' {
+        $state = New-RunTestState 'keep-preview'
+        $run = Start-TestRun $state 'normal' -Kind page -PageId 'p001'
+        $script:Started.Add($run)
+        [void](Wait-TestRun $state)
+        $old = @($state.Previews.Keys)
+        $old.Count | Should -Be 1
+        $oldFolder = $state.Previews[$old[0]].Folder
+        Mock Start-DesignerChildProcess { throw 'Windows refused to start it.' }
+        { Start-TestRun $state 'normal' -Kind page -PageId 'p001' } | Should -Throw '*could not be started*'
+        @($state.Previews.Keys) | Should -Be $old
+        $oldFolder | Should -Exist
+        @(Get-ChildItem -LiteralPath $state.SessionFolder -Directory -Filter 'preview-p001-*').Count | Should -Be 1
+        $state.Run.State | Should -Be 'failed'
+    }
+
+    It 'reads one chunk of the event file per loop turn, the rest at the next turns' {
+        $run = New-DesignerRunState
+        $run.EventPath = Join-Path $TestDrive 'big.ndjson'
+        $state = New-TestState
+        $line = '{"type":"detail","pageId":"p1","status":"OK","text":"' + ('z' * 1000) + '"}' + "`n"
+        [System.IO.File]::WriteAllText($run.EventPath, ($line * 3200), [System.Text.UTF8Encoding]::new($false))
+        $length = (Get-Item -LiteralPath $run.EventPath).Length
+        $first = Read-DesignerRunEvent -State $state -Run $run
+        $run.Offset | Should -Be 1MB
+        $first | Should -BeLessThan 3200
+        $turns = 1
+        while ($run.Offset -lt $length) { [void](Read-DesignerRunEvent -State $state -Run $run); $turns++ }
+        $turns | Should -Be ([Math]::Ceiling($length / 1MB))
+        $run.Events.Count | Should -Be 3200
+    }
+
+    It 'gives the next step for each kind of failure, and test wording for a page test' {
+        $make = {
+            param($Kind, $Code, $RunEnd, $Forced, $Pages)
+            $run = New-DesignerRunState
+            $run.Kind = $Kind; $run.ExitCode = $Code; $run.Forced = $Forced
+            if ($RunEnd) { $run.RunEnd = [ordered]@{ type = 'runEnd' }; $run.Counts = [ordered]@{ pages = 1; run = 1; ok = 1; warning = 0; failed = 0; notRun = 0; captures = 1 } }
+            if ($Pages) { $run.Pages['id:p1'] = [ordered]@{} }
+            return $run
+        }
+        Get-DesignerRunNextStep -Run (& $make 'full' 1 $false $false $false) | Should -Match '^Fix what the message names, then try again\. To see everything'
+        Get-DesignerRunNextStep -Run (& $make 'full' 7 $false $false $true) | Should -Match '^Try again\. If it happens again'
+        Get-DesignerRunNextStep -Run (& $make 'full' -1 $false $true $true) | Should -Match '^Run it again'
+        Get-DesignerRunNextStep -Run (& $make 'full' 2 $true $false $true) | Should -Match 'Open the report to see what went wrong'
+        Get-DesignerRunNextStep -Run (& $make 'full' 3 $true $false $true) | Should -Match 'Fail on warnings'
+        Get-DesignerRunNextStep -Run (& $make 'full' 0 $true $false $true) | Should -Be ''
+        Get-DesignerRunOutcome -Run (& $make 'page' 0 $true $false $true) -ProcessExitCode 0 | Should -Be 'Test finished: this page was captured without problems.'
+        Get-DesignerRunOutcome -Run (& $make 'page' 2 $true $false $true) -ProcessExitCode 2 | Should -Match '^Test finished, but the page failed'
+        Get-DesignerRunOutcome -Run (& $make 'page' 1 $false $false $false) -ProcessExitCode 1 | Should -Match '^The test could not start'
+        Get-DesignerRunOutcome -Run (& $make 'page' 0 $false $true $true) -ProcessExitCode 0 | Should -Match '^You force-stopped the test'
+    }
+
+    It 'removes the folders of Designers that are gone, and nothing else' {
+        $temp = Join-Path $TestDrive 'temp-sweep'
+        [void](New-Item -ItemType Directory -Path $temp -Force)
+        $marker = Get-DesignerSessionMarkerName
+        $new = {
+            param($Name, $MarkerPid, $Started)
+            $folder = Join-Path $temp $Name
+            [void](New-Item -ItemType Directory -Path $folder -Force)
+            [System.IO.File]::WriteAllText((Join-Path $folder 'run-001-aaaaaaaa.json'), '{}')
+            if ($null -ne $MarkerPid) { [System.IO.File]::WriteAllText((Join-Path $folder $marker), (@{ pid = $MarkerPid; started = $Started } | ConvertTo-Json -Compress)) }
+            return $folder
+        }
+        # A process that has ended (its id is free) and one that is alive.
+        $ended = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile', '-Command', 'exit' -WindowStyle Hidden -PassThru
+        $ended.WaitForExit()
+        $alive = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile', '-Command', 'Start-Sleep 60' -WindowStyle Hidden -PassThru
+        try {
+            $aliveTicks = $alive.StartTime.ToUniversalTime().Ticks
+            $gone = & $new "VouchDesigner-$($ended.Id)-0a1b2c3d" $ended.Id 12345
+            $reused = & $new "VouchDesigner-$($alive.Id)-11111111" $alive.Id ($aliveTicks - 10000000)
+            $living = & $new "VouchDesigner-$($alive.Id)-22222222" $alive.Id $aliveTicks
+            $noMarker = & $new "VouchDesigner-$($ended.Id)-33333333" $null 0
+            $otherName = & $new "VouchDesigner-$($ended.Id)-zzzz" $ended.Id 12345
+            $otherPid = & $new "VouchDesigner-$($ended.Id)-44444444" ($ended.Id + 1) 12345
+            $removed = Clear-DesignerStaleSession -TempFolder $temp
+            @($removed | Sort-Object) | Should -Be @(@($gone, $reused) | Sort-Object)
+            $gone | Should -Not -Exist
+            $reused | Should -Not -Exist
+            foreach ($kept in $living, $noMarker, $otherName, $otherPid) { $kept | Should -Exist }
+        }
+        finally { Stop-Process -Id $alive.Id -Force -ErrorAction SilentlyContinue }
+        # A session folder carries the marker naming this process.
+        $state = New-TestState
+        $state.SessionFolder = Join-Path $temp "VouchDesigner-$PID-55555555"
+        $folder = Get-DesignerSessionFolder -State $state
+        $own = Get-Content -Raw -LiteralPath (Join-Path $folder $marker) | ConvertFrom-Json
+        $own.pid | Should -Be $PID
+        $own.started | Should -Be (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks
+        # Its own folder is never touched (the living one's owner has ended by now, so it goes).
+        (Clear-DesignerStaleSession -TempFolder $temp) | Should -Not -Contain $folder
+        $folder | Should -Exist
     }
 
     It 'skips garbage, waits for a line written in two parts, and drops an unfinished last line' {
@@ -3819,7 +3967,7 @@ Describe 'Runs with a stand-in child process (the run state machine)' -Tag 'Inte
         $script:Started.Add($run)
         Should -Invoke Stop-EdgeProcess -Times 1 -Exactly
         $state.Browser.LaunchedByDesigner | Should -BeFalse
-        $run.Arguments | Should -Not -Contain '-TabId'
+        @($run.Arguments | Where-Object { $_ -like '-TabId*' }).Count | Should -Be 0
         $run.Arguments | Should -Not -Contain '-UseVirtualDesktop:$false'
         $data = Wait-TestRun $state
         $data.state | Should -Be 'done'
@@ -3833,7 +3981,7 @@ Describe 'Runs with a stand-in child process (the run state machine)' -Tag 'Inte
         $script:Started.Add($run)
         Should -Invoke Stop-EdgeProcess -Times 1 -Exactly
         $run.Arguments | Should -Contain '-UseVirtualDesktop:$false'
-        $run.Arguments | Should -Contain '-TabId'
+        $run.Arguments | Should -Contain "-TabId:$($state.Browser.TabId)"
         $data = Wait-TestRun $state
         $data.virtualDesktop | Should -Be 'skipped'
         ($data.notes -join ' ') | Should -Match 'does not use a separate virtual desktop'
@@ -4082,6 +4230,19 @@ Describe 'A real run from the Designer (vouch.ps1 as a child, headless Edge, pag
         $data.message | Should -Match '^Stopped by you'
         $script:S.Browser.Connected | Should -BeTrue
     }
+
+    It 'tests pages whose id looks like a switch or has spaces and a colon (<_>)' -ForEach @('-Zip', '-OutputDir', '-home', 'p 1: x') {
+        $config = Copy-VouchConfig -Config $script:Shown.Config
+        $config['pages'].Add([ordered]@{ id = $_; name = "Odd id $_"; url = "$($script:RealBase)/ok"; enabled = $false })
+        $r = Invoke-TestRoute POST '/api/run' ([ordered]@{ config = $config; path = $script:RealKnown; kind = 'page'; pageId = $_ }) -State $script:S
+        $r.Status | Should -Be 200
+        $script:S.Run.Arguments | Should -Contain "-Only:$_"
+        $data = Wait-RealRun
+        $data.state | Should -Be 'done' -Because "$($data.message) $($data.errorText)"
+        $data.pages[0].pageId | Should -Be $_
+        $data.message | Should -Be 'Test finished: this page was captured without problems.'
+        $data.preview.images.Count | Should -Be 1
+    }
 }
 
 Describe 'Running and testing from the panel (two headless Edges, real server)' -Tag 'Integration' {
@@ -4269,6 +4430,8 @@ await until(() => S.run.state === 'done' || S.run.state === 'failed', 90000);
 await until(() => document.querySelectorAll('.thumb-img').length > 0, 15000);
 const imgs = Array.from(document.querySelectorAll('.thumb-img')).map(i => ({ src: i.getAttribute('src').slice(0, 23), ok: i.complete && i.naturalWidth > 0 }));
 const heading = document.querySelector('.preview-block h3').textContent;
+const note = document.querySelector('.preview-block .preview-note').textContent;
+const outcome = document.querySelector('#panel-run .run-message').textContent;
 document.querySelector('.thumb').click();
 await until(() => document.querySelector('#modal').open, 3000);
 const large = document.querySelector('#modal-body img.preview-large');
@@ -4278,10 +4441,12 @@ btnByKey('open-preview').click(); await new Promise(r => setTimeout(r, 300));
 D.setTab('pages');
 const chip = document.querySelectorAll('.page-row .chip')[1].textContent;
 D.setTab('run');
-return { state: S.run.state, imgs, heading, largeOk, chip, count: S.run.preview.images.length, segments: S.run.preview.images.map(i => i.segmentCount) };
+return { state: S.run.state, imgs, heading, note, outcome, largeOk, chip, count: S.run.preview.images.length, segments: S.run.preview.images.map(i => i.segmentCount) };
 '@
         $r.state | Should -Be 'done'
         $r.heading | Should -Be 'Preview of the page test: Tall page'
+        $r.note | Should -Be 'This is a test, not evidence. Use Run all pages to make the report.'
+        $r.outcome | Should -Match '^Test finished: this page was captured'
         @($r.imgs).Count | Should -Be $r.count
         @($r.imgs).Count | Should -BeGreaterThan 1
         foreach ($img in $r.imgs) { $img.src | Should -Be 'data:image/jpeg;base64,'; $img.ok | Should -BeTrue }
@@ -4325,7 +4490,11 @@ S.config.name = 'fake:die';
 btnByKey('run-all').click();
 await until(() => S.run.state === 'failed', 30000);
 const callout = document.querySelector('#panel-run .callout-error');
-return { live: !!firstDone, liveStatus, state: S.run.state, failed: callout ? callout.textContent : '', errs: window.__errs };
+const rows = Array.from(document.querySelectorAll('.run-page')).map(li => li.querySelector('.chip').textContent);
+D.setTab('pages');
+const pageChip = document.querySelectorAll('.page-row .chip')[0].textContent;
+D.setTab('run');
+return { live: !!firstDone, liveStatus, state: S.run.state, failed: callout ? callout.textContent : '', rows, pageChip, errs: window.__errs };
 '@
         $r.live | Should -BeTrue
         $r.liveStatus | Should -Match 'Running…'
@@ -4333,6 +4502,9 @@ return { live: !!firstDone, liveStatus, state: S.run.state, failed: callout ? ca
         $r.state | Should -Be 'failed'
         $r.failed | Should -Match 'ended unexpectedly \(exit code 7\)'
         $r.failed | Should -Match 'Something broke badly inside the run'
+        $r.failed | Should -Match 'What to do: Try again'
+        $r.rows | Should -Be @('Not finished')
+        $r.pageChip | Should -Match '^Run: not finished \d\d:\d\d$'
     }
 
     It 'had no CSP violation, error or rejection in the whole session' {

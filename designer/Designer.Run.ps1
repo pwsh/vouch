@@ -63,6 +63,8 @@ function New-DesignerRunState {
         LogPath          = ''
         OutputFolder     = ''
         Message          = ''
+        # What to do next after a run that did not simply succeed (Get-DesignerRunNextStep).
+        NextStep         = ''
         Output           = ''
         Forced           = $false
         Unsaved          = $false
@@ -107,8 +109,61 @@ function Get-DesignerSessionFolder {
         [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
         $State.SessionFolder = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ("VouchDesigner-$PID-" + [Convert]::ToHexString($bytes).ToLowerInvariant())
     }
-    if (-not [System.IO.Directory]::Exists($State.SessionFolder)) { [void][System.IO.Directory]::CreateDirectory($State.SessionFolder) }
+    if (-not [System.IO.Directory]::Exists($State.SessionFolder)) {
+        [void][System.IO.Directory]::CreateDirectory($State.SessionFolder)
+        # Who owns the folder: a later Designer removes it only when this process is gone
+        # (Clear-DesignerStaleSession); the start time tells a reused process id apart.
+        $self = Get-Process -Id $PID
+        $marker = [ordered]@{ pid = $PID; started = $self.StartTime.ToUniversalTime().Ticks } | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText((Join-Path -Path $State.SessionFolder -ChildPath (Get-DesignerSessionMarkerName)), $marker, [System.Text.UTF8Encoding]::new($false))
+    }
     return $State.SessionFolder
+}
+
+function Get-DesignerSessionMarkerName {
+    # The file that marks a folder as a Designer session folder and names its owner.
+    return 'vouch-designer-session.json'
+}
+
+function Clear-DesignerStaleSession {
+    <#
+        At Designer start: removes the session folders of Designers that ended without
+        cleaning up (killed, or their console closed). Only folders named
+        VouchDesigner-<pid>-<8 hex> that hold the marker file with that same pid, and only
+        when that process is gone - or the process now using the pid started at another
+        time (a reused id). A folder whose owner is alive, or cannot be checked, or that
+        looks any different, is never touched. Returns the folders removed.
+    #>
+    param([string]$TempFolder = [System.IO.Path]::GetTempPath())
+    $removed = [System.Collections.Generic.List[string]]::new()
+    $folders = @()
+    try { $folders = @([System.IO.Directory]::GetDirectories($TempFolder, 'VouchDesigner-*')) } catch { return , $removed }
+    foreach ($folder in $folders) {
+        $name = [System.IO.Path]::GetFileName($folder)
+        $match = [regex]::Match($name, '^VouchDesigner-(\d{1,10})-[0-9a-f]{8}$')
+        if (-not $match.Success) { continue }
+        $owner = [long]$match.Groups[1].Value
+        if ($owner -eq $PID) { continue }
+        $markerPath = Join-Path -Path $folder -ChildPath (Get-DesignerSessionMarkerName)
+        if (-not [System.IO.File]::Exists($markerPath)) { continue }
+        try {
+            $marker = [System.IO.File]::ReadAllText($markerPath) | ConvertFrom-Json -ErrorAction Stop
+            if ([long]$marker.pid -ne $owner) { continue }
+            $started = [long]$marker.started
+        }
+        catch { continue }
+        $gone = $false
+        $process = Get-Process -Id $owner -ErrorAction SilentlyContinue
+        if ($null -eq $process) { $gone = $true }
+        else {
+            try { $gone = $process.StartTime.ToUniversalTime().Ticks -ne $started }
+            catch { continue }
+        }
+        if (-not $gone) { continue }
+        try { [System.IO.Directory]::Delete($folder, $true); $removed.Add($folder) }
+        catch { Write-Verbose "An old Designer folder could not be removed: $folder" }
+    }
+    return , $removed
 }
 
 function Remove-DesignerSessionFolder {
@@ -299,23 +354,28 @@ function Get-DesignerRunSessionFlag {
           Designer is linked to (its port and profile may have been typed with -Designer).
         - Page test: -Only the page, its own preview folder, image files kept for the
           preview, no zip, no opening of the report, no transcript, no virtual desktop.
+        A value that comes from the person or the system (a page id, a folder, a tab id)
+        is passed in the same argument as its switch (-Only:<id>): a separate value that
+        starts with a dash ("-Zip", "-home") would be read by pwsh -File as a switch of
+        its own. The empty -LogDir value stays separate ("-LogDir:" alone would take the
+        next argument); an empty value cannot be mistaken for a switch.
     #>
     param([Parameter(Mandatory)][object]$State, [Parameter(Mandatory)][object]$Plan, [Parameter(Mandatory)][string]$EventPath, [AllowEmptyString()][string]$PreviewFolder = '', [AllowEmptyString()][string]$TabId = '')
     $flags = [System.Collections.Generic.List[object]]::new()
     $add = { param($Arguments, $Note) $flags.Add([pscustomobject]@{ Arguments = [string[]]$Arguments; Note = $Note }) }
-    & $add @('-EventLogPath', $EventPath) 'Progress for this window (-EventLogPath, a file in the Designer''s temporary folder).'
+    & $add @("-EventLogPath:$EventPath") 'Progress for this window (-EventLogPath, a file in the Designer''s temporary folder).'
     $browser = $State.Browser
     if ($TabId -and $Plan.VirtualDesktop -ne 'used') {
-        & $add @('-TabId', $TabId) 'The tab the Designer shows (-TabId).'
+        & $add @("-TabId:$TabId") 'The tab the Designer shows (-TabId).'
     }
     if ($browser.Port -gt 0) {
-        & $add @('-DebugPort', [string]$browser.Port) "The audit Edge the Designer is connected to (-DebugPort $($browser.Port))."
-        if ($browser.ProfileDir) { & $add @('-EdgeProfileDir', $browser.ProfileDir) 'Its profile folder (-EdgeProfileDir).' }
+        & $add @("-DebugPort:$($browser.Port)") "The audit Edge the Designer is connected to (-DebugPort $($browser.Port))."
+        if ($browser.ProfileDir) { & $add @("-EdgeProfileDir:$($browser.ProfileDir)") 'Its profile folder (-EdgeProfileDir).' }
     }
     if ($browser.TypedKeepOpen) { & $add @('-KeepBrowserOpen') 'Keep the browser open (-KeepBrowserOpen, typed when the Designer was started).' }
     if ($Plan.Kind -eq 'page') {
-        & $add @('-Only', $Plan.PageId) "Only this page (-Only $($Plan.PageId))."
-        & $add @('-OutputDir', $PreviewFolder) 'A temporary preview folder instead of the output folder (-OutputDir).'
+        & $add @("-Only:$($Plan.PageId)") "Only this page (-Only:$($Plan.PageId))."
+        & $add @("-OutputDir:$PreviewFolder") 'A temporary preview folder instead of the output folder (-OutputDir).'
         & $add @('-SaveImages') 'Image files for the preview (-SaveImages).'
         & $add @('-Zip:$false') 'No zip (-Zip:$false).'
         & $add @('-OpenReport:$false') 'The report is shown here, not opened (-OpenReport:$false).'
@@ -339,6 +399,10 @@ function Start-DesignerChildProcess {
         are redirected and read asynchronously by .NET - nothing in this process waits on
         them - so a chatty run never blocks on a full pipe; they give the last error text
         when a run cannot start. Its own function so the tests can see the arguments.
+        The child gets a console of its own (hidden), which writes redirected text in the
+        system's OEM code page, not UTF-8: it is read in that code page
+        (Get-DesignerConsoleEncoding), so "Prüfung" in a path comes back as written.
+        Nothing is added to the command for this.
     #>
     param(
         [Parameter(Mandatory)][string]$FilePath,
@@ -352,12 +416,27 @@ function Start-DesignerChildProcess {
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
     $info.RedirectStandardInput = $true
-    $info.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
-    $info.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+    $encoding = Get-DesignerConsoleEncoding
+    $info.StandardOutputEncoding = $encoding
+    $info.StandardErrorEncoding = $encoding
     if ($WorkingDirectory) { $info.WorkingDirectory = $WorkingDirectory }
     $process = [System.Diagnostics.Process]::Start($info)
     try { $process.StandardInput.Close() } catch { Write-Verbose 'The run''s input was already closed.' }
     return $process
+}
+
+function Get-DesignerConsoleEncoding {
+    <#
+        The code page a new console on this computer uses (the system OEM code page, e.g.
+        437 or 850; 65001 when Windows is set to UTF-8 everywhere). UTF-8 when it cannot be
+        read. Characters the code page lacks were already lost in the child.
+    #>
+    try {
+        $page = [int](Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage' -Name 'OEMCP' -ErrorAction Stop).OEMCP
+        if ($page -eq 65001) { return [System.Text.UTF8Encoding]::new($false) }
+        return [System.Text.Encoding]::GetEncoding($page)
+    }
+    catch { return [System.Text.UTF8Encoding]::new($false) }
 }
 
 function Stop-DesignerChildProcess {
@@ -442,8 +521,6 @@ function Start-DesignerRun {
     $run.StopPath = "$($run.EventPath).stop"
     $run.OutputFolder = $Plan.OutputFolder
     if ($Plan.Kind -eq 'page') {
-        # A newer test of the same page replaces the older preview, files and all.
-        Remove-DesignerPreview -State $State -PageId $Plan.PageId
         $run.PreviewId = New-DesignerRandomHex -Bytes 16
         $safe = $Plan.PageId -replace '[^A-Za-z0-9_-]', '_'
         if ($safe.Length -gt 40) { $safe = $safe.Substring(0, 40) }
@@ -490,9 +567,13 @@ function Start-DesignerRun {
         $run.EndedAt = Get-Date
         $run.Message = "The run could not be started: $($_.Exception.Message)"
         Remove-DesignerRunFile -Run $run
+        # The older preview of this page stays: nothing replaces it.
+        if ($run.PreviewFolder) { try { [System.IO.Directory]::Delete($run.PreviewFolder, $true) } catch { Write-Verbose 'The empty preview folder was not removed.' } }
         Restore-DesignerBrowserAfterRun -State $State
         throw $run.Message
     }
+    # Started: a newer test of the same page replaces the older preview, files and all.
+    if ($Plan.Kind -eq 'page') { Remove-DesignerPreview -State $State -PageId $Plan.PageId }
     return $run
 }
 
@@ -510,8 +591,10 @@ function Read-DesignerRunEvent {
         COMPLETE line (Add-DesignerRunEvent). Never blocks the loop: it reads what is there
         (at most -MaxBytes per call) with sharing that lets the run keep writing. An
         incomplete last line waits for its end; a line longer than -MaxLineBytes, or one
-        that is not a JSON object with a "type", is skipped and counted. -Final treats an
-        incomplete last line as lost (the run has ended). Returns the number of events.
+        that is not a JSON object with a "type", is skipped and counted. One call reads
+        one chunk only; the next loop turn reads the next. -Final (the run has ended)
+        reads to the end and treats an incomplete last line as lost. Returns the number
+        of events.
     #>
     param(
         [Parameter(Mandatory)][object]$State,
@@ -562,7 +645,7 @@ function Read-DesignerRunEvent {
             }
             $start = $newline + 1
         }
-        if (-not $Final -and $read -lt $MaxBytes) { break }
+        if (-not $Final) { break }
     }
     if ($Final -and ($Run.Pending.Length -gt 0 -or $Run.Discarding)) {
         $Run.Skipped++
@@ -707,25 +790,34 @@ function Get-DesignerRunOutcome {
     <#
         The engine's exit code in plain words (0 all good, 2 some pages failed, 3 warnings
         with "fail on warning", 1 could not start); a run that ended without its runEnd
-        event, or was forced to stop, is a failure said as such.
+        event, or was forced to stop, is a failure said as such. A page test says "Test"
+        and speaks of the preview: it is never the evidence.
     #>
     param([Parameter(Mandatory)][object]$Run, [int]$ProcessExitCode = 0)
     $counts = $Run.Counts
+    $test = $Run.Kind -eq 'page'
     if ($Run.Forced) {
+        if ($test) { return 'You force-stopped the test. Its preview may be missing or incomplete.' }
         return 'You force-stopped the run. Its report may be missing or incomplete.'
     }
     if ($null -eq $Run.RunEnd) {
         $why = Get-DesignerRunErrorText -Run $Run
+        $what = if ($test) { 'test' } else { 'run' }
         if ($ProcessExitCode -eq 1 -and $Run.Pages.Count -eq 0) {
-            if ($why) { return "The run could not start: $why" }
-            return 'The run could not start, and it gave no reason.'
+            if ($why) { return "The $what could not start: $why" }
+            return "The $what could not start, and it gave no reason."
         }
-        $text = "The run ended unexpectedly (exit code $ProcessExitCode) before it finished its report."
+        $text = if ($test) { "The test ended unexpectedly (exit code $ProcessExitCode) before it finished." } else { "The run ended unexpectedly (exit code $ProcessExitCode) before it finished its report." }
         if ($why) { $text += " What it said last: $why" }
         return $text
     }
     switch ($ProcessExitCode) {
         0 {
+            if ($test) {
+                if ($Run.Stopped) { return 'Test stopped by you. The preview has what was captured until then.' }
+                if ($null -ne $counts -and $counts['warning'] -gt 0) { return 'Test finished: this page was captured, with warnings. Look at them below.' }
+                return 'Test finished: this page was captured without problems.'
+            }
             if ($Run.Stopped) {
                 $done = if ($null -ne $counts) { "$($counts['run']) of $($counts['pages'])" } else { 'some' }
                 return "Stopped by you after $done page(s). The report has what was captured until then."
@@ -734,16 +826,64 @@ function Get-DesignerRunOutcome {
             return 'Finished: every page was captured without problems.'
         }
         2 {
+            if ($test) { return 'Test finished, but the page failed. The details below say what went wrong.' }
             $failed = if ($null -ne $counts) { $counts['failed'] } else { 'Some' }
             return "Finished, but $failed page(s) failed. The report shows what went wrong on each."
         }
-        3 { return 'Finished with warnings, and "Fail on warnings" is on, so the run counts as not passed (exit code 3). The report shows the warnings.' }
+        3 {
+            if ($test) { return 'Test finished with warnings, and "Fail on warnings" is on, so a run would count as not passed (exit code 3).' }
+            return 'Finished with warnings, and "Fail on warnings" is on, so the run counts as not passed (exit code 3). The report shows the warnings.'
+        }
         1 {
             $why = Get-DesignerRunErrorText -Run $Run
-            if ($why) { return "The run could not start: $why" }
-            return 'The run could not start.'
+            $what = if ($test) { 'test' } else { 'run' }
+            if ($why) { return "The $what could not start: $why" }
+            return "The $what could not start."
         }
         default { return "The run ended with exit code $ProcessExitCode." }
+    }
+}
+
+function Get-DesignerRunNextStep {
+    <#
+        What to do after a run that did not simply succeed, one plain sentence per kind of
+        failure ('' when there is nothing to do). Shown under the outcome in the Run tab.
+    #>
+    param([Parameter(Mandatory)][object]$Run)
+    $test = $Run.Kind -eq 'page'
+    $console = 'To see everything it printed, copy the command below into a PowerShell window and run it there.'
+    if ($Run.Forced) {
+        if ($test) { return 'Test the page again. If it hangs again, check that its address opens in Edge and that the waits on the page can be met.' }
+        return 'Run it again. If it hangs again, test the slow page on its own with "Test this page" to find what it waits for.'
+    }
+    if ($null -eq $Run.RunEnd) {
+        if ($Run.ExitCode -eq 1 -and $Run.Pages.Count -eq 0) { return "Fix what the message names, then try again. $console" }
+        return 'Try again. If it happens again, copy the command below into a PowerShell window and run it there to see everything it printed.'
+    }
+    switch ($Run.ExitCode) {
+        1 { return "Fix what the message names, then try again. $console" }
+        2 {
+            if ($test) { return 'Fix the page (its address, the sign-in or its steps) and test it again.' }
+            return 'Open the report to see what went wrong on each failed page; fix those pages and test them with "Test this page", then run all pages again.'
+        }
+        3 {
+            if ($test) { return 'Look at the warnings below. If they are acceptable, "Fail on warnings" (Output tab) can be switched off.' }
+            return 'Open the report and look at the warnings. If they are acceptable, switch off "Fail on warnings" (Output tab), or keep it on so scheduled runs report them.'
+        }
+    }
+    return ''
+}
+
+function Complete-DesignerRunPage {
+    # Pages still "running" when the run ended did not finish: said so, never shown as captured.
+    param([Parameter(Mandatory)][object]$State, [Parameter(Mandatory)][object]$Run)
+    foreach ($entry in $Run.Pages.Values) {
+        if ($entry.status -ne 'RUNNING') { continue }
+        $entry.status = 'NOTFINISHED'
+        $entry.details.Add('The run ended before this page finished.')
+        if ($entry.pageId) {
+            $State.PageResults[$entry.pageId] = [ordered]@{ status = 'NOTFINISHED'; kind = $Run.Kind; time = (Get-Date).ToString('HH:mm'); text = 'The run ended before this page finished.'; captureCount = $entry.captureCount }
+        }
     }
 }
 
@@ -775,40 +915,60 @@ function Test-DesignerRunForceAvailable {
 function Complete-DesignerRun {
     <#
         The child has ended: the last events are read, the exit code (the final truth) is
-        put into words, the paths of THIS run become openable, a page test's preview is
-        registered, the temporary copy and stop file go, and the Designer connects to the
-        audit Edge again.
+        put into words, pages left unfinished are said to be so, the paths of THIS run
+        become openable, a page test's preview is registered, the temporary copy and stop
+        file go, and the Designer connects to the audit Edge again.
+        Whatever fails on the way, the run always ends as done or failed and the browser
+        is always handed back (finally): a run must never stay "running" for ever.
     #>
     param([Parameter(Mandatory)][object]$State)
     $run = $State.Run
-    [void](Read-DesignerRunEvent -State $State -Run $run -Final)
     $exitCode = -1
-    try { if ($null -ne $run.Process) { [void]$run.Process.WaitForExit(5000); $exitCode = $run.Process.ExitCode } } catch { $exitCode = -1 }
-    $run.Output = Get-DesignerRunOutput -Run $run
-    $run.EndedAt = Get-Date
-    $run.Prompt = $null
-    $finished = $null -ne $run.RunEnd -and -not $run.Forced -and $exitCode -in 0, 2, 3
-    $run.Message = Get-DesignerRunOutcome -Run $run -ProcessExitCode $exitCode
-    $run.ExitCode = $exitCode
-    $run.State = if ($finished) { 'done' } else { 'failed' }
-    if ($null -ne $run.RunEnd) {
-        if ($run.Kind -eq 'page') {
-            if ($run.ReportPath) { $State.OpenTargets['preview-report'] = $run.ReportPath }
+    try {
+        try { [void](Read-DesignerRunEvent -State $State -Run $run -Final) } catch { Write-Verbose "The last events could not be read: $($_.Exception.Message)" }
+        try { if ($null -ne $run.Process) { [void]$run.Process.WaitForExit(5000); $exitCode = $run.Process.ExitCode } } catch { $exitCode = -1 }
+        $run.Output = Get-DesignerRunOutput -Run $run
+        $run.EndedAt = Get-Date
+        $run.Prompt = $null
+        $finished = $null -ne $run.RunEnd -and -not $run.Forced -and $exitCode -in 0, 2, 3
+        $run.ExitCode = $exitCode
+        $run.Message = Get-DesignerRunOutcome -Run $run -ProcessExitCode $exitCode
+        $run.NextStep = Get-DesignerRunNextStep -Run $run
+        $run.State = if ($finished) { 'done' } else { 'failed' }
+        Complete-DesignerRunPage -State $State -Run $run
+        if ($null -ne $run.RunEnd) {
+            if ($run.Kind -eq 'page') {
+                if ($run.ReportPath) { $State.OpenTargets['preview-report'] = $run.ReportPath }
+            }
+            else {
+                if ($run.ReportPath) { $State.OpenTargets['report'] = $run.ReportPath; $State.OpenTargets['folder'] = Split-Path -Path $run.ReportPath -Parent }
+                if ($run.LogPath) { $State.OpenTargets['log'] = $run.LogPath }
+                if ($run.ZipPath) { $State.OpenTargets['zip'] = Split-Path -Path $run.ZipPath -Parent }
+            }
         }
-        else {
-            if ($run.ReportPath) { $State.OpenTargets['report'] = $run.ReportPath; $State.OpenTargets['folder'] = Split-Path -Path $run.ReportPath -Parent }
-            if ($run.LogPath) { $State.OpenTargets['log'] = $run.LogPath }
-            if ($run.ZipPath) { $State.OpenTargets['zip'] = Split-Path -Path $run.ZipPath -Parent }
+        if ($run.Kind -eq 'page') { Register-DesignerPreview -State $State -Run $run }
+    }
+    catch {
+        $problem = [string]$_.Exception.Message
+        Write-Verbose "The end of the run could not be handled completely: $problem"
+        $run.Notes.Add("The Designer could not finish reading this run's result ($problem).")
+        if ($run.State -notin 'done', 'failed') {
+            $run.State = 'failed'
+            $run.Message = "The run ended, but the Designer could not read its result ($problem)."
         }
     }
-    if ($run.Kind -eq 'page') { Register-DesignerPreview -State $State -Run $run }
-    Remove-DesignerRunFile -Run $run
-    try { if ($null -ne $run.Process) { $run.Process.Dispose() } } catch { Write-Verbose 'The run''s process was already released.' }
-    $run.Process = $null
-    Restore-DesignerBrowserAfterRun -State $State
-    if ($State.ShutdownAfterRun) {
-        $State.Running = $false
-        $State.StopReason = 'The run was stopped and the Designer was closed from its window.'
+    finally {
+        if ($run.State -notin 'done', 'failed') { $run.State = 'failed' }
+        if (-not $run.Message) { $run.Message = 'The run ended, but the Designer could not read its result.' }
+        if ($run.EndedAt -eq [datetime]::MinValue) { $run.EndedAt = Get-Date }
+        try { Remove-DesignerRunFile -Run $run } catch { Write-Verbose 'The temporary files of the run were not removed.' }
+        try { if ($null -ne $run.Process) { $run.Process.Dispose() } } catch { Write-Verbose 'The run''s process was already released.' }
+        $run.Process = $null
+        try { Restore-DesignerBrowserAfterRun -State $State } catch { Write-Verbose "The browser could not be connected again: $($_.Exception.Message)" }
+        if ($State.ShutdownAfterRun) {
+            $State.Running = $false
+            $State.StopReason = 'The run was stopped and the Designer was closed from its window.'
+        }
     }
 }
 
@@ -1159,6 +1319,7 @@ function Get-DesignerRunData {
         preview          = $preview
         prompt           = $run.Prompt
         message          = $run.Message
+        nextStep         = $run.NextStep
         errorText        = $(if ($run.State -eq 'failed') { Get-DesignerRunErrorText -Run $run } else { '' })
         skippedLines     = $run.Skipped
         elapsedSec       = $elapsed

@@ -348,6 +348,9 @@ select.input { padding-right: var(--s5); }
 .run-page.st-warning { border-left-color: var(--warning); }
 .run-page.st-failed { border-left-color: var(--danger); }
 .run-page.st-running { border-left-color: var(--accent); }
+.run-page.st-notfinished { border-left-color: var(--border-strong); }
+.run-next { flex: 1 1 100%; color: var(--text); }
+.preview-note { font-weight: 600; }
 .run-page-head { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; min-width: 0; }
 .run-page-name { font-weight: 600; flex: 1 1 12ch; min-width: 0; overflow-wrap: anywhere; }
 .run-page-count { color: var(--muted); font-size: 0.93rem; }

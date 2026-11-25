@@ -846,8 +846,8 @@
     if (!result) return { text: 'Not tested', cls: 'chip-muted', title: '' };
     const status = String(result.status || '').toUpperCase();
     const what = result.kind === 'page' ? 'Test' : 'Run';
-    const word = status === 'OK' ? what + ' OK' : status === 'WARNING' ? what + ': warning' : status === 'FAILED' ? what + ' failed' : what + ': ' + String(result.status);
-    return { text: word + (result.time ? ' ' + result.time : ''), cls: 'chip-' + status.toLowerCase(), title: result.text || '' };
+    const word = status === 'OK' ? what + ' OK' : status === 'WARNING' ? what + ': warning' : status === 'FAILED' ? what + ' failed' : status === 'NOTFINISHED' ? what + ': not finished' : what + ': ' + String(result.status);
+    return { text: word + (result.time ? ' ' + result.time : ''), cls: status === 'NOTFINISHED' ? 'chip-muted' : 'chip-' + status.toLowerCase(), title: result.text || '' };
   }
   function pageErrorCount(i) {
     const prefix = P('pages', i);
@@ -1407,7 +1407,8 @@
     }
     return bits.join(' · ');
   }
-  const STATUS_TEXT = { OK: 'OK', WARNING: 'Warning', FAILED: 'Failed', RUNNING: 'Running…' };
+  const STATUS_TEXT = { OK: 'OK', WARNING: 'Warning', FAILED: 'Failed', RUNNING: 'Running…', NOTFINISHED: 'Not finished' };
+  function statusChipClass(status) { return status === 'RUNNING' ? 'chip-accent' : status === 'NOTFINISHED' ? 'chip-muted' : 'chip-' + status.toLowerCase(); }
   function runPageList() {
     const pages = S.run.pages || [];
     if (!pages.length) return h('p', { class: 'empty', text: runActive() ? 'Waiting for the first page…' : 'Progress appears here while a run is going.' });
@@ -1417,10 +1418,10 @@
       return h('li', { class: 'run-page st-' + status.toLowerCase() },
         h('div', { class: 'run-page-head' },
           h('span', { class: 'run-page-name', text: p.name || p.pageId || 'Page' }),
-          h('span', { class: 'chip chip-' + (status === 'RUNNING' ? 'accent' : status.toLowerCase()), text: STATUS_TEXT[status] || status }),
+          h('span', { class: 'chip ' + statusChipClass(status), text: STATUS_TEXT[status] || status }),
           h('span', { class: 'run-page-count', text: plural(p.captureCount || 0, 'image', 'images') })),
         details.length ? h('details', { class: 'run-details' },
-          h('summary', { text: status === 'FAILED' ? plural(details.length, 'problem', 'problems') : status === 'WARNING' ? plural(details.length, 'warning', 'warnings') : plural(details.length, 'note', 'notes') }),
+          h('summary', { text: status === 'FAILED' ? plural(details.length, 'problem', 'problems') : status === 'WARNING' || status === 'NOTFINISHED' ? plural(details.length, 'warning', 'warnings') : plural(details.length, 'note', 'notes') }),
           h('ul', { class: 'notes' }, details.map(d => h('li', { text: d })))) : null);
     }));
   }
@@ -1442,8 +1443,9 @@
     const parts = [h('h3', { class: 'sub-title', text: 'Preview of the page test' + (r.pageName ? ': ' + r.pageName : '') })];
     if (page) {
       const status = String(page.status || '').toUpperCase();
-      parts.push(h('p', {}, h('span', { class: 'chip chip-' + status.toLowerCase(), text: STATUS_TEXT[status] || status }), ' ', plural(page.captureCount || 0, 'image', 'images')));
+      parts.push(h('p', {}, h('span', { class: 'chip ' + statusChipClass(status), text: STATUS_TEXT[status] || status }), ' ', plural(page.captureCount || 0, 'image', 'images')));
     }
+    parts.push(h('p', { class: 'preview-note', text: 'This is a test, not evidence. Use Run all pages to make the report.' }));
     const images = pv && Array.isArray(pv.images) ? pv.images : [];
     if (images.length) {
       parts.push(h('div', { class: 'thumbs' }, images.map((img, k) => {
@@ -1473,6 +1475,7 @@
     const outcome = (run.state === 'done' || run.state === 'failed') && run.message
       ? h('div', { class: 'callout ' + (run.state === 'failed' ? 'callout-error' : (run.exitCode === 0 && !(run.counts && run.counts.warning) ? 'callout-ok' : 'callout-warning')), role: 'note' },
         h('p', { class: 'run-message', text: run.message }),
+        run.nextStep ? h('p', { class: 'run-next', text: 'What to do: ' + run.nextStep }) : null,
         run.errorText && run.errorText !== run.message && !run.message.includes(run.errorText) ? h('pre', { class: 'code run-error', text: run.errorText }) : null)
       : null;
     panel.replaceChildren(h('div', { class: 'stack' },

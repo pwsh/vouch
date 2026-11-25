@@ -3682,6 +3682,8 @@ function Start-VouchDesigner {
         $state.Browser.ConnectPending = -not $NoBrowser
         $state.TickHandlers.Add({ param($s) Invoke-DesignerBrowserTick -State $s })
         $state.TickHandlers.Add({ param($s) Invoke-DesignerRunTick -State $s })
+        # Temporary folders of Designers that were killed (their owner is gone) go now.
+        try { [void](Clear-DesignerStaleSession) } catch { Write-Verbose "Old Designer folders were not checked: $($_.Exception.Message)" }
         if ($RunScriptPath) { $state.RunScriptPath = [System.IO.Path]::GetFullPath($RunScriptPath) }
         $state.OpenLog = $OpenLog
         $url = "http://localhost:$($state.Port)/?t=$($state.Token)"
