@@ -213,6 +213,20 @@
     Use this Edge tab (its DevTools target id, as listed by /json/list) instead of the
     first one. Only for an Edge that is already running; the tab is never closed.
 
+.PARAMETER Designer
+    Open the Vouch Designer instead of capturing: a window beside your screen where you
+    add pages, choose what to click and capture, set the report and output options, and
+    save a configuration file. Double-clicking Vouch-Designer.cmd does the same. Give
+    -ConfigPath as well to open that file at the start. Needs the designer folder next
+    to vouch.ps1; every other use of vouch.ps1 works without it.
+
+.PARAMETER DesignerPort
+    The local port the Designer listens on (only this computer can reach it). Default 0:
+    a free port is chosen.
+
+.EXAMPLE
+    .\vouch.ps1 -Designer -ConfigPath .\captures.json
+
 .EXAMPLE
     .\vouch.ps1 -LoginSetup
 
@@ -324,7 +338,12 @@ param(
 
     [switch]$OpenReport,
 
-    [switch]$NoCaptureLog
+    [switch]$NoCaptureLog,
+
+    [switch]$Designer,
+
+    [ValidateRange(0, 65535)]
+    [int]$DesignerPort = 0
 )
 
 Set-StrictMode -Version Latest
@@ -8064,6 +8083,47 @@ function Write-RunFailedEvent {
     Write-RunEvent -Type 'runEnd' -Data ([ordered]@{
         exitCode = 1; reportPath = ''; jsonSummaryPath = ''; counts = $null; stopped = [bool]$script:StopRequested
         logPath = $script:CaptureLogPath; logComplete = [bool]$script:CaptureLogComplete })
+}
+
+function Invoke-DesignerMode {
+    <#
+        -Designer: serves the Designer panel instead of running a capture. It returns before
+        any of a capture run's setup (no transcript, no run events, no capture log). The
+        Designer's code lives in designer\Designer.ps1 so that this file stays one
+        self-contained engine; it is loaded only here, and a copy of vouch.ps1 without the
+        folder still does everything else.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [AllowEmptyString()][string]$ConfigPath = '',
+        [int]$Port = 0,
+        [AllowEmptyCollection()][string[]]$IgnoredParameters = @()
+    )
+    Assert-Environment
+    $designerScript = Join-Path -Path (Split-Path -Path $ScriptPath -Parent) -ChildPath 'designer\Designer.ps1'
+    if (-not (Test-Path -LiteralPath $designerScript -PathType Leaf)) {
+        throw ("The Vouch Designer needs the folder 'designer' next to vouch.ps1 ($(Split-Path -Path $designerScript -Parent)), and it is not there. " +
+            'Copy the whole Vouch folder, not only vouch.ps1. Everything else vouch.ps1 does works without it.')
+    }
+    if ($IgnoredParameters.Count -gt 0) {
+        Write-Host "NOTE: with -Designer only -ConfigPath and -DesignerPort are used; these are ignored: -$($IgnoredParameters -join ', -')" -ForegroundColor Yellow
+    }
+    . $designerScript
+    Start-VouchDesigner -ScriptPath $ScriptPath -ConfigPath $ConfigPath -Port $Port -Version $script:ToolVersion
+}
+
+if ($Designer) {
+    try {
+        $ignored = @($PSBoundParameters.Keys | Where-Object { $_ -notin 'Designer', 'DesignerPort', 'ConfigPath', 'Verbose', 'Debug' })
+        Invoke-DesignerMode -ScriptPath $PSCommandPath -ConfigPath $ConfigPath -Port $DesignerPort -IgnoredParameters $ignored
+    }
+    catch {
+        Write-Host ''
+        Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        if ($null -ne $_.ScriptStackTrace) { Write-Verbose $_.ScriptStackTrace }
+        exit 1
+    }
+    exit 0
 }
 
 $transcribing = Start-RunLog -Directory (Get-RunLogDirectory -BoundParameters $PSBoundParameters -LogDir $LogDir -ConfigPath $ConfigPath)

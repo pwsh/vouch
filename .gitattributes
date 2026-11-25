@@ -3,3 +3,5 @@
 examples/** -text
 *.jpg binary
 *.png binary
+# cmd.exe reads batch files with Windows line ends only.
+*.cmd text eol=crlf
