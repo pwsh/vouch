@@ -1887,11 +1887,6 @@ Describe 'Progress events, stop and -TabId (headless Edge, desktop functions moc
             try { [void](Invoke-RestMethod -Uri "http://127.0.0.1:$($script:CdpPort)/json/close/$Id" -NoProxy) } catch { Write-Verbose 'already closed' }
         }
     }
-    AfterAll {
-        $script:EventLogPath = ''
-        $script:StopRequested = $false
-        $script:CdpTabId = ''
-    }
 
     It 'Get-CdpPageTarget -TabId picks the named tab among two web tabs, and refuses an unknown id' {
         $first = New-TestTab "$Web/ok?tab=first"
@@ -1980,7 +1975,6 @@ Describe 'Progress events, stop and -TabId (headless Edge, desktop functions moc
         }
         finally {
             Remove-TestTab $tab.id
-            $script:EventLogPath = ''
         }
     }
 
@@ -2040,8 +2034,59 @@ Describe 'Progress events, stop and -TabId (headless Edge, desktop functions moc
 
         $runEnd.reportPath | Should -Exist
         @(Test-ReportIntegrity -Path $runEnd.reportPath | Where-Object { -not $_.Ok }) | Should -BeNullOrEmpty
-        $script:StopRequested = $false
-        $script:EventLogPath = ''
+        "$log.stop" | Should -Not -Exist -Because 'a stop that was honoured is cleaned up before runEnd'
+        $script:StopRequested | Should -BeFalse -Because 'the stop ends with the run'
+        $script:EventLogPath | Should -Be '' -Because 'the event log ends with the run'
+    }
+
+    It 'a stop during a pause''s Wait ends the run without asking again' {
+        $file = New-RunConfig -Folder 'pausestop' -Pages @(
+            [ordered]@{ id = 'pause'; name = 'Pause'; url = "$Web/ok"; actions = @(
+                    [ordered]@{ type = 'pause'; message = 'Complete MFA' }
+                    [ordered]@{ type = 'capture' }) }
+            [ordered]@{ id = 'next'; name = 'Never reached'; url = "$Web/ok" })
+        $log = Join-Path -Path $TestDrive -ChildPath 'pausestop\progress.ndjson'
+        Mock Test-InteractiveRun { $true }
+        Mock Show-ContinueDialog { [pscustomobject]@{ Decision = 'Wait'; WaitSeconds = 60; TimedOut = $false } }
+        # The person answers "Wait 60 s", then stops the run from the Designer.
+        $job = Start-ThreadJob -ArgumentList $log -ScriptBlock {
+            param($Log)
+            $deadline = (Get-Date).AddSeconds(60)
+            while ((Get-Date) -lt $deadline) {
+                $text = ''
+                try {
+                    $stream = [System.IO.FileStream]::new($Log, 'Open', 'Read', 'ReadWrite, Delete')
+                    try { $text = [System.IO.StreamReader]::new($stream).ReadToEnd() } finally { $stream.Dispose() }
+                }
+                catch { $text = '' }
+                if ($text -match '"type":"promptResult"') { break }
+                Start-Sleep -Milliseconds 100
+            }
+            Start-Sleep -Milliseconds 500
+            [System.IO.File]::WriteAllText("$Log.stop", '')
+        }
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            $output = Invoke-Main -BoundParameters @{ ConfigPath = $file; EventLogPath = $log } 6>&1 | Out-String
+        }
+        finally {
+            $job | Wait-Job -Timeout 70 | Remove-Job -Force
+        }
+        $watch.Stop()
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 15 -Because 'the 60 s wait was cut short'
+        Should -Invoke Show-ContinueDialog -Times 1 -Exactly
+        $output | Should -Not -Match 'could not be shown'
+        $events = Read-RunEvent $log
+        @($events.type) | Should -Be @('runStart', 'pageStart', 'prompt', 'promptResult', 'action', 'pageEnd', 'runEnd')
+        $events[3].decision | Should -Be 'Wait'
+        $events[4].actionType | Should -Be 'pause'
+        $events[4].message | Should -Be 'stopped by the user'
+        $events[5].status | Should -Be 'WARNING'
+        $events[5].stopped | Should -BeTrue
+        @($events[5].details) | Should -Contain 'Stopped by the user: the run ended here, so the rest of this page was not captured.'
+        $events[6].stopped | Should -BeTrue
+        $events[6].counts.notRun | Should -Be 1
+        "$log.stop" | Should -Not -Exist
     }
 
     It 'the real script logs an error and a runEnd when the run cannot start' {

@@ -2984,8 +2984,24 @@ function Write-RunEvent {
         }
         $line = (ConvertTo-Json -InputObject $record -Compress -Depth 8) + "`n"
         $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($line)
-        $stream = [System.IO.FileStream]::new($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write,
-            ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        # A reader that opens the file without write sharing (File.ReadAllText does)
+        # locks it for a moment; a few short retries keep the event - runEnd above all.
+        for ($attempt = 1; ; $attempt++) {
+            try {
+                $stream = [System.IO.FileStream]::new($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write,
+                    ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+                break
+            }
+            catch {
+                # PowerShell wraps the .NET error; look for the IOException inside.
+                $io = $_.Exception
+                while ($null -ne $io -and $io -isnot [System.IO.IOException]) { $io = $io.InnerException }
+                # 0x80070020 ERROR_SHARING_VIOLATION, 0x80070021 ERROR_LOCK_VIOLATION
+                $sharing = $null -ne $io -and ($io.HResult -band 0xFFFF) -in 0x20, 0x21
+                if (-not $sharing -or $attempt -ge 4) { throw }
+                [System.Threading.Thread]::Sleep(50)
+            }
+        }
         try {
             $stream.Write($bytes, 0, $bytes.Length)
             $stream.Flush()
@@ -3083,8 +3099,9 @@ function Request-UserDecision {
         The one place where the run asks the person something (a pause, a page that is
         not ready, a sign-in). Everything else calls this, so tests replace this one
         function. When nobody can answer ($script:InteractiveRun is false: scheduled,
-        -NonInteractive, -NoPrompt) it returns the default at once, with no window, and
-        Prompted = $false so the caller can say nobody was asked. Otherwise the Vouch
+        -NonInteractive, -NoPrompt), or the run is already stopped, it returns the
+        default at once, with no window and no event, and Prompted = $false so the
+        caller can say nobody was asked. Otherwise the Vouch
         dialog (Show-ContinueDialog) asks; a dialog that cannot be shown counts as
         nobody there, because a run must never fail or hang over a question.
         Returns { Decision = Continue|Wait|Skip; WaitSeconds; TimedOut; Prompted }.
@@ -3100,7 +3117,8 @@ function Request-UserDecision {
     )
     if ($TimeoutSec -le 0) { $TimeoutSec = 300 }
     $unanswered = [pscustomobject]@{ Decision = $Default; WaitSeconds = 0; TimedOut = $false; Prompted = $false }
-    if (-not $script:InteractiveRun) { return $unanswered }
+    # A stopped run asks nothing more: no window, no prompt event (the caller ends the page).
+    if (-not $script:InteractiveRun -or (Test-StopRequested)) { return $unanswered }
 
     Write-RunEvent -Type 'prompt' -Data ([ordered]@{
         pageId = $script:EventPageId; kind = $Kind; title = $Title; message = $Message; pageName = $PageName
@@ -3221,19 +3239,21 @@ function New-ContinueDialog {
     $timer = [System.Windows.Forms.Timer]::new()
     $timer.Interval = 250
 
+    # Decides only; the window is closed only once it exists. Close() on a form never
+    # shown disposes it, and ShowDialog would then fail instead of returning the answer.
     $tick = {
         if ($state.Decision) { return }
         if ($state.StopFile -and [System.IO.File]::Exists($state.StopFile)) {
             $state.Stopped = $true
             $state.Decision = 'Skip'
-            $form.Close()
+            if ($form.IsHandleCreated) { $form.Close() }
             return
         }
         $left = [int][Math]::Ceiling(($state.Deadline - [datetime]::Now).TotalSeconds)
         if ($left -le 0) {
             $state.Decision = $state.Default
             $state.TimedOut = $true
-            $form.Close()
+            if ($form.IsHandleCreated) { $form.Close() }
             return
         }
         $countdown.Text = $countdownFormat -f [int][Math]::Floor($left / 60), ($left % 60)
@@ -3259,13 +3279,23 @@ function New-ContinueDialog {
     # A pwsh started hidden or minimised gives its first window that style (measured):
     # the dialog would exist but never appear. SW_RESTORE shows it normally, TopMost
     # keeps it above a maximised Edge.
+    # The countdown starts first: whatever happens to the window, the prompt must end.
     $form.add_Shown({
-        [void][Vouch.Native]::ShowWindow($form.Handle, 9)   # SW_RESTORE
-        $form.Activate()
         $timer.Start()
+        try {
+            [void][Vouch.Native]::ShowWindow($form.Handle, 9)   # SW_RESTORE
+            $form.Activate()
+        }
+        catch {
+            [System.Diagnostics.Debug]::WriteLine("Vouch dialog: could not restore the window: $($_.Exception.Message)")
+        }
+        # Decided before it appeared (a stop): close at once.
+        if ($state.Decision) { $form.Close() }
     }.GetNewClosure())
 
-    & $tick
+    # The first countdown text, without deciding anything before the window exists.
+    $initialLeft = [int][Math]::Ceiling(($state.Deadline - [datetime]::Now).TotalSeconds)
+    $countdown.Text = $countdownFormat -f [int][Math]::Floor($initialLeft / 60), ($initialLeft % 60)
     return [pscustomobject]@{
         Form = $form; State = $state; Timer = $timer; ContinueButton = $continueButton; WaitButton = $waitButton
         SkipButton = $skipButton; WaitInput = $waitInput; Countdown = $countdown
@@ -3301,14 +3331,34 @@ function Show-ContinueDialog {
         $dialog.Timer.Dispose()
         $dialog.Form.Dispose()
         [System.Windows.Forms.Application]::DoEvents()
-        $handle = Get-EdgeWindowHandle -TimeoutSec 1
-        if ($handle -ne [IntPtr]::Zero) { [void][Vouch.Native]::SetForegroundWindow($handle) }
+        Restore-EdgeForeground
         # Lets the window manager finish removing the dialog before anything is captured.
         Start-Sleep -Milliseconds 500
     }
     $state = $dialog.State
     $decision = if ($state.Decision) { [string]$state.Decision } else { $Default }
     return [pscustomobject]@{ Decision = $decision; WaitSeconds = [int]$state.WaitSeconds; TimedOut = [bool]$state.TimedOut }
+}
+
+function Restore-EdgeForeground {
+    <#
+        Hands the screen back to Edge after the Vouch dialog. Get-EdgeWindowHandle knows
+        the window by its process; a reused Edge (the Designer's way of running) often
+        has no known process, and then only its window title - which ends with the page's
+        title - can find it. So the page title is read over the open DevTools connection
+        and passed on. Without either there is nothing to look for, and the 1-second
+        search that could only fail is skipped. Best-effort: a failure costs nothing but
+        the hand-back.
+    #>
+    $title = ''
+    if ($null -eq $script:EdgeProcess) {
+        if (-not (Test-CdpSocketOpen)) { return }
+        try { $title = [string](Invoke-CdpEval -Expression 'document.title' -TimeoutSec 5) }
+        catch { Write-Verbose "Could not read the page title: $($_.Exception.Message)" }
+        if ([string]::IsNullOrWhiteSpace($title)) { return }
+    }
+    $handle = Get-EdgeWindowHandle -TimeoutSec 1 -ExpectedTitle $title
+    if ($handle -ne [IntPtr]::Zero) { [void][Vouch.Native]::SetForegroundWindow($handle) }
 }
 
 #endregion
@@ -4061,18 +4111,22 @@ function Invoke-PauseAction {
     while ($true) {
         $answer = Request-UserDecision -Kind 'pause' -Title 'Vouch is paused' -Message $message -PageName $pageName `
             -Default 'Continue' -TimeoutSec $policy.PromptTimeoutSec
-        if (Test-StopRequested) {
-            $Entry.Message = 'stopped by the user'
-            return
-        }
-        if (-not $answer.Prompted) {
+        $stopped = Test-StopRequested
+        if (-not $stopped -and -not $answer.Prompted) {
             $Entry.Message = 'skipped: nobody was there to answer'
             & $addDetail "The pause ($Text) was skipped because nobody was there to answer it (an unattended run, or -NoPrompt); the actions after it ran straight away."
             return
         }
-        if ($answer.Decision -eq 'Wait') {
-            [void](Wait-Interruptible -Milliseconds ([Math]::Max(1, [int]$answer.WaitSeconds) * 1000))
+        # A stop during the extra wait ends the pause here: asking again would only
+        # put a question on screen for a run that is already ending.
+        if (-not $stopped -and $answer.Decision -eq 'Wait' -and
+            (Wait-Interruptible -Milliseconds ([Math]::Max(1, [int]$answer.WaitSeconds) * 1000))) {
             continue
+        }
+        if ($stopped -or (Test-StopRequested)) {
+            $Entry.Message = 'stopped by the user'
+            if ($null -ne $Item) { Add-StopDetail -Item $Item }
+            return
         }
         if ($answer.Decision -eq 'Skip') {
             $taken = if ($null -ne $Item) { $Item.Captures.Count } else { 0 }
@@ -5776,8 +5830,9 @@ function Invoke-CaptureItem {
                 if (Test-StopRequested) { Add-StopDetail -Item $Item; & $endPage 'stopped by the user'; return $Item }
                 if (-not $answer.Prompted) { break }
                 if ($answer.Decision -eq 'Wait') {
-                    [void](Wait-Interruptible -Milliseconds ([Math]::Max(1, [int]$answer.WaitSeconds) * 1000))
-                    continue
+                    # A stop during the wait ends the page; it is not asked again.
+                    if (Wait-Interruptible -Milliseconds ([Math]::Max(1, [int]$answer.WaitSeconds) * 1000)) { continue }
+                    Add-StopDetail -Item $Item; & $endPage 'stopped by the user'; return $Item
                 }
                 if ($answer.Decision -eq 'Skip') {
                     if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
@@ -5908,6 +5963,28 @@ function Invoke-CaptureItem {
 }
 
 function Invoke-Main {
+    <#
+        Runs the whole job (Invoke-CaptureRun) and owns what must outlive it or end with
+        it: a run that throws still tells a program following the event log why
+        (error + runEnd), and the event log and stop state end with the run, so a later
+        page captured in the same session (the Designer) is neither logged into this
+        run's file nor stopped by its stop file.
+    #>
+    param([AllowNull()][System.Collections.IDictionary]$BoundParameters = $null)
+    try {
+        Invoke-CaptureRun -BoundParameters $BoundParameters
+    }
+    catch {
+        Write-RunFailedEvent -Message $_.Exception.Message
+        throw
+    }
+    finally {
+        $script:EventLogPath = ''
+        $script:StopRequested = $false
+    }
+}
+
+function Invoke-CaptureRun {
     <#
         Runs the whole job: verify, login setup, or a capture run.
         Settings come from Resolve-RunSettings. The script passes -BoundParameters
@@ -6197,6 +6274,7 @@ function Invoke-Main {
     if ($settings.SaveImages) { Write-Host "Individual images: $imagesDir" }
     Write-Host "Report: $reportPath ($reportSizeMb MB)" -ForegroundColor Cyan
     if ($summaryPath) { Write-Host "Summary: $summaryPath" }
+    Remove-StopFile
     Write-RunEvent -Type 'runEnd' -Data ([ordered]@{
         exitCode = $script:ExitCode; reportPath = $reportPath; jsonSummaryPath = $summaryPath
         counts = [ordered]@{
@@ -6238,14 +6316,28 @@ function Test-CdpSocketOpen {
     return $null -ne $script:CdpSocket -and $script:CdpSocket.State -eq [System.Net.WebSockets.WebSocketState]::Open
 }
 
+function Remove-StopFile {
+    <#
+        Removes the stop file of a run that honoured it, before runEnd, so nothing is
+        left behind for the next run or the person to trip over. Only when the stop was
+        seen: a file that appears after that moment belongs to nobody yet. Best-effort.
+    #>
+    if (-not $script:StopRequested) { return }
+    $stopFile = Get-StopFilePath
+    if (-not $stopFile) { return }
+    try { [System.IO.File]::Delete($stopFile) }
+    catch { Write-Verbose "Could not remove the stop file '$stopFile': $($_.Exception.Message)" }
+}
+
 function Write-RunFailedEvent {
     <#
         The events of a run that ended with an error (exit code 1): what went wrong and
         a runEnd, so a program following the event log is never left waiting for an end
-        that does not come. Called from the script's own error handler.
+        that does not come. Called by Invoke-Main when the run throws.
     #>
     param([AllowEmptyString()][string]$Message = '')
     Write-RunEvent -Type 'error' -Data ([ordered]@{ message = $Message })
+    Remove-StopFile
     Write-RunEvent -Type 'runEnd' -Data ([ordered]@{
         exitCode = 1; reportPath = ''; jsonSummaryPath = ''; counts = $null; stopped = [bool]$script:StopRequested })
 }
@@ -6259,7 +6351,6 @@ catch {
     Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
     if ($null -ne $_.ScriptStackTrace) { Write-Verbose $_.ScriptStackTrace }
     $script:ExitCode = 1
-    Write-RunFailedEvent -Message $_.Exception.Message
 }
 finally {
     if ($transcribing) {

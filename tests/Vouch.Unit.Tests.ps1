@@ -1509,6 +1509,20 @@ Describe 'Request-UserDecision' {
         $script:EventPageId = ''
     }
 
+    It 'asks nothing and logs nothing once the run is stopped' {
+        $script:InteractiveRun = $true
+        $script:EventLogPath = Join-Path -Path $TestDrive -ChildPath 'stopped.ndjson'
+        Set-Content -LiteralPath "$($script:EventLogPath).stop" -Value ''
+        try {
+            $answer = Request-UserDecision -Title 'T' -Message 'M' 6>$null
+            $answer.Decision | Should -Be 'Continue'
+            $answer.Prompted | Should -BeFalse
+            Should -Invoke Show-ContinueDialog -Times 0 -Exactly
+            $script:EventLogPath | Should -Not -Exist -Because 'no prompt event is written'
+        }
+        finally { $script:StopRequested = $false }
+    }
+
     It 'carries on as if nobody were there when the dialog cannot be shown' {
         $script:InteractiveRun = $true
         Mock Show-ContinueDialog { throw 'no desktop' }
@@ -1533,6 +1547,20 @@ Describe 'The Vouch dialog, built but not shown' {
         & $dialog.State.Tick
         $dialog.State.Decision | Should -Be 'Skip'
         $dialog.State.TimedOut | Should -BeTrue
+    }
+
+    It 'decides nothing and stays usable when the stop file exists before it is shown' {
+        $stop = Join-Path -Path $TestDrive -ChildPath 'early.ndjson.stop'
+        Set-Content -LiteralPath $stop -Value ''
+        $dialog = New-ContinueDialog -Title 'Paused' -Message 'm' -StopFile $stop
+        $script:Dialogs.Add($dialog)
+        $dialog.State.Decision | Should -Be ''
+        $dialog.Form.IsDisposed | Should -BeFalse
+        $dialog.Countdown.Text | Should -Match '^If nobody answers, Vouch will continue in 4:(59|60)\.$|^If nobody answers, Vouch will continue in 5:00\.$'
+        # A tick before the window exists decides, but never closes (Close would dispose it).
+        & $dialog.State.Tick
+        $dialog.State.Decision | Should -Be 'Skip'
+        $dialog.Form.IsDisposed | Should -BeFalse
     }
 
     It 'closes with Skip as soon as the stop file appears' {
@@ -1630,6 +1658,35 @@ Describe 'Progress events' {
         finally { $reader.Dispose() }
     }
 
+    It 'retries while a reader holds the file without write sharing, and keeps the event' {
+        $script:EventLogPath = Join-Path -Path $TestDrive -ChildPath 'locked.ndjson'
+        Write-RunEvent -Type 'runStart'
+        $lock = [System.IO.FileStream]::new($script:EventLogPath, 'Open', 'Read', 'Read')
+        # Released by another thread after about 80 ms, as File.ReadAllText would.
+        $job = Start-ThreadJob -ArgumentList $lock -ScriptBlock { param($Stream) Start-Sleep -Milliseconds 80; $Stream.Dispose() }
+        try {
+            Write-RunEvent -Type 'runEnd' -Data @{ exitCode = 0 }
+        }
+        finally {
+            $job | Wait-Job | Remove-Job
+            $lock.Dispose()
+        }
+        @(Get-Content -LiteralPath $script:EventLogPath | ForEach-Object { ($_ | ConvertFrom-Json).type }) | Should -Be @('runStart', 'runEnd')
+    }
+
+    It 'gives up quietly after a few retries when the file stays locked' {
+        $script:EventLogPath = Join-Path -Path $TestDrive -ChildPath 'held.ndjson'
+        Write-RunEvent -Type 'runStart'
+        $lock = [System.IO.FileStream]::new($script:EventLogPath, 'Open', 'Read', 'Read')
+        try {
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            { Write-RunEvent -Type 'runEnd' } | Should -Not -Throw
+            $watch.Elapsed.TotalSeconds | Should -BeLessThan 1
+        }
+        finally { $lock.Dispose() }
+        @(Get-Content -LiteralPath $script:EventLogPath).Count | Should -Be 1
+    }
+
     It 'never fails the run when the file cannot be written' {
         $script:EventLogPath = Join-Path -Path $TestDrive -ChildPath 'no such folder\e.ndjson'
         { Write-RunEvent -Type 'runStart' } | Should -Not -Throw
@@ -1695,6 +1752,71 @@ Describe 'Stop file' {
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
         Wait-Interruptible -Milliseconds 60000 6>$null | Should -BeFalse
         $watch.Elapsed.TotalSeconds | Should -BeLessThan 1
+    }
+}
+
+Describe 'Ending a run: stop file, events and state' {
+    AfterEach {
+        $script:EventLogPath = ''
+        $script:StopRequested = $false
+    }
+
+    It 'removes the stop file only when the stop was honoured' {
+        $script:EventLogPath = Join-Path -Path $TestDrive -ChildPath 'end.ndjson'
+        Set-Content -LiteralPath "$($script:EventLogPath).stop" -Value ''
+        $script:StopRequested = $false
+        Remove-StopFile
+        "$($script:EventLogPath).stop" | Should -Exist
+        $script:StopRequested = $true
+        Remove-StopFile
+        "$($script:EventLogPath).stop" | Should -Not -Exist
+    }
+
+    It 'Invoke-Main logs error and runEnd for a run that throws, removes an honoured stop file and ends the event log and stop with the run' {
+        $script:TestLog = Join-Path -Path $TestDrive -ChildPath 'throws.ndjson'
+        Set-Content -LiteralPath "$($script:TestLog).stop" -Value ''
+        Mock Invoke-CaptureRun {
+            $script:EventLogPath = $script:TestLog
+            [void](Test-StopRequested 6>$null)
+            throw 'Edge did not start'
+        }
+        { Invoke-Main -BoundParameters @{} } | Should -Throw '*Edge did not start*'
+        $events = @(Get-Content -LiteralPath $script:TestLog | ForEach-Object { $_ | ConvertFrom-Json })
+        @($events.type) | Should -Be @('error', 'runEnd')
+        $events[1].stopped | Should -BeTrue
+        "$($script:TestLog).stop" | Should -Not -Exist
+        $script:EventLogPath | Should -Be ''
+        $script:StopRequested | Should -BeFalse
+    }
+}
+
+Describe 'Handing the screen back to Edge after the dialog' {
+    AfterEach { $script:EdgeProcess = $null }
+
+    It 'does not search at all for a reused Edge with no known process and no connection' {
+        $script:EdgeProcess = $null
+        Mock Test-CdpSocketOpen { $false }
+        Mock Get-EdgeWindowHandle { [IntPtr]::Zero }
+        Restore-EdgeForeground
+        Should -Invoke Get-EdgeWindowHandle -Times 0 -Exactly
+    }
+
+    It 'looks for a reused Edge by the title of the page it shows' {
+        $script:EdgeProcess = $null
+        Mock Test-CdpSocketOpen { $true }
+        Mock Invoke-CdpEval { 'Users - Admin' }
+        Mock Get-EdgeWindowHandle { [IntPtr]::Zero }
+        Restore-EdgeForeground
+        Should -Invoke Get-EdgeWindowHandle -Times 1 -Exactly -ParameterFilter { $ExpectedTitle -eq 'Users - Admin' -and $TimeoutSec -eq 1 }
+    }
+
+    It 'looks for an Edge it knows by its process without reading the title' {
+        $script:EdgeProcess = [pscustomobject]@{ Id = 1 }
+        Mock Invoke-CdpEval { throw 'not needed' }
+        Mock Get-EdgeWindowHandle { [IntPtr]::Zero }
+        Restore-EdgeForeground
+        Should -Invoke Get-EdgeWindowHandle -Times 1 -Exactly -ParameterFilter { $ExpectedTitle -eq '' }
+        Should -Invoke Invoke-CdpEval -Times 0 -Exactly
     }
 }
 
