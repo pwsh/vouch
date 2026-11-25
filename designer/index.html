@@ -23,6 +23,7 @@
     <div class="toolbar" role="toolbar" aria-label="File" id="file-toolbar"></div>
     <div class="tabs" role="tablist" aria-label="Sections" id="tabs"></div>
   </header>
+  <section id="browser-strip" class="browser-strip" aria-label="The audit browser"></section>
   <div id="banner" class="banner" role="alert" hidden></div>
   <div id="issues" class="issues" hidden></div>
   <main id="main" class="main" tabindex="-1">
@@ -43,6 +44,12 @@
 <dialog id="busy" class="modal busy" aria-labelledby="busy-title">
   <h2 id="busy-title" class="modal-title">Waiting for the file dialog…</h2>
   <p>Choose the file in the Windows dialog. If you do not see it, look behind this window or on the taskbar.</p>
+</dialog>
+<dialog id="picking" class="modal busy" aria-labelledby="picking-title" aria-describedby="picking-text">
+  <h2 id="picking-title" class="modal-title">Waiting for you to click in the browser…</h2>
+  <p id="picking-text">Press Esc in the browser to cancel.</p>
+  <p id="picking-notice" class="help" hidden></p>
+  <div class="modal-buttons"><button type="button" id="picking-cancel" class="btn">Cancel picking</button></div>
 </dialog>
 </body>
 </html>

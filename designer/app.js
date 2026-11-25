@@ -7,13 +7,18 @@
   kept exactly as the file was written (no defaults filled in), and keys the panel does
   not know are carried along untouched.
 
-  Extension points for later steps (see the Task 7 report):
+  Links to the server (see the Task 7 and Task 8 reports):
   - GET /api/state -> capabilities {browser, pick, test, run}, browser {...}, run {...}.
     When a capability turns true, the matching buttons below start calling their API.
-  - Browser: goToUrl(), addPageFromCurrentTab()          -> /api/browser/navigate, /current
-  - Picker:  startPick(kind, target)                       -> /api/pick/start, GET /api/pick, /cancel
-  - Action test: testAction(pageIndex, actionIndex)        -> /api/action/test
-  - Runs: startRun(kind), stopRun(), pollRun()             -> /api/run, GET /api/run, /api/run/stop
+  - Browser: renderBrowser() (status strip), retryBrowser(), tidyWindows(), zoomOff(),
+    goToUrl(), addPageFromCurrentTab() -> /api/browser/{connect,layout,zoom-off,navigate},
+    /api/page/from-current
+  - Picker:  startPick(mode, target) -> /api/pick/start, GET /api/pick, /api/pick/cancel;
+    chooseCandidate() lets the person pick one of the verified candidates; applyPick().
+  - Action test: testAction(pageIndex, actionIndex) -> /api/action/test (result inline)
+  - Runs (later step): startRun(kind), stopRun(), pollRun() -> /api/run, GET /api/run, /api/run/stop
+  Everything that came from the audit page (titles, addresses, element words, selectors)
+  arrives as JSON strings and is only ever shown with textContent.
 */
 (function () {
   'use strict';
@@ -85,9 +90,25 @@
     const parent = getAt(obj, P.apply(null, keys.slice(0, -1)));
     if (isObj(parent)) delete parent[keys[keys.length - 1]];
   }
-  // The value a path had in the file as last opened or saved (undefined when absent).
+  /*
+    The value a path had in the file as last opened or saved (undefined when absent).
+    A page is found again by its id, not its position: after pages were moved, the
+    same position in the saved file is another page.
+  */
   function savedValue(path) {
-    try { return getAt(JSON.parse(S.savedJson || 'null'), path); } catch (e) { return undefined; }
+    let saved;
+    try { saved = JSON.parse(S.savedJson || 'null'); } catch (e) { return undefined; }
+    const keys = parsePath(path);
+    if (keys[0] === 'pages' && typeof keys[1] === 'number') {
+      const page = pageAt(keys[1]);
+      if (!page) return undefined;
+      const id = pageId(page, keys[1]).toLowerCase();
+      const savedPages = pagesOf(saved);
+      const at = savedPages.findIndex((p, j) => isObj(p) && pageId(p, j).toLowerCase() === id);
+      if (at < 0) return undefined;
+      return getAt(saved, P.apply(null, ['pages', at].concat(keys.slice(2))));
+    }
+    return getAt(saved, path);
   }
   /*
     Clearing a field removes its key, so blanks and empty {} do not pile up in the file.
@@ -142,6 +163,11 @@
     pageResults: {},
     capabilities: { browser: false, pick: false, test: false, run: false },
     browser: { connected: false },
+    connecting: false,
+    // Results of "Test" per action (key: testKey()), and the one being tested now.
+    tests: {},
+    testing: '',
+    picking: null,
     closed: false,
     drag: -1,
     clickStash: null,
@@ -149,7 +175,7 @@
   window.VouchDesigner = { S: S };
 
   // ------------------------------------------------------------------ texts
-  const LATER_BROWSER = 'This needs the link to the browser, which comes in a later step of the Designer. Until then, type the address, text or selector yourself.';
+  const LATER_BROWSER = 'This needs the audit browser, which is not connected. See the browser line at the top (Retry), or type the address, words or selector yourself.';
   const LATER_RUN = 'Running and testing from the Designer comes in a later step. Until then, copy the command from the Run tab into a PowerShell window.';
   const LATER_RUN_HERE = 'Running and testing from the Designer comes in a later step. Until then, copy the command below into a PowerShell window.';
 
@@ -751,6 +777,7 @@
     if (!S.config) return;
     keepFocus(() => {
       renderHeader();
+      renderBrowser();
       const render = { pages: renderPages, output: renderOutput, report: renderReport, run: renderRun }[S.tab];
       for (const [key] of TABS) if (key !== S.tab) $('#panel-' + key).replaceChildren();
       render();
@@ -879,8 +906,8 @@
       pageListBlock(),
       h('div', { class: 'button-row' },
         btn('Add blank page', () => addPage(), { primary: true, fkey: 'add-page' }),
-        btn('Add page from current tab', () => addPageFromCurrentTab(), { later: S.capabilities.browser ? null : LATER_BROWSER, fkey: 'add-from-tab' })),
-      S.capabilities.browser ? null : laterNote('“Add page from current tab” needs the link to the browser, which comes in a later step.'));
+        btn('Add page from current tab', () => addPageFromCurrentTab(), { later: S.capabilities.browser ? null : LATER_BROWSER, fkey: 'add-from-tab', title: 'Adds the page shown in the audit Edge window, with its title as the name' })),
+      S.capabilities.browser ? null : laterNote('“Add page from current tab” works once the audit browser is connected (see the top of this window).'));
     const editor = pages.length ? pageEditor(S.page) : h('div', { class: 'card empty-editor' }, h('p', { text: 'Add a page to start. A page is one web address to capture, with the clicks and waits needed before the screenshot.' }));
     panel.replaceChildren(h('div', { class: 'pages-layout' }, listCol, h('div', { class: 'pages-editor-col' }, editor)));
   }
@@ -897,7 +924,7 @@
       btn('Move down', () => movePage(i, i + 1, true), { small: true, disabled: i === pages.length - 1, fkey: 'page-down' }),
       btn('Duplicate', () => duplicatePage(i), { small: true, fkey: 'page-dup' }),
       btn('Delete', () => deletePage(i), { small: true, danger: true, fkey: 'page-del' }));
-    const goButton = btn('Go', () => goToUrl(i), { small: true, later: S.capabilities.browser ? null : LATER_BROWSER, title: 'Open this address in the browser', fkey: 'go' });
+    const goButton = btn('Go', () => goToUrl(i), { small: true, later: S.capabilities.browser ? null : LATER_BROWSER, title: 'Open this address in the audit browser, at the zoom the run will use', fkey: 'go' });
     const accountInfo = effOverride(i, 'account');
     const details = h('div', { class: 'card page-card' },
       h('div', { class: 'card-head' },
@@ -957,7 +984,7 @@
         const options = (sp.allowed || []).map(v => ({ value: v, label: (f.key === 'captureArea' ? AREA_TEXT : NOT_READY_TEXT)[v] || v }));
         return selectField({ path: path, label: SETTING_LABELS['defaults.' + f.key], value: info.value, options: options, help: help, badge: badge });
       }
-      const pick = f.pick ? btn('Pick', () => startPick('waitFor', { page: i, override: true }), { small: true, later: S.capabilities.pick ? null : LATER_BROWSER, fkey: 'pick-waitfor' }) : null;
+      const pick = f.pick ? btn('Pick', () => startPick('waitFor', { page: i, override: true }), { small: true, later: S.capabilities.pick ? null : LATER_BROWSER, fkey: 'pick-waitfor', aria: 'Pick the element to wait for in the browser' }) : null;
       return textField({
         path: path, label: SETTING_LABELS['defaults.' + f.key] + (f.unit === 's' ? ' (seconds)' : f.unit === '%' ? ' (%)' : ''),
         kind: f.kind, whole: sp.type === 'int', mono: f.key === 'waitFor', value: info.has ? info.value : '',
@@ -984,16 +1011,26 @@
       const path = P('pages', i, 'actions', j);
       const open = S.openAction === j;
       const editorId = 'action-editor-' + j;
+      const clicks = ['click', 'clickText'].includes(actionType(action));
+      const key = testKey(i, j);
+      const result = S.tests[key];
+      const testing = S.testing === key;
       const row = h('li', { class: 'action-row' + (open ? ' is-open' : '') },
         h('div', { class: 'action-line' },
           h('span', { class: 'action-num', text: (j + 1) + '.' }),
           h('span', { class: 'action-text', dataset: { summaryFor: path, path: path }, tabindex: '-1', text: describeAction(action) })),
         h('div', { class: 'action-buttons' },
           btn(open ? 'Close' : 'Edit', () => { S.openAction = open ? -1 : j; keepFocus(renderAll); }, { small: true, expanded: open, controls: editorId, fkey: 'action-edit:' + j, aria: (open ? 'Close action ' : 'Edit action ') + (j + 1) }),
-          btn('Test', () => testAction(i, j), { small: true, later: S.capabilities.test ? null : LATER_BROWSER, fkey: 'action-test:' + j, aria: 'Test action ' + (j + 1) }),
+          btn(testing ? 'Testing…' : (clicks ? 'Test (really clicks)' : 'Test'), () => testAction(i, j), {
+            small: true, later: S.capabilities.test ? null : LATER_BROWSER, disabled: !!S.testing, fkey: 'action-test:' + j,
+            aria: 'Test action ' + (j + 1) + ' in the audit browser' + (clicks ? ': this really clicks on the page' : ''),
+            title: clicks ? 'Runs this click in the audit browser now. It is a real click: the site acts on it.' : 'Runs this one step in the audit browser now.',
+          }),
           btn('↑', () => moveAction(i, j, j - 1), { small: true, disabled: j === 0, aria: 'Move action ' + (j + 1) + ' up', fkey: 'action-up:' + j }),
           btn('↓', () => moveAction(i, j, j + 1), { small: true, disabled: j === actions.length - 1, aria: 'Move action ' + (j + 1) + ' down', fkey: 'action-down:' + j }),
           btn('Delete', () => deleteAction(i, j), { small: true, danger: true, aria: 'Delete action ' + (j + 1), fkey: 'action-del:' + j })),
+        result ? h('p', { class: 'action-result ' + (result.ok ? 'is-ok' : 'is-bad'), role: 'status' },
+          h('strong', { text: result.ok ? 'Test worked. ' : 'Test: ' }), result.message) : null,
         open ? h('div', { class: 'action-editor', id: editorId }, actionEditor(i, j, action)) : null);
       list.appendChild(row);
     });
@@ -1004,14 +1041,19 @@
       actions.length ? list : h('p', { class: 'empty', text: 'No actions yet.' }),
       hasCapture ? null : h('p', { class: 'help note', text: 'This page has no capture, so Vouch adds one at the end: a screenshot of what is visible.' }),
       h('div', { class: 'button-row wrap' },
-        btn('Pick something to click', () => startPick('click', { page: i }), { small: true, later: S.capabilities.pick ? null : LATER_BROWSER, fkey: 'pick-click' }),
-        btn('Pick a scroll area', () => startPick('area', { page: i }), { small: true, later: S.capabilities.pick ? null : LATER_BROWSER, fkey: 'pick-area' }),
+        btn('Pick something to click', () => startPick('click', { page: i }), { small: true, later: S.capabilities.pick ? null : LATER_BROWSER, fkey: 'pick-click', title: 'Point at it in the audit browser; Vouch records how to click it again' }),
+        btn('Pick a scroll area', () => startPick('scroll', { page: i }), { small: true, later: S.capabilities.pick ? null : LATER_BROWSER, fkey: 'pick-area', title: 'Point inside the area in the audit browser; Vouch adds a capture that scrolls it' }),
         btn('Add click', () => addAction(i, { type: 'clickText', text: '' }), { small: true, fkey: 'add-click' }),
         btn('Add capture', () => addAction(i, { type: 'capture', scroll: { mode: 'none' } }), { small: true, fkey: 'add-capture' }),
         btn('Add wait', () => addAction(i, { type: 'wait', seconds: 2 }), { small: true, fkey: 'add-wait' }),
         btn('Add wait-for', () => addAction(i, { type: 'waitFor', selector: '' }), { small: true, fkey: 'add-waitfor' }),
         btn('Add pause', () => addAction(i, { type: 'pause' }), { small: true, fkey: 'add-pause' })),
-      S.capabilities.pick ? null : laterNote('Picking in the browser comes in a later step. Until then, use “Add click” and type the words or the selector.'));
+      S.capabilities.pick ? null : laterNote('Picking needs the audit browser (see the top of this window). Until it is connected, use “Add click” and type the words or the selector.'));
+  }
+  // A test result belongs to one action as it is now: moving or changing it drops the result.
+  function testKey(i, j) {
+    const page = pageAt(i);
+    return pageId(page, i) + '#' + j + '#' + JSON.stringify(actionsOf(page)[j]);
   }
   function actionEditor(i, j, action) {
     const path = P('pages', i, 'actions', j);
@@ -1044,14 +1086,14 @@
           }),
           byText
             ? textField({ path: path + '.text', label: 'Words to click', help: 'Vouch never clicks Log out or Sign out unless you write those words here.' })
-            : textField({ path: path + '.selector', label: 'Selector', mono: true, help: 'The first element on the page that matches is clicked.', extra: btn('Pick', () => startPick('click', { page: i, action: j }), { small: true, later: S.capabilities.pick ? null : LATER_BROWSER, fkey: 'pick-sel' }) }),
+            : textField({ path: path + '.selector', label: 'Selector', mono: true, help: 'The first element on the page that matches is clicked.', extra: btn('Pick', () => startPick('click', { page: i, action: j }), { small: true, later: S.capabilities.pick ? null : LATER_BROWSER, fkey: 'pick-sel', aria: 'Pick what to click in the browser' }) }),
         ];
       }
       case 'wait':
         return [textField({ path: path + '.seconds', label: 'Seconds to wait', kind: 'number', narrow: true, help: 'For pages that fill in slowly, 0 to ' + schemaFor('wait').seconds.max + ' seconds. “Wait until” is usually better: it goes on as soon as the element is there.' })];
       case 'waitFor':
         return [
-          textField({ path: path + '.selector', label: 'Wait until this element appears (selector)', mono: true, help: 'For example #lockout-table. Vouch waits until it is on the page and visible.', extra: btn('Pick', () => startPick('waitFor', { page: i, action: j }), { small: true, later: S.capabilities.pick ? null : LATER_BROWSER, fkey: 'pick-wf' }) }),
+          textField({ path: path + '.selector', label: 'Wait until this element appears (selector)', mono: true, help: 'For example #lockout-table. Vouch waits until it is on the page and visible.', extra: btn('Pick', () => startPick('waitFor', { page: i, action: j }), { small: true, later: S.capabilities.pick ? null : LATER_BROWSER, fkey: 'pick-wf', aria: 'Pick the element to wait for in the browser' }) }),
           textField({ path: path + '.timeoutSec', label: 'At most (seconds)', kind: 'number', whole: true, narrow: true, placeholder: String(effOverride(i, 'navigationTimeoutSec').value) + ' (page load limit)', help: 'Empty: the page load time limit. If the element does not appear in time, the page gets a warning.' }),
         ];
       case 'pause':
@@ -1076,7 +1118,11 @@
           }),
         ];
         if (mode === 'area') {
-          parts.push(textField({ path: path + '.scroll.selector', label: 'Area to scroll (selector)', mono: true, help: 'For example #main.', extra: btn('Pick', () => startPick('area', { page: i, action: j }), { small: true, later: S.capabilities.pick ? null : LATER_BROWSER, fkey: 'pick-ar' }) }));
+          parts.push(textField({ path: path + '.scroll.selector', label: 'Area to scroll (selector)', mono: true, help: 'For example #main.', extra: btn('Pick', () => startPick('scroll', { page: i, action: j }), { small: true, later: S.capabilities.pick ? null : LATER_BROWSER, fkey: 'pick-ar', aria: 'Pick the area to scroll in the browser' }) }));
+        }
+        if (mode !== 'area') {
+          parts.push(h('div', { class: 'button-row' },
+            btn('Pick the area to scroll in the browser', () => startPick('scroll', { page: i, action: j }), { small: true, later: S.capabilities.pick ? null : LATER_BROWSER, fkey: 'pick-ar2', title: 'Point inside what should be scrolled; the page itself gives “The whole page”' })));
         }
         if (mode !== 'none') {
           parts.push(radioField({
@@ -1171,9 +1217,10 @@
       try {
         const result = await whileServerDialog(() => api('POST', '/api/dialog', { kind: kind, title: title }));
         if (result.cancelled) return;
+        // The preview remembers the value it was made for: after Undo the path changes
+        // back and the preview is no longer shown with it (Redo shows it again).
+        if (kind === 'image') S.logo = result.logo ? Object.assign({}, result.logo, { value: result.value || result.path }) : null;
         change(() => setAt(S.config, path, result.value || result.path), { render: 'all' });
-        if (kind === 'image') S.logo = result.logo || null;
-        renderAll();
       } catch (e) { showError(e); }
     }, { small: true, fkey: 'browse:' + path });
   }
@@ -1248,15 +1295,16 @@
     const level = eff('report.classification') || '';
     const chip = level ? h('span', { class: 'cls-chip cls-' + level.toLowerCase(), text: level.toUpperCase() }) : h('span', { class: 'chip chip-muted', text: 'No marking' });
     const logoPath = eff('report.logoPath') || '';
-    const logo = S.logo && S.logo.dataUri && logoPath ? h('img', { class: 'logo-thumb', src: S.logo.dataUri, alt: 'Logo preview' }) : null;
-    const logoNote = S.logo && S.logo.warning && logoPath ? h('p', { class: 'help warning-text', text: S.logo.warning }) : null;
+    const preview = S.logo && logoPath && S.logo.value === logoPath ? S.logo : null;
+    const logo = preview && preview.dataUri ? h('img', { class: 'logo-thumb', src: preview.dataUri, alt: 'Logo preview' }) : null;
+    const logoNote = preview && preview.warning ? h('p', { class: 'help warning-text', text: preview.warning }) : null;
     panel.replaceChildren(h('div', { class: 'stack' },
       section('Report heading', null, [
         textField({ path: 'report.title', label: 'Title', placeholder: 'Audit Evidence Report', help: 'The report’s main heading.' }),
         selectField({ path: 'report.classification', label: 'Classification', value: level, options: CLASSIFICATIONS.map(([v, l]) => ({ value: v, label: l })), extra: chip,
           help: 'A coloured banner at the top and bottom of the report, repeated on every printed page.' }),
         textField({ path: 'report.logoPath', label: 'Logo (optional)', mono: true, extra: browseButton('report.logoPath', 'image', 'Choose a logo'),
-          commit: raw => { if (raw === '') clearValue('report.logoPath'); else setAt(S.config, 'report.logoPath', raw); S.logo = null; },
+          commit: raw => { if (raw === '') clearValue('report.logoPath'); else setAt(S.config, 'report.logoPath', raw); },
           help: 'PNG, JPEG, GIF or SVG, at most 1 MB. It is copied into the report. A relative path is read from the folder of this configuration file.' }),
         logo ? h('div', { class: 'logo-row' }, logo) : (logoPath && !logoNote ? h('p', { class: 'help', text: 'Choose the file with Browse… to see a preview.' }) : null),
         logoNote,
@@ -1409,47 +1457,246 @@
   }
   Object.assign(window.VouchDesigner, { refreshCommand });
 
-  // ------------------------------------------------------------------ later-step hooks (browser, picker, runs)
+  // ------------------------------------------------------------------ the audit browser
+  /*
+    The status strip under the header: connected (page title and address, Tidy windows,
+    a zoom preview with "Show at 100%"), connecting, or not connected with the reason,
+    what to do about it, and Retry. Page text is shown with textContent only.
+  */
+  function renderBrowser() {
+    const box = $('#browser-strip');
+    if (!box || S.closed) return;
+    const b = S.browser || {};
+    const parts = [];
+    let cls = 'is-off';
+    if (b.connected) {
+      cls = 'is-on';
+      parts.push(h('div', { class: 'bs-line' },
+        h('span', { class: 'bs-dot', 'aria-hidden': 'true' }),
+        h('span', { class: 'bs-state', text: 'Browser connected' }),
+        h('span', { class: 'bs-actions' }, btn('Tidy windows', () => tidyWindows(), { small: true, fkey: 'bs-tidy', title: 'Put the browser on the left and this window on the right' }))),
+        h('p', { class: 'bs-page' },
+          h('span', { class: 'bs-title', text: b.title || '(no title)' }),
+          h('span', { class: 'bs-url', text: b.url || '' })));
+      if (b.zoom && b.zoom.percent && b.zoom.percent !== 100) {
+        parts.push(h('p', { class: 'bs-zoom' },
+          h('strong', { text: 'Zoom preview: ' }),
+          (b.zoom.page ? '“' + b.zoom.page + '”' : 'This page') + ' is shown at ' + b.zoom.percent + '%, as the run will show it. ',
+          btn('Show at 100%', () => zoomOff(), { small: true, fkey: 'bs-zoomoff' })));
+      }
+      if (b.settingsChanged) {
+        parts.push(h('p', { class: 'bs-note' }, 'The saved configuration names another browser (port or profile) than the one connected. ',
+          btn('Reconnect', () => retryBrowser(), { small: true, fkey: 'bs-reconnect' })));
+      }
+      if (b.notice) parts.push(h('p', { class: 'bs-note', text: b.notice }));
+    }
+    else if (b.connecting || S.connecting) {
+      cls = 'is-busy';
+      parts.push(h('div', { class: 'bs-line' }, h('span', { class: 'bs-dot', 'aria-hidden': 'true' }), h('span', { class: 'bs-state', text: 'Connecting to the audit Edge…' })));
+    }
+    else {
+      const problem = b.problem || { message: b.message || 'The audit Edge is not connected.', causes: [] };
+      parts.push(h('div', { class: 'bs-line' },
+        h('span', { class: 'bs-dot', 'aria-hidden': 'true' }),
+        h('strong', { class: 'bs-state', text: 'Browser not connected' }),
+        h('span', { class: 'bs-actions' }, btn('Retry', () => retryBrowser(), { small: true, primary: true, fkey: 'bs-retry', title: 'Connect to the audit Edge again, opening it if needed' }))),
+        h('p', { class: 'bs-problem', text: problem.message }),
+        Array.isArray(problem.causes) && problem.causes.length ? h('ul', { class: 'bs-causes' }, problem.causes.map(c => h('li', { text: c }))) : null,
+        h('p', { class: 'help', text: 'You can still edit and save. Type addresses, words and selectors yourself until the browser is connected.' }));
+    }
+    box.className = 'browser-strip ' + cls;
+    keepFocus(() => box.replaceChildren(...parts));
+  }
+  function browserAnnouncement(before, after) {
+    if (!before || before.connected === after.connected) return '';
+    if (after.connected) return 'Browser connected' + (after.title ? ': ' + after.title : '') + '.';
+    return 'Browser not connected: ' + ((after.problem && after.problem.message) || after.message || '');
+  }
+  async function retryBrowser() {
+    S.connecting = true;
+    renderBrowser();
+    try { S.browser = await api('POST', '/api/browser/connect', {}); }
+    catch (e) { showError(e); }
+    finally { S.connecting = false; }
+    await poll(true);
+    renderBrowser();
+    announce(S.browser.connected ? 'Browser connected.' : 'Still not connected: ' + ((S.browser.problem && S.browser.problem.message) || ''));
+  }
+  async function tidyWindows() {
+    try { const r = await api('POST', '/api/browser/layout', {}); toast(r.message || 'Done.'); }
+    catch (e) { showError(e); }
+  }
+  async function zoomOff() {
+    try { S.browser = await api('POST', '/api/browser/zoom-off', {}); renderBrowser(); announce('The page is shown at 100% again.'); }
+    catch (e) { showError(e); }
+  }
   async function goToUrl(i) {
     const page = pageAt(i);
-    try { await api('POST', '/api/browser/navigate', { url: page ? page.url : '' }); }
-    catch (e) { showError(e); }
+    toast('Opening the page in the browser…');
+    try {
+      const r = await api('POST', '/api/browser/navigate', { url: page && typeof page.url === 'string' ? page.url : '', config: S.config, pageIndex: i });
+      toast((r.status === 'loaded' ? 'Opened: ' : '') + (r.status === 'loaded' ? (r.title || r.url) : r.message));
+      await poll(true);
+    } catch (e) { showError(e, 'The page was not opened.'); }
   }
   async function addPageFromCurrentTab() {
     try {
-      const current = await api('GET', '/api/browser/current');
-      addPage({ name: current.title || 'New page', url: current.url || '' });
-    } catch (e) { showError(e); }
+      const current = await api('POST', '/api/page/from-current', {});
+      addPage({ name: current.name || 'New page', url: current.url || '' });
+    } catch (e) { showError(e, 'No page was added.'); }
   }
-  /* kind: 'click' | 'area' | 'waitFor'; target: { page, action?, override? } */
-  async function startPick(kind, target) {
+
+  // ------------------------------------------------------------------ picking
+  const PICK_TEXT = {
+    click: 'Click what Vouch should click, in the Edge window. Press Esc there to cancel.',
+    scroll: 'Click inside the area Vouch should scroll, in the Edge window. Press Esc there to cancel.',
+    waitFor: 'Click the element Vouch should wait for, in the Edge window. Press Esc there to cancel.',
+  };
+  const ROBUST = { best: 'Most robust', good: 'Robust', fair: 'Less robust', fragile: 'Fragile' };
+  /*
+    A dialog that cannot be closed while its work is pending: Chromium lets a second Esc
+    close a modal dialog even when its "cancel" is prevented, so the dialog opens itself
+    again until release() is called.
+  */
+  function holdOpen(dialog) {
+    let held = true;
+    const reopen = () => { if (held && !dialog.open && dialog.isConnected) { try { dialog.showModal(); } catch (e) { /* not possible now */ } } };
+    dialog.addEventListener('close', reopen);
+    if (!dialog.open) dialog.showModal();
+    return () => { held = false; dialog.removeEventListener('close', reopen); if (dialog.open) dialog.close(); };
+  }
+  /* mode: 'click' | 'scroll' | 'waitFor'; target: { page, action?, override? } */
+  async function startPick(mode, target) {
+    if (S.picking) return;
+    let release = null;
+    S.picking = { mode: mode, target: target };
     try {
-      await api('POST', '/api/pick/start', { kind: kind });
-      toast('Click the element in the browser window. Press Esc there to cancel.');
+      await api('POST', '/api/pick/start', { mode: mode });
+      $('#picking-text').textContent = PICK_TEXT[mode];
+      $('#picking-notice').hidden = true;
+      release = holdOpen($('#picking'));
+      announce('Waiting for you to click in the browser. Press Esc there to cancel.');
+      let state;
       for (;;) {
         await new Promise(r => setTimeout(r, 400));
-        const state = await api('GET', '/api/pick');
-        if (state.state === 'picking') continue;
-        if (state.state === 'done' && state.result) applyPick(kind, target, state.result);
-        else if (state.message) toast(state.message);
-        return;
+        state = await api('GET', '/api/pick');
+        if (state.state !== 'picking') break;
+        if (state.notice) { $('#picking-notice').textContent = state.notice; $('#picking-notice').hidden = false; }
       }
-    } catch (e) { showError(e); }
+      release(); release = null;
+      if (state.state === 'done' && state.result) {
+        const choice = await chooseCandidate(mode, state.result);
+        if (choice) applyPick(mode, target, choice);
+        else announce('Nothing was recorded.');
+      }
+      else if (state.state === 'cancelled') { toast(state.message || 'Picking was cancelled.'); announce(state.message || 'Picking was cancelled.'); }
+      else await ask({ title: 'Nothing was recorded', body: [state.message || 'Picking stopped.'], buttons: [{ label: 'OK', value: true, primary: true }], cancelValue: true });
+    } catch (e) { showError(e, 'Picking did not work.'); }
+    finally { if (release) release(); S.picking = null; }
   }
-  function applyPick(kind, target, result) {
+  async function cancelPick() {
+    try { await api('POST', '/api/pick/cancel', {}); } catch (e) { /* the poll reports it */ }
+  }
+  function candidateValueLabel(mode, c) {
+    if (mode === 'scroll') return 'Area to scroll (selector)';
+    if (mode === 'waitFor') return 'Element to wait for (selector)';
+    return c.kind === 'text' ? 'Words to click' : 'Selector of what to click';
+  }
+  /*
+    Shows the verified candidates, best first and pre-selected: the plain description,
+    how robust it is, and the exact words or selector, which can still be edited. An
+    edited value has not been checked against the page, and the dialog says so.
+  */
+  async function chooseCandidate(mode, result) {
+    const cands = Array.isArray(result.candidates) ? result.candidates : [];
+    if (!cands.length) return null;
+    const element = result.element || {};
+    let selected = 0;
+    const name = uid('cand');
+    const legendId = uid('lg');
+    const inputId = uid('f');
+    const input = h('input', { type: 'text', id: inputId, class: 'input mono', value: cands[0].value, spellcheck: 'false', autocomplete: 'off', dataset: { fkey: 'cand-value' } });
+    const inputLabel = h('label', { for: inputId, text: candidateValueLabel(mode, cands[0]) });
+    const editNote = h('p', { class: 'help', text: 'You can change it. A changed value is not checked against the page; use Test afterwards.' });
+    const valueBlock = h('div', { class: 'field cand-edit', hidden: cands[0].kind === 'page' }, inputLabel, input, editNote);
+    const group = h('div', { class: 'radio-group cand-list', role: 'radiogroup', 'aria-labelledby': legendId });
+    cands.forEach((c, k) => {
+      const id = uid('o');
+      const descId = uid('d');
+      const radio = h('input', { type: 'radio', name: name, id: id, class: 'radio', value: String(k), checked: k === 0, 'aria-describedby': descId, dataset: { fkey: 'cand:' + k } });
+      radio.addEventListener('change', () => {
+        if (!radio.checked) return;
+        selected = k;
+        input.value = c.value;
+        inputLabel.textContent = candidateValueLabel(mode, c);
+        valueBlock.hidden = c.kind === 'page';
+      });
+      group.appendChild(h('div', { class: 'radio-row cand-row' }, radio, h('div', { class: 'cand-main' },
+        h('label', { for: id, text: sentence(c.description) }),
+        h('span', { class: 'chip cand-' + c.robustness, text: ROBUST[c.robustness] || c.robustness }),
+        h('p', { class: 'help', id: descId, text: c.note }),
+        c.kind === 'page' ? null : h('code', { class: 'cand-value', text: c.value }))));
+    });
+    const what = element.kind === 'window' ? 'the whole page' : ('the ' + (element.noun || 'element') + (element.text ? ' “' + shortText(element.text, 60) + '”' : '') + (element.frame ? ' in the frame ' + element.frame : ''));
+    const body = [
+      h('p', {}, 'You picked ', h('strong', { text: what }), '. Vouch checked each way below in the page: replaying it reaches exactly that.'),
+      element.climbedNote ? h('p', { class: 'help', text: element.climbedNote }) : null,
+      h('p', { class: 'legend', id: legendId, text: cands.length === 1 ? 'The way Vouch can record it:' : 'Choose how Vouch records it (the first is the most robust):' }),
+      group,
+      valueBlock,
+    ].filter(Boolean);
+    const ok = await ask({ title: 'Record this?', body: body, buttons: [{ label: 'Use this', value: true, primary: true }, { label: 'Cancel', value: false }], cancelValue: false });
+    if (!ok) return null;
+    const c = cands[selected];
+    const value = input.value.trim();
+    if (c.kind !== 'page' && !value) { toast('Nothing was recorded: the value was empty.'); return null; }
+    return { candidate: c, value: c.kind === 'page' ? '' : value, edited: c.kind !== 'page' && value !== c.value };
+  }
+  function applyPick(mode, target, choice) {
     const i = target.page;
-    if (kind === 'click' && target.action === undefined) { addAction(i, result.action || { type: 'click', selector: result.selector || '' }); return; }
-    if (kind === 'click') { change(() => setAt(S.config, P('pages', i, 'actions', target.action), result.action || { type: 'click', selector: result.selector }), {}); return; }
-    if (kind === 'area' && target.action === undefined) { addAction(i, { type: 'capture', scroll: { mode: 'area', selector: result.selector, as: 'segments' } }); return; }
-    if (kind === 'area') { change(() => setAt(S.config, P('pages', i, 'actions', target.action, 'scroll', 'selector'), result.selector), {}); return; }
-    if (kind === 'waitFor' && target.override) { change(() => setAt(S.config, P('pages', i, 'overrides', 'waitFor'), result.selector), {}); return; }
-    if (kind === 'waitFor') change(() => setAt(S.config, P('pages', i, 'actions', target.action, 'selector'), result.selector), {});
+    const c = choice.candidate;
+    const said = sentence(c.description) + (choice.edited ? ' (edited by hand)' : '');
+    if (mode === 'click') {
+      const action = c.kind === 'text' ? { type: 'clickText', text: choice.value } : { type: 'click', selector: choice.value };
+      if (target.action === undefined) addAction(i, action);
+      else { S.clickStash = null; change(() => setAt(S.config, P('pages', i, 'actions', target.action), action), {}); }
+    }
+    else if (mode === 'scroll') {
+      if (target.action === undefined) {
+        addAction(i, { type: 'capture', scroll: c.kind === 'page' ? { mode: 'page' } : { mode: 'area', selector: choice.value, as: 'segments' } });
+      }
+      else {
+        change(() => {
+          const a = getAt(S.config, P('pages', i, 'actions', target.action));
+          if (!isObj(a.scroll)) a.scroll = {};
+          a.scroll.mode = c.kind === 'page' ? 'page' : 'area';
+          if (c.kind === 'page') delete a.scroll.selector; else a.scroll.selector = choice.value;
+        }, {});
+      }
+    }
+    else if (target.override) change(() => setAt(S.config, P('pages', i, 'overrides', 'waitFor'), choice.value), {});
+    else change(() => setAt(S.config, P('pages', i, 'actions', target.action, 'selector'), choice.value), {});
+    if (choice.edited) toast('Recorded as you edited it. It was not checked against the page; try it with Test.');
+    announce('Recorded: ' + said + '.');
   }
   async function testAction(i, j) {
+    const page = pageAt(i);
+    const action = actionsOf(page)[j];
+    const key = testKey(i, j);
+    S.testing = key;
+    keepFocus(renderAll);
     try {
-      const result = await api('POST', '/api/action/test', { page: pageAt(i), actionIndex: j });
-      toast((result.ok ? 'Worked: ' : 'Did not work: ') + (result.message || describeAction(actionsOf(pageAt(i))[j])));
-    } catch (e) { showError(e); }
+      const result = await api('POST', '/api/action/test', { action: action, config: S.config, pageIndex: i });
+      S.tests[key] = { ok: !!result.ok, message: result.message || '' };
+      announce((result.ok ? 'Test worked. ' : 'Test: ') + (result.message || ''));
+    } catch (e) {
+      S.tests[key] = { ok: false, message: e.message + (e.detail ? ' ' + e.detail : '') };
+      announce('Test: ' + S.tests[key].message);
+    } finally {
+      S.testing = '';
+      keepFocus(renderAll);
+      poll(true);
+    }
   }
   let runTimer = 0;
   async function startRun(kind) {
@@ -1482,7 +1729,7 @@
   async function openTarget(what) {
     try { await api('POST', '/api/open', { what: what }); } catch (e) { showError(e); }
   }
-  Object.assign(window.VouchDesigner, { goToUrl, addPageFromCurrentTab, startPick, applyPick, testAction, startRun, pollRun, stopRun, openTarget });
+  Object.assign(window.VouchDesigner, { goToUrl, addPageFromCurrentTab, startPick, cancelPick, chooseCandidate, applyPick, testAction, testKey, renderBrowser, retryBrowser, tidyWindows, zoomOff, holdOpen, startRun, pollRun, stopRun, openTarget });
 
   // ------------------------------------------------------------------ files
   /*
@@ -1491,10 +1738,9 @@
     meanwhile would race with the answer (a Save As would mark them saved).
   */
   async function whileServerDialog(fn) {
-    const busy = $('#busy');
-    if (!busy.open) busy.showModal();
+    const release = holdOpen($('#busy'));
     try { return await fn(); }
-    finally { if (busy.open) busy.close(); }
+    finally { release(); }
   }
   async function confirmDiscard(what) {
     if (!isDirty()) return true;
@@ -1642,12 +1888,18 @@
     const caps = state.capabilities || {};
     const changed = JSON.stringify(caps) !== JSON.stringify(S.capabilities);
     S.capabilities = { browser: !!caps.browser, pick: !!caps.pick, test: !!caps.test, run: !!caps.run };
+    const before = S.browser;
     S.browser = state.browser || { connected: false };
+    if (JSON.stringify(before) !== JSON.stringify(S.browser)) {
+      renderBrowser();
+      const said = browserAnnouncement(before, S.browser);
+      if (said) announce(said);
+    }
     if (state.run && state.run.state && state.run.state !== S.run.state && S.capabilities.run) pollRun();
     if (changed && S.config) renderAll();
   }
-  async function poll() {
-    if (S.closed || document.hidden) return;
+  async function poll(force) {
+    if (S.closed || (document.hidden && force !== true)) return;
     try { applyServerState(await api('GET', '/api/state')); pollFailures = 0; $('#banner').hidden = true; }
     catch (e) { pollFailures += 1; if (pollFailures >= 2) serverGone(); }
   }
@@ -1659,7 +1911,7 @@
 
   // ------------------------------------------------------------------ keyboard and window
   document.addEventListener('keydown', ev => {
-    if ($('#modal').open || $('#busy').open || S.closed) return;
+    if ($('#modal').open || $('#busy').open || $('#picking').open || S.closed) return;
     const mod = ev.ctrlKey || ev.metaKey;
     if (!mod) return;
     const key = ev.key.toLowerCase();
@@ -1686,6 +1938,9 @@
     S.token = token;
     buildChrome();
     $('#busy').addEventListener('cancel', ev => ev.preventDefault());
+    $('#picking').addEventListener('cancel', ev => ev.preventDefault());
+    $('#picking-cancel').addEventListener('click', () => cancelPick());
+    renderBrowser();
     if (!token) { showClosed('Open the Vouch Designer with Vouch-Designer.cmd (or vouch.ps1 -Designer); this address alone cannot be used.'); return; }
     let state;
     try { state = await api('GET', '/api/state'); }
