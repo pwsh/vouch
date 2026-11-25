@@ -37,7 +37,7 @@ BeforeAll {
         finally { $bitmap.Dispose() }
     }
 
-    function New-TestReport([string]$Folder, [switch]$SaveImages, [switch]$Linked, [switch]$Full) {
+    function New-TestReport([string]$Folder, [switch]$SaveImages, [switch]$Linked, [switch]$Full, [string]$Classification = 'Confidential') {
         if ($Linked) { $SaveImages = [switch]$true }
         $name = 'report'
         $imagesDir = Join-Path $Folder "images\$name"
@@ -49,13 +49,21 @@ BeforeAll {
             $fileName = "003_Admin_users_seg0$segment.jpg"
             $filePath = ''
             if ($SaveImages) { $filePath = Join-Path $imagesDir $fileName; [System.IO.File]::WriteAllBytes($filePath, $bytes) }
+            # -Full: two labelled captures of one page (index sub-entries, figure anchors).
+            $setArguments = if ($Full) { @{ CaptureNumber = $segment; Label = "Label $segment <img src=x> &period;" } } else { @{} }
             $captures.Add((New-CaptureRecord -Bytes $bytes -Url $metadata.PageUrl -SegmentIndex $segment -SegmentCount 2 `
-                -FilePath $filePath -FileName $fileName -CapturedAt $script:CapturedAt -NoBase64:$Linked))
+                -FilePath $filePath -FileName $fileName -CapturedAt $script:CapturedAt -NoBase64:$Linked @setArguments))
         }
         $item = [pscustomobject]@{
             Index = 3; Name = 'Admin – users'; Url = 'https://app.example.com/admin'; FinalUrl = 'https://app.example.com/admin/users?page=1'
             Notes = ''; StepsText = ''; ScrollFullPage = $true; Status = 'OK'; HttpStatus = 200
             Details = [System.Collections.Generic.List[string]]::new(); StepLog = [System.Collections.Generic.List[object]]::new(); Captures = $captures
+        }
+        if ($Full) {
+            $item | Add-Member -NotePropertyName Account -NotePropertyValue 'admin@example.com <b>'
+            $item.Notes = 'notes <!-- hi --> style="x"'
+            $item.Details.Add('detail & <img src=x> &nbsp;')
+            $item.StepLog.Add([pscustomobject]@{ Text = 'click:a[href="x"] > b'; Ok = $false; Message = 'No <element> &period;' })
         }
         $manifest = Get-CaptureManifest -Items @($item)
         if ($SaveImages) { [System.IO.File]::WriteAllText((Join-Path $imagesDir 'SHA256SUMS'), $manifest, [System.Text.UTF8Encoding]::new($false)) }
@@ -70,9 +78,10 @@ BeforeAll {
         $options = if ($Linked) { New-ReportOptions -EmbedImages $false -ImageFolder "images/$name" } else { $null }
         if ($Full) {
             # Everything 2.0 can add: logo, company, classification (print CSS), index, run details.
-            $options = New-ReportOptions -EmbedImages (-not $Linked) -ImageFolder $(if ($Linked) { "images/$name" } else { '' }) -Title 'Q3 <evidence>' `
-                -Classification 'Confidential' -CompanyName 'ACME' -CompanyDetails "1 Main St`nSpringfield" -Description 'Why' -Origin 'HQ' `
-                -GeneratedBy 'Jane' -PeriodFrom '2026-07-01' -PeriodTo '2026-09-30' -Account 'svc' -CaptureLogName 'report.log' `
+            $evil = 'x <img src=x> <!-- hi --> &period; &nbsp; style="x" url( '' > < & ü 日本'
+            $options = New-ReportOptions -EmbedImages (-not $Linked) -ImageFolder $(if ($Linked) { "images/$name" } else { '' }) -Title "Q3 $evil" `
+                -Classification $Classification -CompanyName "ACME $evil" -CompanyDetails "1 Main St`nSpringfield $evil" -Description "Why $evil" -Origin $evil `
+                -GeneratedBy "Jane $evil" -PeriodFrom '2026-07-01' -PeriodTo '2026-09-30' -PeriodLabel $evil -Account "svc $evil" -CaptureLogName 'report.log' `
                 -LogoDataUri 'data:image/png;base64,iVBORw0KGgo='
         }
         [System.IO.File]::WriteAllText($path, (New-HtmlReport -Items @($item) -Run $run -Options $options), [System.Text.UTF8Encoding]::new($false))
@@ -255,7 +264,7 @@ Describe 'Test-ReportIntegrity (-Verify)' {
             { param($m) "<IMG loading=""lazy"" src=""$($m.Groups[6].Value)"" data-url=""$($m.Groups[5].Value)"" class='shot' data-captured='$($m.Groups[4].Value)' data-sha256=""$($m.Groups[3].Value)"" title=""x &amp; y"" data-file=""$($m.Groups[2].Value)"" alt=""$($m.Groups[1].Value)"" decoding=async>" })
         [System.IO.File]::WriteAllText($report, $html)
         $failed = @(Test-ReportIntegrity -Path $report | Where-Object { -not $_.Ok })
-        @($failed | Where-Object Check -eq 'Report markup').Count | Should -Be 2
+        @($failed | Where-Object Check -eq 'Report markup').Count | Should -BeGreaterOrEqual 1
         @($failed | Where-Object Check -like 'Metadata *').Count | Should -Be 0 -Because 'no screenshot is accepted from such a tag'
     }
 }
@@ -269,16 +278,14 @@ Describe 'The committed example report' {
     }
 }
 
-Describe 'Get-ReportImageList' {
-    It 'reads screenshots and the logo in the generator''s form, decoding the values' {
-        $html = '<h0><img class="logo" data-vouch-logo="true" alt="Company logo" src="data:image/svg+xml;base64,PHN2Zz4="></h0><h1>T</h1>' +
-            '<img alt="x" data-file="a&amp;b.jpg" data-sha256="' + ('a' * 64) + '" data-captured="t" data-url="u" src="images/r/a%26b.jpg">' +
-            '<img src="images/r/2.jpg" data-url="u" data-captured="t" data-sha256="' + ('b' * 64) + '" data-file="2.jpg" alt="y" />'
-        $scan = Get-ReportImageList -Html $html
+Describe 'Test-ReportMarkup' {
+    It 'returns the screenshots of a genuine report with their decoded attributes' {
+        $report = New-TestReport -Folder (Join-Path $TestDrive 'markup') -Full
+        $scan = Test-ReportMarkup -Html ([System.IO.File]::ReadAllText($report))
         $scan.Problems | Should -BeNullOrEmpty
         @($scan.Images.Kind) | Should -Be @('logo', 'screenshot', 'screenshot')
-        $scan.Images[1].Attributes['DATA-FILE'] | Should -Be 'a&b.jpg'
-        $scan.Images[2].Attributes['data-sha256'] | Should -Be ('b' * 64)
+        $scan.Images[1].Attributes['data-file'] | Should -Be '003_Admin_users_seg01.jpg'
+        $scan.Images[1].Attributes['data-url'] | Should -Be 'https://app.example.com/admin/users?page=1'
     }
 }
 Describe 'Resolve-ReportImagePath (what -Verify may read)' {
@@ -379,20 +386,25 @@ Describe 'Linked reports (images as files next to the report)' {
         Copy-Item -LiteralPath (Join-Path $folder 'images\report\003_Admin_users_seg01.jpg') -Destination $outside -Force
         $html = [System.IO.File]::ReadAllText($report).Replace('src="images/report/003_Admin_users_seg01.jpg"', "src=""$Source""")
         [System.IO.File]::WriteAllText($report, $html)
+        Mock Get-Sha256Hex { throw 'never reached for the outside file' } -ParameterFilter { $false }
         $results = @(Test-ReportIntegrity -Path $report)
-        $row = $results | Where-Object Check -eq 'Image 003_Admin_users_seg01.jpg'
-        $row.Ok | Should -BeFalse
-        $row.Detail | Should -BeLike 'not checked:*'
-        @($results | Where-Object Check -eq 'Metadata 003_Admin_users_seg01.jpg').Count | Should -Be 0 -Because 'the file was never read'
+        ($results | Where-Object Check -eq 'Report markup').Detail | Should -BeLike "A screenshot's image address is not in the form Vouch writes*"
+        @($results | Where-Object Check -like '* 003_Admin_users_seg01.jpg' | Where-Object Check -notlike 'File *').Count | Should -Be 0 -Because 'the screenshot is refused before any file is read'
+        ($results | Where-Object Check -eq 'Manifest').Ok | Should -BeFalse
+    }
+
+    It 'Resolve-ReportImagePath still refuses <Source> on its own' -ForEach @(
+        @{ Source = '../outside.jpg' }, @{ Source = 'C:/outside.jpg' }, @{ Source = 'file:///C:/outside.jpg' }, @{ Source = '\\localhost\c$\outside.jpg' }
+    ) {
+        (Resolve-ReportImagePath -ReportDirectory 'C:\r' -Source $Source).Problem | Should -Not -BeNullOrEmpty
     }
 
     It 'reports a src that is neither an image nor a file as a failure, not an exception' {
         $report = New-TestReport -Folder $folder
         $html = [regex]::Replace([System.IO.File]::ReadAllText($report), 'src="data:image/jpeg;base64,[^"]*"', 'src="data:text/html;base64,PGI+"', 1)
         [System.IO.File]::WriteAllText($report, $html)
-        $row = @(Test-ReportIntegrity -Path $report) | Where-Object Check -eq 'Image 003_Admin_users_seg01.jpg'
-        $row.Ok | Should -BeFalse
-        $row.Detail | Should -BeLike '*not an embedded JPEG or PNG*'
+        $failed = @(Test-ReportIntegrity -Path $report | Where-Object { -not $_.Ok })
+        ($failed | Where-Object Check -eq 'Report markup').Detail | Should -BeLike "A screenshot's image address is not in the form Vouch writes*"
     }
 }
 
@@ -526,7 +538,7 @@ Describe 'Window capture (screen grab mocked)' {
     }
 }
 
-Describe 'What -Verify accepts: the generator''s markup only (fix round 2)' {
+Describe 'What -Verify accepts: only what Vouch writes, in the whole document (fix round 3)' {
     BeforeEach {
         $folder = Join-Path $TestDrive ([guid]::NewGuid())
         [void](New-Item -ItemType Directory -Path $folder)
@@ -536,104 +548,126 @@ Describe 'What -Verify accepts: the generator''s markup only (fix round 2)' {
             [System.IO.File]::WriteAllText($Path, (& $Change ([System.IO.File]::ReadAllText($Path))))
         }
         function Get-FailedCheck([string]$Path) { @(Test-ReportIntegrity -Path $Path | Where-Object { -not $_.Ok }) }
-        $script:Logo = '<img class="logo" data-vouch-logo="true" alt="Company logo" src="data:image/png;base64,iVBORw0KGgo=">'
+        function Get-MarkupProblem([string]$Path) { @((Get-FailedCheck $Path) | Where-Object { $_.Check -in 'Report markup', 'Report styles' }) }
+        $script:FirstShot = '<img alt="[^"]*" data-file="003_Admin_users_seg01\.jpg"[^>]*>'
     }
 
-    It 'passes a genuine 2.0 <Form> report with logo, classification, company block and index' -ForEach @(@{ Form = 'embedded'; Linked = $false }, @{ Form = 'linked'; Linked = $true }) {
-        $report = New-TestReport -Folder $folder -Linked:$Linked -Full
+    It 'passes a genuine full-featured 2.0 report (<Classification>, <Form>) with hostile user text, all of it encoded' -ForEach @(
+        @{ Classification = ''; Form = 'embedded'; Linked = $false }, @{ Classification = 'Public'; Form = 'embedded'; Linked = $false }
+        @{ Classification = 'Internal'; Form = 'linked'; Linked = $true }, @{ Classification = 'Private'; Form = 'embedded'; Linked = $false }
+        @{ Classification = 'Confidential'; Form = 'linked'; Linked = $true }, @{ Classification = 'Confidential'; Form = 'embedded'; Linked = $false }
+    ) {
+        $report = New-TestReport -Folder $folder -Linked:$Linked -Full -Classification $Classification
         $html = [System.IO.File]::ReadAllText($report)
         $html | Should -Match 'data-vouch-logo="true"'
-        $html | Should -Match '@top-center'
         $html | Should -Match 'id="contents"'
+        $html | Should -Match '<figure id="item-3-c2">'
+        $html | Should -Match '&lt;img src=x&gt;'
+        $html | Should -Match '&amp;period;'
         $results = @(Test-ReportIntegrity -Path $report)
         @($results | Where-Object { -not $_.Ok }) | Should -BeNullOrEmpty
         @($results | Where-Object Check -like 'Image *').Count | Should -Be 2
     }
 
-    It 'fails a report that hides a picture behind <Case>' -ForEach @(
-        @{ Case = 'an empty comment <!-->'; Insert = '<!--><img src="fake.png"><!-- x -->' }
-        @{ Case = 'a comment ended by --!>'; Insert = '<!-- a --!><img src="fake.png"><!-- x -->' }
-        @{ Case = 'comment marks in attribute values'; Insert = '<p title="<!--"></p><img src="fake.png"><p title="-->"></p>' }
-        @{ Case = 'comment marks in style text'; Insert = '<style>/*<!--*/</style><img src="fake.png"><style>/*-->*/</style>' }
+    # (a) The logo where screenshot 1 was, the title moved to the end, the real screenshot hidden.
+    It 'fails the logo moved into the evidence with the real screenshot hidden in <Wrapper>' -ForEach @(@{ Wrapper = 'noscript' }, @{ Wrapper = 'template' }) {
+        $report = New-TestReport -Folder $folder -Full
+        Edit-Report $report {
+            param($h)
+            $logo = [regex]::Match($h, '<img class="logo"[^>]*>').Value
+            $title = [regex]::Match($h, '<h1>[^<]*</h1>').Value
+            $shot = [regex]::Match($h, $script:FirstShot).Value
+            $h = $h.Replace($logo, '').Replace($title, '').Replace('</body>', "$title</body>")
+            $h.Replace($shot, "$logo<$Wrapper>$shot</$Wrapper>")
+        }
+        $problems = (Get-MarkupProblem $report).Detail -join ' | '
+        $problems | Should -Match "<$Wrapper> element, which Vouch never writes|company logo is not at the start"
+    }
+
+    It 'fails a picture set through <Case>' -ForEach @(
+        @{ Case = 'body background'; Old = '<body>'; New = '<body background="fake.png">'; Pattern = 'attribute background' }
+        @{ Case = 'table background'; Old = '<h2>Evidence</h2>'; New = '<h2>Evidence</h2><table background="fake.png" width="2000" height="2000"></table>'; Pattern = 'attribute background' }
+        @{ Case = 'a style attribute'; Old = '<h2>Evidence</h2>'; New = '<h2>Evidence</h2><div style="background:url(fake.png);width:1280px;height:800px"></div>'; Pattern = 'attribute style' }
+        @{ Case = 'a second style sheet'; Old = '</head>'; New = '<style>@import url(http://evil.example/x.css); figure img{content:url(fake.png)}</style></head>'; Pattern = 'styles \(CSS\) are not|exactly one' }
     ) {
-        $report = New-TestReport -Folder $folder
-        Edit-Report $report { param($h) $h.Replace('<h2>Evidence</h2>', "<h2>Evidence</h2>$Insert") }
-        $failed = Get-FailedCheck $report
-        @($failed | Where-Object Check -eq 'Report markup').Count | Should -BeGreaterOrEqual 1
-        ($failed.Detail -join ' ') | Should -Match "neither a screenshot|not in the form Vouch writes|HTML comment"
+        $report = New-TestReport -Folder $folder -Linked
+        Edit-Report $report { param($h) $h.Replace($Old, $New) }
+        ((Get-MarkupProblem $report).Detail -join ' | ') | Should -Match $Pattern
     }
 
-    It 'fails a base element hidden in an attribute value as well' {
+    It 'fails a linked src the browser and the checker would read differently (<Case>)' -ForEach @(
+        @{ Case = '&period;'; From = '003_Admin_users_seg01.jpg"'; To = '003_Admin_users_seg01&period;jpg"' }
+        @{ Case = 'a trailing &nbsp;'; From = '003_Admin_users_seg01.jpg"'; To = '003_Admin_users_seg01.jpg&nbsp;"' }
+    ) {
         $report = New-TestReport -Folder $folder -Linked
-        Edit-Report $report { param($h) $h.Replace('<head>', '<head><p title="<!--"></p><base href="http://evil.example/"><p title="-->"></p>') }
-        ((Get-FailedCheck $report).Detail -join ' ') | Should -Match '<base> element'
+        # The file the checker would have read, so only the markup rule can catch it.
+        Copy-Item -LiteralPath (Join-Path $folder 'images\report\003_Admin_users_seg01.jpg') -Destination (Join-Path $folder "images\report\003_Admin_users_seg01$($Case -replace '[^a-z]', '').jpg")
+        Edit-Report $report { param($h) ([regex][regex]::Escape($From)).Replace($h, $To, 1) }
+        @(Get-MarkupProblem $report).Count | Should -BeGreaterOrEqual 1
     }
 
-    It 'fails a forged src glued to a quoted value, though the genuine file still hashes' {
-        $report = New-TestReport -Folder $folder -Linked
-        Edit-Report $report { param($h) ([regex]' src="images/').Replace($h, ' data-x="y"src="fake.png" src="images/', 1) }
-        $failed = Get-FailedCheck $report
-        ($failed | Where-Object Check -eq 'Report markup').Detail | Should -BeLike 'An image tag is not in the form Vouch writes*'
-        $failed.Check | Should -Contain 'Manifest' -Because 'the refused screenshot is not counted'
+    It 'Resolve-ReportImagePath refuses edge spaces instead of trimming them' {
+        (Resolve-ReportImagePath -ReportDirectory 'C:\r' -Source 'images/r/x.jpg ').Problem | Should -BeLike '*starts or ends with a space'
+        (Resolve-ReportImagePath -ReportDirectory 'C:\r' -Source 'images/r/x.jpg%C2%A0').Problem | Should -BeLike '*starts or ends with a space'
     }
 
     It 'fails <Case>' -ForEach @(
-        @{ Case = 'an <image> tag'; Insert = '<image src="fake.png">'; Pattern = 'An image tag is not in the form Vouch writes*' }
-        @{ Case = 'an unquoted value with a stray quote'; Insert = '<img src=fake.png alt=x''></body></html>'; Pattern = 'An image tag is not in the form Vouch writes*' }
-        @{ Case = 'an upper-case IMG'; Insert = '<IMG alt="x" src="fake.png">'; Pattern = 'An image tag is not in the form Vouch writes*' }
-        @{ Case = 'a single-quoted value'; Insert = "<img alt='x' src=""fake.png"">"; Pattern = 'An image tag is not in the form Vouch writes*' }
-        @{ Case = 'a duplicate attribute'; Insert = '<img src="a.png" src="b.png">'; Pattern = 'An image tag names an attribute twice*' }
-        @{ Case = 'an image without a hash'; Insert = '<img alt="x" src="fake.png">'; Pattern = 'An image is neither a screenshot with its hash nor the company logo*' }
-        @{ Case = 'a Base element in other case'; Insert = '<Base href="http://evil.example/">'; Pattern = '*<base> element*' }
+        @{ Case = 'a foreign tag'; Old = '<h2>Evidence</h2>'; New = '<h2>Evidence</h2><marquee>x</marquee>'; Pattern = '<marquee> element' }
+        @{ Case = 'a foreign attribute on a known tag'; Old = '<h2>Evidence</h2>'; New = '<h2 title="x">Evidence</h2>'; Pattern = 'attribute title' }
+        @{ Case = 'an event attribute'; Old = '<body>'; New = '<body onload="x">'; Pattern = 'attribute onload' }
+        @{ Case = 'a style attribute on a screenshot'; Old = '<img alt="'; New = '<img style="content:url(x)" alt="'; Pattern = 'attribute style' }
+        @{ Case = 'an http href'; Old = 'href="#item-3"'; New = 'href="http://evil.example/"'; Pattern = 'href is not a value Vouch writes' }
+        @{ Case = 'a javascript href'; Old = 'href="#item-3"'; New = 'href="javascript:alert(1)"'; Pattern = 'href is not a value Vouch writes' }
+        @{ Case = 'a bare &'; Old = '<h2>Evidence</h2>'; New = '<h2>Evidence & more</h2>'; Pattern = 'character reference or &' }
+        @{ Case = '&period;'; Old = '<h2>Evidence</h2>'; New = '<h2>Evidence&period;</h2>'; Pattern = 'character reference or &' }
+        @{ Case = 'a raw > in text'; Old = '<h2>Evidence</h2>'; New = '<h2>Evidence > x</h2>'; Pattern = 'markup Vouch never writes' }
+        @{ Case = 'an upper-case tag'; Old = '<h2>Evidence</h2>'; New = '<H2>Evidence</H2>'; Pattern = 'markup Vouch never writes' }
+        @{ Case = 'a comment'; Old = '<h2>Evidence</h2>'; New = '<h2>Evidence</h2><!-- x -->'; Pattern = 'markup Vouch never writes' }
+        @{ Case = 'a base element'; Old = '<head>'; New = '<head><base href="http://evil.example/">'; Pattern = '<base> element' }
+        @{ Case = 'an image element'; Old = '<h2>Evidence</h2>'; New = '<h2>Evidence</h2><image src="fake.png">'; Pattern = '<image> element' }
+        @{ Case = 'a script'; Old = '<h2>Evidence</h2>'; New = '<h2>Evidence</h2><script>1</script>'; Pattern = '<script> element' }
+        @{ Case = 'a duplicate attribute'; Old = '<img alt="'; New = '<img alt="x" alt="'; Pattern = 'alt twice' }
+        @{ Case = 'an unquoted value'; Old = '<h2>Evidence</h2>'; New = '<h2>Evidence</h2><img src=fake.png>'; Pattern = 'markup Vouch never writes' }
+        @{ Case = 'a single-quoted value'; Old = '<h2>Evidence</h2>'; New = "<h2>Evidence</h2><img src='fake.png'>"; Pattern = 'markup Vouch never writes' }
+        @{ Case = 'two h1'; Old = '<h2>Evidence</h2>'; New = '<h2>Evidence</h2><h1>Again</h1>'; Pattern = '2 <h1> element' }
+        @{ Case = 'a screenshot outside its figure'; Old = '<h2>Evidence</h2>'; New = '<h2>Evidence</h2>@SHOT@'; Pattern = 'not inside the report''s evidence section' }
+        @{ Case = 'a screenshot inside an unknown element'; Old = '<figure>'; New = '<figure><object>'; Pattern = '<object> element|not nested' }
+        @{ Case = 'wrong nesting'; Old = '</figure>'; New = '</section></figure>'; Pattern = 'not nested the way Vouch writes' }
     ) {
         $report = New-TestReport -Folder $folder
-        Edit-Report $report { param($h) $h.Replace('<h2>Evidence</h2>', "<h2>Evidence</h2>$Insert") }
-        ((Get-FailedCheck $report) | Where-Object Check -eq 'Report markup').Detail | Should -BeLike $Pattern
+        Edit-Report $report {
+            param($h)
+            $replacement = $New.Replace('@SHOT@', [regex]::Match($h, $script:FirstShot).Value)
+            ([regex][regex]::Escape($Old)).Replace($h, $replacement, 1)
+        }
+        ((Get-MarkupProblem $report).Detail -join ' | ') | Should -Match $Pattern
     }
 
-    It 'fails a screenshot tag with an attribute the generator never writes (<Attribute>)' -ForEach @(@{ Attribute = 'srcset="fake.png 1x"' }, @{ Attribute = 'style="content:url(x)"' }, @{ Attribute = 'onerror="x"' }, @{ Attribute = 'sizes="1px"' }) {
-        $report = New-TestReport -Folder $folder
-        Edit-Report $report { param($h) ([regex]'<img alt=').Replace($h, "<img $Attribute alt=", 1) }
-        $failed = Get-FailedCheck $report
-        ($failed | Where-Object Check -eq 'Report markup').Detail | Should -BeLike 'An image is neither a screenshot*'
-    }
-
-    It 'fails a report with a <Element> element' -ForEach @(
-        @{ Element = 'picture'; Insert = '<picture></picture>' }, @{ Element = 'source'; Insert = '<source srcset="x.png">' }
-        @{ Element = 'object'; Insert = '<object data="x.png"></object>' }, @{ Element = 'embed'; Insert = '<embed src="x.png">' }
-        @{ Element = 'iframe'; Insert = '<iframe src="x.html"></iframe>' }, @{ Element = 'frame'; Insert = '<frame src="x.html">' }
-        @{ Element = 'svg'; Insert = '<svg><image href="x.png"/></svg>' }, @{ Element = 'video'; Insert = '<video poster="x.png"></video>' }
-        @{ Element = 'canvas'; Insert = '<canvas></canvas>' }, @{ Element = 'script'; Insert = '<script>1</script>' }
-        @{ Element = 'link'; Insert = '<link rel="stylesheet" href="x.css">' }, @{ Element = 'input'; Insert = '<input type="image" src="x.png">' }
-        @{ Element = 'meta http-equiv'; Insert = '<meta http-equiv="refresh" content="0;url=x">' }, @{ Element = 'CDATA'; Insert = '<![CDATA[x]]>' }
-        @{ Element = 'comment'; Insert = '<!-- x -->' }
-    ) {
-        $report = New-TestReport -Folder $folder
-        Edit-Report $report { param($h) $h.Replace('<h2>Evidence</h2>', "<h2>Evidence</h2>$Insert") }
-        ((Get-FailedCheck $report) | Where-Object Check -eq 'Report markup').Count | Should -BeGreaterOrEqual 1
-    }
-
-    It 'fails two logos' {
+    It 'fails a style sheet changed by one character' {
         $report = New-TestReport -Folder $folder -Full
-        Edit-Report $report { param($h) $h.Replace('<h1>', "$($script:Logo)<h1>") }
-        ((Get-FailedCheck $report) | Where-Object Check -eq 'Report markup').Detail | Should -BeLike 'The report has a second company logo*'
+        Edit-Report $report { param($h) $h.Replace('h1 { font-size: 22px;', 'h1 { font-size: 23px;') }
+        $failed = Get-FailedCheck $report
+        ($failed | Where-Object Check -eq 'Report styles').Detail | Should -BeLike "The report's styles (CSS) are not a style sheet Vouch writes*"
     }
 
-    It 'fails a logo marker on an image after the title' {
-        $report = New-TestReport -Folder $folder
-        Edit-Report $report { param($h) $h.Replace('<h2>Evidence</h2>', "<h2>Evidence</h2>$($script:Logo)") }
-        ((Get-FailedCheck $report) | Where-Object Check -eq 'Report markup').Detail | Should -BeLike 'The company logo is not at the top*'
-    }
-
-    It 'fails a logo that is not stored inside the report' {
-        $report = New-TestReport -Folder $folder
-        Edit-Report $report { param($h) $h.Replace('<h1>', '<img class="logo" data-vouch-logo="true" alt="Company logo" src="logo.png"><h1>') }
-        ((Get-FailedCheck $report) | Where-Object Check -eq 'Report markup').Detail | Should -BeLike 'The company logo is not an image stored inside the report*'
+    It 'fails <Case>' -ForEach @(
+        @{ Case = 'a second logo'; Old = '<header class="company"><img class="logo"'; New = '<header class="company">@LOGO@<img class="logo"'; Pattern = 'logo is not at the start' }
+        @{ Case = 'a logo outside the header'; Old = '<h2>Evidence</h2>'; New = '<h2>Evidence</h2>@LOGO@'; Pattern = 'logo is not at the start' }
+        @{ Case = 'a logo that is not stored in the report'; Old = 'src="data:image/png;base64,iVBORw0KGgo="'; New = 'src="logo.png"'; Pattern = 'not an image stored inside the report' }
+        @{ Case = 'a header that is not at the top'; Old = '</body>'; New = '<header class="company"></header></body>'; Pattern = 'header is not at its top|2 headers' }
+    ) {
+        $report = New-TestReport -Folder $folder -Full
+        Edit-Report $report {
+            param($h)
+            $replacement = $New.Replace('@LOGO@', [regex]::Match($h, '<img class="logo"[^>]*>').Value)
+            ([regex][regex]::Escape($Old)).Replace($h, $replacement, 1)
+        }
+        ((Get-MarkupProblem $report).Detail -join ' | ') | Should -Match $Pattern
     }
 
     It 'fails a <Form> report with one screenshot tag duplicated' -ForEach @(@{ Form = 'embedded'; Linked = $false }, @{ Form = 'linked'; Linked = $true }) {
         $report = New-TestReport -Folder $folder -Linked:$Linked
-        Edit-Report $report { param($h) $tag = [regex]::Match($h, '<img alt="[^"]*" data-file[^>]*>').Value; $h.Replace($tag, "$tag`n$tag") }
+        Edit-Report $report { param($h) $tag = [regex]::Match($h, $script:FirstShot).Value; $h.Replace($tag, "$tag`n$tag") }
         (Get-FailedCheck $report).Check | Should -Contain 'Manifest'
     }
 
@@ -656,6 +690,27 @@ Describe 'What -Verify accepts: the generator''s markup only (fix round 2)' {
         Edit-Report $report { param($h) ([regex]" $Attribute=""[^""]*""").Replace($h, '', 1) }
         $failed = Get-FailedCheck $report
         ($failed | Where-Object Check -eq 'Report markup').Detail | Should -BeLike 'An image is neither a screenshot*'
-        $failed.Check | Should -Contain 'Manifest' -Because 'the incomplete screenshot is not accepted'
+        $failed.Check | Should -Contain 'Manifest'
+    }
+}
+
+Describe 'Report style sheet pins' {
+    It 'pins every style sheet this version writes, and keeps the 1.3.0 and 2.0.0 ones' {
+        $known = Get-KnownReportCssHash
+        $current = Get-CurrentReportCssHash
+        $missing = @($current | Where-Object { -not $known.Contains($_) })
+        $missing | Should -BeNullOrEmpty -Because "the report CSS (Get-ReportCss) changed: add these SHA-256 values to Get-KnownReportCssHash and keep the old ones there, or older reports stop verifying: $($missing -join ', ')"
+        # Released style sheets: removing any of these breaks -Verify for reports made by that version.
+        foreach ($hash in 'c777d90eb3cf23596ed8e5f857508c5165ce399b7ae03676697aae9dcd251190', 'b159902f6ac1f1e8d0d58f5ef93ebc01c7c5c4d51c33cbd831195b918fd748b4',
+            '2b4c494d2f22318be79409d18f969ae47b589600f08e2a4879eea93eec0748b1', '96805324fe4f2c698b02cf5e5032a077aba5d0414c36b3c3c91ae0744f061c17',
+            '550b8033a6dc5924662ff306df27e3168166bf87aa51de75392ddaf5a83d3350', '584a9b4957c6ba72dfa3eebea97fe71e93182fdf5564f5ace1b71255930bebf0') {
+            $known.Contains($hash) | Should -BeTrue -Because "$hash is the style sheet of a released Vouch version and must stay pinned"
+        }
+    }
+
+    It 'pins the style sheet of the committed 1.3 example' {
+        $html = [System.IO.File]::ReadAllText((Join-Path -Path $PSScriptRoot -ChildPath '..\examples\live-test-2026-09-24\live-test.html'))
+        $start = $html.IndexOf('<style>') + 7
+        (Get-KnownReportCssHash).Contains((Get-ReportCssHash -Text $html.Substring($start, $html.IndexOf('</style>') - $start))) | Should -BeTrue
     }
 }

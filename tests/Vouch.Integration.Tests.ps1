@@ -28,6 +28,18 @@ BeforeAll {
     # Request-UserDecision or Show-ContinueDialog themselves.
     Mock Show-ContinueDialog { throw 'A test reached the real Vouch dialog; mock Request-UserDecision or Show-ContinueDialog.' }
 
+    # The false-rejection net for -Verify's whitelist: every report a test here produced
+    # must consist only of markup and styles -Verify accepts (Test-ReportMarkup). Called
+    # from each Describe's AfterEach; tests only tamper with image files, never markup.
+    function Assert-GeneratedReportMarkup {
+        if (-not $TestDrive -or -not (Test-Path -LiteralPath $TestDrive)) { return }
+        if ($null -eq $global:VouchCheckedReports) { $global:VouchCheckedReports = [System.Collections.Generic.HashSet[string]]::new() }
+        foreach ($file in @(Get-ChildItem -LiteralPath $TestDrive -Recurse -File -Filter '*.html' -ErrorAction SilentlyContinue)) {
+            if (-not $global:VouchCheckedReports.Add("$($file.FullName)|$($file.LastWriteTimeUtc.Ticks)")) { continue }
+            $problems = @((Test-ReportMarkup -Html ([System.IO.File]::ReadAllText($file.FullName))).Problems)
+            if ($problems.Count -gt 0) { throw "A report made by this test run fails -Verify's markup check ($($file.FullName)): $($problems -join ' | ')" }
+        }
+    }
     function Connect-TestPage {
         Close-CdpSocket
         $target = Get-CdpPageTarget -Port $script:CdpPort
@@ -43,6 +55,7 @@ BeforeAll {
 }
 
 AfterAll {
+    Remove-Variable -Name VouchCheckedReports -Scope Global -ErrorAction SilentlyContinue
     Close-CdpSocket
     Stop-HeadlessEdge -ProfileDir $script:ProfileDir
     foreach ($process in @($script:ServerProcess, $script:SlowServerProcess)) {
@@ -52,6 +65,7 @@ AfterAll {
 }
 
 Describe 'CDP plumbing' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
     BeforeAll { Connect-TestPage }
 
     It 'navigates and detects the new document as ready' {
@@ -302,6 +316,7 @@ Describe 'CDP plumbing' -Tag 'Integration' {
 }
 
 Describe 'Invoke-Main end to end (desktop functions mocked)' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
     BeforeAll {
         Close-CdpSocket
         $script:RealNewHtmlReport = ${function:New-HtmlReport}
@@ -503,6 +518,7 @@ Plain page after the slow one,$Web/ok,,N,
 }
 
 Describe 'Invoke-Main with a configuration file (desktop functions mocked)' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
     # The same pages as the CSV run above, converted to a configuration file, plus a
     # switched-off page, a page that waits for an element and a page with its own timing.
     BeforeAll {
@@ -655,6 +671,7 @@ Plain page after the slow one,$Web/ok,,N,
 }
 
 Describe 'vouch.ps1 with -ConfigPath (the real script)' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
     BeforeAll {
         function Invoke-VouchScript {
             param([string[]]$Arguments)
@@ -688,6 +705,7 @@ Describe 'vouch.ps1 with -ConfigPath (the real script)' -Tag 'Integration' {
 }
 
 Describe 'Invoke-CaptureItem on its own (one page, desktop functions mocked)' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
     # The single-page path the Designer will use: no Invoke-Main, no CSV run.
     BeforeAll {
         Connect-TestPage
@@ -742,6 +760,7 @@ Tall page,$Web/tall?px=3000,,Y,
 }
 
 Describe 'Page actions (one page at a time, desktop functions mocked)' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
     # Each page runs through Invoke-CaptureItem. The screenshot is mocked, so the mock
     # records the page's state (a JavaScript probe) at the moment each image is taken.
     BeforeAll {
@@ -1165,6 +1184,7 @@ Describe 'Page actions (one page at a time, desktop functions mocked)' -Tag 'Int
 }
 
 Describe 'Invoke-Main with several captures per page (desktop functions mocked)' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
     BeforeAll {
         Close-CdpSocket
         $script:RealNewHtmlReportForMulti = ${function:New-HtmlReport}
@@ -1244,6 +1264,7 @@ Describe 'Invoke-Main with several captures per page (desktop functions mocked)'
 }
 
 Describe 'Page zoom (headless Edge)' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
     BeforeAll {
         Connect-TestPage
         [void](Open-TestPage "$Web/ok")
@@ -1351,6 +1372,7 @@ Describe 'Page zoom (headless Edge)' -Tag 'Integration' {
 }
 
 Describe 'Capture area: page content, end to end (nothing mocked but the screen path)' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
     # A real configuration run in the headless Edge: the page images are taken by the
     # browser, so this checks the real images, their embedded metadata and -Verify.
     BeforeAll {
@@ -1528,6 +1550,7 @@ Describe 'Capture area: page content, end to end (nothing mocked but the screen 
 }
 
 Describe 'Capture area: page content as PNG, and the end of a failed run' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
     BeforeAll {
         Connect-TestPage
         Mock Set-EdgeForeground { throw 'page captures must not bring the window to the front' }
@@ -1624,6 +1647,7 @@ Describe 'Capture area: page content as PNG, and the end of a failed run' -Tag '
 }
 
 Describe 'Capture area: Edge window (window position mocked)' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
     BeforeAll {
         Connect-TestPage
         Mock Set-EdgeForeground { $null }
@@ -1704,6 +1728,7 @@ Describe 'Capture area: Edge window (window position mocked)' -Tag 'Integration'
 }
 
 Describe 'Exit codes for warning-only runs' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
     BeforeAll {
         $csv = Join-Path -Path $TestDrive -ChildPath 'warn.csv'
         "Name,Url`nExpired session,$Web/protected" | Set-Content -LiteralPath $csv -Encoding utf8
@@ -1741,6 +1766,7 @@ Describe 'Exit codes for warning-only runs' -Tag 'Integration' {
 }
 
 Describe 'Browser lifecycle' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
     BeforeEach {
         $lifecycleProfile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "vouch-test-profile-life-$(Get-Random)"
     }
@@ -1825,6 +1851,7 @@ Describe 'Browser lifecycle' -Tag 'Integration' {
 }
 
 Describe 'Running from another working directory (scheduled-task style)' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
     It 'finds captures.csv next to the script when -CsvPath is omitted' {
         # Task Scheduler starts in C:\Windows\System32 unless "Start in" is set; the
         # defaults .\captures.csv and .\reports resolve against that, not the script folder.
@@ -1845,6 +1872,7 @@ Describe 'Running from another working directory (scheduled-task style)' -Tag 'I
 }
 
 Describe 'Progress events, stop and -TabId (headless Edge, desktop functions mocked)' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
     BeforeAll {
         Close-CdpSocket
         Mock Set-EdgeForeground { $null }
@@ -2115,6 +2143,7 @@ Describe 'Progress events, stop and -TabId (headless Edge, desktop functions moc
 }
 
 Describe 'Report form, zip and opening the report (headless Edge, page capture area, nothing of the page path mocked)' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
     BeforeAll {
         Close-CdpSocket
         # The page capture area needs neither the screen nor the window; they must not be used.
@@ -2368,6 +2397,7 @@ Describe 'Report form, zip and opening the report (headless Edge, page capture a
 }
 
 Describe 'Capture log (headless Edge, page capture area)' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
     BeforeAll {
         Close-CdpSocket
         Mock Get-ScreenCapture { throw 'the screen must not be captured in a page-area run' }
