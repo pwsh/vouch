@@ -2919,12 +2919,14 @@ function Get-DefinitionActionList {
 
 function Invoke-PageAction {
     <#
-        Runs one action of a page. Every action except a capture is isolated: a failure
-        is returned in the log entry { Text; Ok; Message } and the caller carries on with
-        the next action, so a page always ends with its captures. A capture is not
-        isolated: when no screenshot can be taken the page has no evidence, and the
-        error goes to Invoke-CaptureItem, which marks the page FAILED (as before actions
-        existed).
+        Runs one action of a page. Every action is isolated: a failure is returned in the
+        log entry { Text; Ok; Message } and the caller carries on with the next action,
+        so one failed capture (a scroll that timed out, a screenshot that could not be
+        taken) does not lose the evidence of the captures after it. A failed capture
+        makes the page FAILED when it took no image at all, WARNING when it took some.
+        -PropagateCaptureError leaves a capture error to the caller instead: the one
+        implied final capture of a CSV-style page, which nothing follows, so such a page
+        ends exactly as it always has.
         A click waits SettleSeconds, then for any page it opened (Wait-StepNavigation),
         exactly as CSV steps always have.
         -Item, -CaptureContext and friends are needed for capture and pause only.
@@ -2940,7 +2942,8 @@ function Invoke-PageAction {
         [int]$CaptureNumber = 1,
         [bool]$BrowserErrorPage = $false,
         # Every scroll-area selector the page captures, for Get-ScrollTargetScript.
-        [AllowEmptyCollection()][string[]]$ExplicitAreas = @()
+        [AllowEmptyCollection()][string[]]$ExplicitAreas = @(),
+        [switch]$PropagateCaptureError
     )
 
     if (-not $Text) { $Text = ConvertTo-LegacyStepText -Action $Action }
@@ -2964,9 +2967,31 @@ function Invoke-PageAction {
         $scroll = $Action['scroll']
         $mode = if ($scroll -is [System.Collections.IDictionary] -and $scroll['mode']) { [string]$scroll['mode'] } else { 'none' }
         $selector = if ($scroll -is [System.Collections.IDictionary] -and $scroll['selector']) { [string]$scroll['selector'] } else { '' }
-        Invoke-ScrollCapture -Item $Item -ScrollMode $mode -ScrollSelector $selector -ExplicitAreas $ExplicitAreas `
-            -CaptureNumber $CaptureNumber -Label ([string]$Action['label']) -BrowserErrorPage $BrowserErrorPage `
-            -Settings $Settings -CaptureContext $CaptureContext
+        $label = [string]$Action['label']
+        $imagesBefore = $Item.Captures.Count
+        try {
+            Invoke-ScrollCapture -Item $Item -ScrollMode $mode -ScrollSelector $selector -ExplicitAreas $ExplicitAreas `
+                -CaptureNumber $CaptureNumber -Label $label -BrowserErrorPage $BrowserErrorPage `
+                -Settings $Settings -CaptureContext $CaptureContext
+        }
+        catch {
+            if ($PropagateCaptureError) { throw }
+            $taken = $Item.Captures.Count - $imagesBefore
+            $which = if ($label) { "Capture $CaptureNumber ($label)" } else { "Capture $CaptureNumber" }
+            if ($taken -eq 0) {
+                $Item.Status = 'FAILED'
+                $Item.Details.Add("$which failed and took no screenshot: $($_.Exception.Message)")
+            }
+            else {
+                if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+                $Item.Details.Add("$which stopped after $taken screenshot(s); the rest of it is missing: $($_.Exception.Message)")
+            }
+            $entry.Ok = $false
+            $entry.Message = $_.Exception.Message
+            # Leave the area at its top for the actions and captures that follow.
+            try { [void](Invoke-CdpEval -Expression 'window.__vouchTarget && window.__vouchTarget.to(0)' -TimeoutSec 10) }
+            catch { Write-Verbose "Could not scroll back to the top: $($_.Exception.Message)" }
+        }
         return $entry
     }
 
@@ -4253,11 +4278,13 @@ function Invoke-CaptureItem {
                 $failureLine = Add-StepFailureDetail -Item $Item -Failed $failedSteps -Total $stepCount -Position $failureLine
                 if ($stepsSinceUrl -gt 0 -and -not $browserErrorPage) { $Item.FinalUrl = Get-CurrentPageUrl }
                 $stepsSinceUrl = 0
+                # The one final capture of a page is implied, as in a CSV row: its errors
+                # end the page as they always have. Any other capture is a step of its own.
+                $implied = $captureCount -eq 1 -and $position -eq $actions.Count - 1
                 $entry = Invoke-PageAction -Action $action -Settings $Settings -Item $Item -CaptureContext $CaptureContext `
-                    -CaptureNumber $captureNumber -BrowserErrorPage $browserErrorPage -ExplicitAreas $explicitAreas
-                # The one final capture of a page is implied, as in a CSV row; any other
-                # capture is a step of its own.
-                if (-not ($captureCount -eq 1 -and $position -eq $actions.Count - 1)) { $Item.StepLog.Add($entry) }
+                    -CaptureNumber $captureNumber -BrowserErrorPage $browserErrorPage -ExplicitAreas $explicitAreas `
+                    -PropagateCaptureError:$implied
+                if (-not $implied) { $Item.StepLog.Add($entry) }
                 continue
             }
 

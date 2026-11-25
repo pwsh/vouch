@@ -96,8 +96,9 @@ Describe 'CDP plumbing' -Tag 'Integration' {
             Invoke-CdpEval -Expression 'document.title' | Should -Be 'Audit Log'
         }
 
-        It 'clicktext: a partial match never lands on a sign-out link' {
-            # 'Log' has no exact match; the first partial match in DOM order is "Log out".
+        It 'clicktext: a partial match takes the shortest label' {
+            # 'Log' has no exact match; of the partial matches "Log out", "Audit Log" and
+            # "Logs", "Logs" is the shortest. The sign-out guard is tested on /signout.
             Invoke-ClickText -Text 'Log'
             Invoke-CdpEval -Expression 'document.title' | Should -Be 'Logs'
         }
@@ -114,7 +115,7 @@ Describe 'CDP plumbing' -Tag 'Integration' {
 
         It 'clicktext find-only names the element the click then hits (<Case>)' -ForEach @(
             @{ Case = 'exact, a hidden twin first'; Text = 'Audit Log'; Id = 't-audit'; Exact = $true; Title = 'Audit Log' }
-            @{ Case = 'partial, never the sign-out link'; Text = 'Log'; Id = 't-logs'; Exact = $false; Title = 'Logs' }
+            @{ Case = 'partial, the shortest label'; Text = 'Log'; Id = 't-logs'; Exact = $false; Title = 'Logs' }
             @{ Case = 'sign-out when asked for it'; Text = 'log out'; Id = 'signout'; Exact = $true; Title = 'SIGNED OUT' }
         ) {
             $found = Invoke-CdpEval -Expression (Get-ClickTextScript -Text $Text -FindOnly)
@@ -126,6 +127,16 @@ Describe 'CDP plumbing' -Tag 'Integration' {
             Invoke-CdpEval -Expression 'document.title' | Should -Be 'Tabs' -Because 'find-only clicks nothing'
             Invoke-ClickText -Text $Text
             Invoke-CdpEval -Expression 'document.title' | Should -Be $Title
+        }
+
+        It 'clicktext: a partial match skips a sign-out link even when it is the shortest (find-only and click)' {
+            [void](Open-TestPage "$Web/signout")
+            $found = Invoke-CdpEval -Expression (Get-ClickTextScript -Text 'log' -FindOnly)
+            $found.id | Should -Be 'logsettings'
+            $found.exact | Should -BeFalse
+            Invoke-CdpEval -Expression 'document.title' | Should -Be 'Sign out'
+            Invoke-ClickText -Text 'log'
+            Invoke-CdpEval -Expression 'document.title' | Should -Be 'LOG SETTINGS'
         }
 
         It 'clicktext find-only says when only hidden elements match' {
@@ -713,7 +724,11 @@ Describe 'Page actions (one page at a time, desktop functions mocked)' -Tag 'Int
         Mock Set-EdgeForeground { $null }
         $global:VouchShots = [System.Collections.Generic.List[string]]::new()
         $global:VouchShotProbe = ''
+        $global:VouchShotCalls = 0
+        $global:VouchFailShots = @()
         Mock Get-ScreenCapture {
+            $global:VouchShotCalls++
+            if ($global:VouchFailShots -contains $global:VouchShotCalls) { throw 'Simulated screen capture failure' }
             $state = ''
             if ($global:VouchShotProbe) { $state = [string](Invoke-CdpEval -Expression $global:VouchShotProbe -TimeoutSec 10) }
             $global:VouchShots.Add($state)
@@ -726,9 +741,13 @@ Describe 'Page actions (one page at a time, desktop functions mocked)' -Tag 'Int
                 [Parameter(Mandatory)][object[]]$Actions,
                 [string]$Probe = 'document.title',
                 [string]$WaitFor = '',
-                [int]$TimeoutSec = 10
+                [int]$TimeoutSec = 10,
+                # Screenshot calls (1, 2, ...) that throw.
+                [int[]]$FailShots = @()
             )
             $global:VouchShots.Clear()
+            $global:VouchShotCalls = 0
+            $global:VouchFailShots = $FailShots
             $global:VouchShotProbe = $Probe
             $definition = ConvertTo-CaptureDefinition -Index 7 -Page ([ordered]@{ name = 'Actions'; url = $Url; actions = $Actions })
             $run = Resolve-RunSettings -BoundParameters @{} -Config $null -Defaults @{
@@ -751,7 +770,7 @@ Describe 'Page actions (one page at a time, desktop functions mocked)' -Tag 'Int
 
     AfterAll {
         Close-CdpSocket
-        Remove-Variable -Name VouchShots, VouchShotProbe -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable -Name VouchShots, VouchShotProbe, VouchShotCalls, VouchFailShots -Scope Global -ErrorAction SilentlyContinue
     }
 
     It 'takes one capture set per tab: click A, capture, click B, capture' {
@@ -783,6 +802,51 @@ Describe 'Page actions (one page at a time, desktop functions mocked)' -Tag 'Int
         @($item.Details | Where-Object { $_ -like 'Completed with errors*' }) | Should -Be @('Completed with errors: 2 of 3 step(s) failed.')
         @($item.StepLog.Ok) | Should -Be @($false, $true, $false, $true, $true)
         $result.Shots | Should -Be @('Tabs', 'Logs')
+    }
+
+    It 'a capture that takes no screenshot fails the page, and the next actions still run' {
+        $result = Invoke-TestPage -Url "$Web/tabs" -FailShots 1 -Actions @(
+            (New-Capture 'General tab')
+            [ordered]@{ type = 'click'; selector = '#t-logs' }
+            (New-Capture 'Logs tab'))
+        $item = $result.Item
+        $item.Status | Should -Be 'FAILED'
+        @($item.Details | Where-Object { $_ -like 'Capture 1 (General tab) failed and took no screenshot: *Simulated*' }).Count |
+            Should -Be 1 -Because ($item.Details -join ' | ')
+        ($item.Details -join ' ') | Should -Not -Match 'Unhandled error'
+        @($item.StepLog | ForEach-Object { "$($_.Text)|$($_.Ok)" }) |
+            Should -Be @('capture:General tab|False', 'click:#t-logs|True', 'capture:Logs tab|True')
+        @($item.Captures.FileName) | Should -Be @('007_Actions_c02_seg01.jpg')
+        $result.Shots | Should -Be @('Logs')
+    }
+
+    It 'a capture that stops after some segments is a warning, and the next capture is complete' {
+        $result = Invoke-TestPage -Url "$Web/tworegions" -FailShots 2 -Probe "document.getElementById('left').scrollTop + '|' + document.getElementById('right').scrollTop" -Actions @(
+            (New-Capture 'Left' 'area' '#left')
+            (New-Capture 'Right' 'area' '#right'))
+        $item = $result.Item
+        $item.Status | Should -Be 'WARNING'
+        @($item.Details | Where-Object { $_ -like 'Capture 1 (Left) stopped after 1 screenshot(s)*Simulated*' }).Count |
+            Should -Be 1 -Because ($item.Details -join ' | ')
+        $item.StepLog[0].Ok | Should -BeFalse
+        $item.StepLog[1].Ok | Should -BeTrue
+        @($item.Captures | Where-Object CaptureNumber -eq 1).Count | Should -Be 1
+        $second = @($item.Captures | Where-Object CaptureNumber -eq 2)
+        $second.Count | Should -BeGreaterOrEqual 2
+        $second[-1].SegmentIndex | Should -Be $second[-1].SegmentCount
+        # The second set starts with the left area back at its top.
+        $result.Shots[1] | Should -Match '^0\|0$'
+    }
+
+    It 'the one final capture of a CSV-style page still ends the page as before when it fails' {
+        $result = Invoke-TestPage -Url "$Web/tabs" -FailShots 1 -Actions @(
+            [ordered]@{ type = 'click'; selector = '#t-logs' }
+            (New-Capture))
+        $item = $result.Item
+        $item.Status | Should -Be 'FAILED'
+        ($item.Details -join ' ') | Should -Match 'Unhandled error while capturing this item: Simulated'
+        @($item.StepLog | ForEach-Object { "$($_.Text)|$($_.Ok)" }) | Should -Be @('click:#t-logs|True')
+        $item.Captures.Count | Should -Be 0
     }
 
     It 'scrolls each named area in turn and does not report the other as missed' {

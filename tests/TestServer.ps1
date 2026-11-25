@@ -133,6 +133,13 @@ while ($listener.IsListening) {
 '@
                 Send-Response $context 200 (Page 'Tabs' $body)
             }
+            '^/signout$' {
+                # For "log", the sign-out link is the shortest partial match: only the
+                # sign-out guard keeps clicktext away from it.
+                $body = "<a href='#' id='signout' onclick=""document.title='SIGNED OUT';return false;"">Log out</a>" +
+                    "<button id='logsettings' onclick=""document.title='LOG SETTINGS'"">Change log settings</button>"
+                Send-Response $context 200 (Page 'Sign out' $body)
+            }
             '^/slow$' {
                 $seconds = if ($query['s']) { [int]$query['s'] } else { 10 }
                 Start-Sleep -Seconds $seconds
