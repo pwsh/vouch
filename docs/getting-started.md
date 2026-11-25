@@ -747,7 +747,26 @@ A CSV run in this version also writes, compared with earlier versions:
 The columns of a CSV file are **Name**, **Url**, **Steps** (optional:
 `clicktext:Words`, `wait:3`, `click:#selector`, separated by `;`), **ScrollFullPage**
 (`Y`/`N`) and **Notes** (optional). `captures.template.csv` has an example row for each
-common situation.
+common situation. The same examples, ready to paste into Notepad (keep the first line
+only once, at the top of your file):
+
+```text
+Name,Url,Steps,ScrollFullPage,Notes
+Simple page - one screen,https://app.example.com/admin/security,,N,The page is right as it opens.
+Long list - whole page,https://app.example.com/admin/users?role=admin,,Y,Whole page - for user lists and logs.
+Click a tab by its words,https://app.example.com/settings,clicktext:Password Policy,N,Clicks the tab showing these words.
+Two clicks in a row,https://app.example.com/settings,clicktext:Security; clicktext:Multi-factor authentication,N,Steps run left to right.
+Slow page - wait first,https://reports.example.com/backup-status,wait:5,N,Waits 5 seconds before the screenshot.
+Click then wait then capture all,https://app.example.com/audit,clicktext:Audit Log; wait:3,Y,Tab then wait then whole page.
+Click an exact element (selector),https://app.example.com/admin,click:#tab-roles,N,When the same words appear twice.
+Notes with commas,https://app.example.com/admin/retention,,N,"Text with commas, like this, goes in double quotes."
+Page reached through a menu,https://portal.example.com/,clicktext:Administration; clicktext:Change approvals; wait:2,Y,Click through a menu to the evidence.
+```
+
+If Excel saves your CSV with semicolons instead of commas (Windows set to use commas for
+decimals), Vouch says the *Url column is missing*: open the file in Notepad, check the
+columns are separated by commas, and save it there — or import it into the Designer and
+work with the configuration file instead.
 
 ---
 
