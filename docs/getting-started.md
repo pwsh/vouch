@@ -750,7 +750,7 @@ The columns of a CSV file are **Name**, **Url**, **Steps** (optional:
 common situation. The same examples, ready to paste into Notepad (keep the first line
 only once, at the top of your file):
 
-```text
+```
 Name,Url,Steps,ScrollFullPage,Notes
 Simple page - one screen,https://app.example.com/admin/security,,N,The page is right as it opens.
 Long list - whole page,https://app.example.com/admin/users?role=admin,,Y,Whole page - for user lists and logs.
