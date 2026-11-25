@@ -1,0 +1,107 @@
+{
+  "schemaVersion": 1,
+  "name": "Q3 ITGC evidence",
+  "browser": {
+    "profileDir": "",
+    "debugPort": 9222,
+    "useVirtualDesktop": false,
+    "keepBrowserOpen": false
+  },
+  "defaults": {
+    "account": "",
+    "captureArea": "screen",
+    "zoomPercent": 100,
+    "navigationTimeoutSec": 30,
+    "settleSeconds": 2,
+    "scrollSettleSeconds": 1,
+    "maxScrollSegments": 30,
+    "waitFor": "",
+    "onNotReady": "warn",
+    "promptTimeoutSec": 300
+  },
+  "output": {
+    "dir": "reports",
+    "reportName": "",
+    "imageFormat": "jpeg",
+    "jpegQuality": 85,
+    "saveImages": true,
+    "embedImages": true,
+    "jsonSummary": false,
+    "logDir": "",
+    "failOnWarning": false,
+    "openReport": false,
+    "zip": { "enabled": false, "name": "{report}.zip" }
+  },
+  "report": {
+    "title": "Audit Evidence Report",
+    "logoPath": "",
+    "showIndex": true,
+    "company": { "name": "Example Ltd", "details": "IT General Controls, FY2026" },
+    "description": "Configuration evidence for the quarterly ITGC review.",
+    "origin": "",
+    "generatedBy": "",
+    "period": { "from": "2026-07-01", "to": "2026-09-30", "label": "Q3 2026" },
+    "classification": "Confidential"
+  },
+  "pages": [
+    {
+      "id": "p001",
+      "name": "Intranet Dashboard",
+      "url": "https://intranet.example.com/dashboard",
+      "notes": "Landing page showing the logged-in user and the environment banner.",
+      "enabled": true,
+      "overrides": {},
+      "actions": [
+        { "type": "capture", "label": "", "scroll": { "mode": "none" } }
+      ]
+    },
+    {
+      "id": "p002",
+      "name": "App Settings - Audit Log",
+      "url": "https://app.example.com/settings",
+      "notes": "Evidence that audit logging is enabled. The retention setting is near the bottom.",
+      "enabled": true,
+      "overrides": {},
+      "actions": [
+        { "type": "clickText", "text": "Audit Log" },
+        { "type": "wait", "seconds": 2.5 },
+        { "type": "capture", "label": "", "scroll": { "mode": "auto" } }
+      ]
+    },
+    {
+      "id": "p003",
+      "name": "Payroll - security settings",
+      "url": "https://payroll.example.com/admin/security",
+      "notes": "ITGC-04: password policy and account lockout.",
+      "enabled": true,
+      "overrides": {
+        "account": "svc-audit@example.com",
+        "captureArea": "page",
+        "zoomPercent": 80,
+        "navigationTimeoutSec": 60,
+        "settleSeconds": 3,
+        "onNotReady": "prompt"
+      },
+      "actions": [
+        { "type": "pause", "message": "Complete MFA if asked" },
+        { "type": "clickText", "text": "Password Policy" },
+        { "type": "capture", "label": "Password policy", "scroll": { "mode": "none" } },
+        { "type": "click", "selector": "[data-testid=tab-lockout]" },
+        { "type": "waitFor", "selector": "#lockout-table", "timeoutSec": 20 },
+        { "type": "wait", "seconds": 1 },
+        { "type": "capture", "label": "Lockout", "scroll": { "mode": "area", "selector": "#main", "as": "segments" } }
+      ]
+    },
+    {
+      "id": "p004",
+      "name": "Admin User List",
+      "url": "https://portal.example.com/admin/users",
+      "notes": "Complete list of accounts with administrative privileges as of the capture date.",
+      "enabled": false,
+      "overrides": { "maxScrollSegments": 60 },
+      "actions": [
+        { "type": "capture", "label": "", "scroll": { "mode": "auto" } }
+      ]
+    }
+  ]
+}

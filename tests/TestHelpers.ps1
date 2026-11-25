@@ -12,28 +12,33 @@ function Get-VouchFunctionSource {
     <#
         vouch.ps1 runs Invoke-Main and calls exit when dot-sourced (and the installer acts
         on the Task Scheduler), so the tests load only function definitions and script
-        state, extracted from the AST.
+        state, extracted from the AST. Several files can be given (vouch.ps1 and
+        designer\Designer.ps1); their state comes first, then their functions, in order.
     #>
-    param([string]$Path = $script:VouchPath)
-    $tokens = $null
-    $errors = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$errors)
-    if ($errors.Count -gt 0) { throw "$Path has parse errors: $($errors[0].Message)" }
+    param([string[]]$Path = @($script:VouchPath))
+    $state = [System.Collections.Generic.List[string]]::new()
+    $functions = [System.Collections.Generic.List[string]]::new()
+    foreach ($file in $Path) {
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$errors)
+        if ($errors.Count -gt 0) { throw "$file has parse errors: $($errors[0].Message)" }
 
-    $statements = $ast.EndBlock.Statements
-    $functions = $statements |
-        Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] }
-
-    # The script-level state ($script:CdpSocket = $null, ...) comes along too, so the
-    # tests never drift from the script's own initial values.
-    $state = $statements | Where-Object {
-        $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-        $_.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
-        $_.Left.VariablePath.UserPath -like 'script:*'
+        foreach ($statement in $ast.EndBlock.Statements) {
+            if ($statement -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                $functions.Add($statement.Extent.Text)
+            }
+            # The script-level state ($script:CdpSocket = $null, ...) comes along too, so
+            # the tests never drift from the script's own initial values.
+            elseif ($statement -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $statement.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                $statement.Left.VariablePath.UserPath -like 'script:*') {
+                $state.Add($statement.Extent.Text)
+            }
+        }
     }
 
-    return (($state | ForEach-Object { $_.Extent.Text }) -join "`n") + "`n`n" +
-        (($functions | ForEach-Object { $_.Extent.Text }) -join "`n`n")
+    return ($state -join "`n") + "`n`n" + ($functions -join "`n`n")
 }
 
 function Get-FreeTcpPort {

@@ -16,6 +16,17 @@
     Defaults to captures.csv in the script's own folder, so the script behaves the same
     when started by Task Scheduler (whose working directory is C:\Windows\System32).
 
+.PARAMETER ConfigPath
+    Path to a configuration file (JSON) holding the pages and every setting; see
+    captures.sample.json. Use it instead of -CsvPath, not together with it. Relative
+    folders in the file are read from the file's own folder. A parameter typed on the
+    command line still beats the same setting in the file.
+
+.PARAMETER Only
+    Run only these pages, by id (p001) or by name. Works with -ConfigPath and -CsvPath
+    (CSV rows get the ids p001, p002, ... in order). Pages switched off in the
+    configuration ("enabled": false) still run when named here.
+
 .PARAMETER OutputDir
     Folder for the report. Defaults to the reports folder next to the script.
 
@@ -55,12 +66,19 @@
     .\vouch.ps1 -CsvPath .\captures.csv -OutputDir .\reports
 
 .EXAMPLE
+    .\vouch.ps1 -ConfigPath .\captures.json -Only p002
+
+.EXAMPLE
     .\vouch.ps1 -ImageFormat png -SaveImages -KeepBrowserOpen
 #>
 
 [CmdletBinding()]
 param(
     [string]$CsvPath = (Join-Path -Path $PSScriptRoot -ChildPath 'captures.csv'),
+
+    [string]$ConfigPath = '',
+
+    [string[]]$Only = @(),
 
     [string]$OutputDir = (Join-Path -Path $PSScriptRoot -ChildPath 'reports'),
 
@@ -455,7 +473,11 @@ function Import-CaptureDefinition {
         }
 
         $steps = ConvertTo-StepList -StepsText $stepsText -LineNumber $lineNumber -Errors $errors
+        $scrollFullPage = ConvertTo-BooleanFlag -Value $scrollText
 
+        # Id, Enabled, Overrides and Actions make a CSV row the same shape as a page of
+        # a configuration file (ConvertTo-CaptureDefinition), so -Only and the
+        # Designer's CSV import treat both alike.
         $definitions.Add([pscustomobject]@{
             Index          = $index
             LineNumber     = $lineNumber
@@ -463,8 +485,12 @@ function Import-CaptureDefinition {
             Url            = $url
             StepsText      = $stepsText
             Steps          = $steps
-            ScrollFullPage = (ConvertTo-BooleanFlag -Value $scrollText)
+            ScrollFullPage = $scrollFullPage
             Notes          = $notes
+            Id             = 'p{0:d3}' -f $index
+            Enabled        = $true
+            Overrides      = [ordered]@{}
+            Actions        = (ConvertTo-ActionList -Steps @($steps) -ScrollFullPage $scrollFullPage)
         })
     }
 
@@ -481,6 +507,894 @@ function Import-CaptureDefinition {
     }
 
     return , $definitions
+}
+
+#endregion
+
+#region Configuration file ---------------------------------------------------
+
+function Get-VouchConfigSchema {
+    <#
+        The configuration file format (schemaVersion 1) in one place: every key, its
+        type, allowed values and default. Validation (Test-VouchConfig), the default
+        configuration and filling in missing keys all read this, so they cannot drift.
+        Ranges of settings that are also script parameters match the parameters'
+        ValidateRange attributes; the command line and the file accept the same values.
+    #>
+    $text = @{ Type = 'string'; Default = '' }
+    $defaultsKeys = [ordered]@{
+        account              = $text
+        captureArea          = @{ Type = 'enum'; Allowed = @('screen', 'window', 'page'); Default = 'screen' }
+        zoomPercent          = @{ Type = 'int'; Min = 25; Max = 500; Default = 100 }
+        navigationTimeoutSec = @{ Type = 'int'; Min = 5; Max = 600; Default = 30 }
+        settleSeconds        = @{ Type = 'number'; Min = 0; Max = 120; Default = 2 }
+        scrollSettleSeconds  = @{ Type = 'number'; Min = 0; Max = 120; Default = 1 }
+        maxScrollSegments    = @{ Type = 'int'; Min = 1; Max = 500; Default = 30 }
+        waitFor              = $text
+        onNotReady           = @{ Type = 'enum'; Allowed = @('warn', 'prompt'); Default = 'warn' }
+        promptTimeoutSec     = @{ Type = 'int'; Min = 1; Max = 3600; Default = 300 }
+    }
+    return [ordered]@{
+        schemaVersion = @{ Type = 'schemaVersion'; Default = 1 }
+        name          = $text
+        browser       = @{ Type = 'object'; Fields = [ordered]@{
+                profileDir        = $text
+                debugPort         = @{ Type = 'int'; Min = 1024; Max = 65535; Default = 9222 }
+                useVirtualDesktop = @{ Type = 'bool'; Default = $false }
+                keepBrowserOpen   = @{ Type = 'bool'; Default = $false }
+            }
+        }
+        defaults      = @{ Type = 'object'; Fields = $defaultsKeys }
+        output        = @{ Type = 'object'; Fields = [ordered]@{
+                dir           = @{ Type = 'string'; Default = 'reports' }
+                reportName    = $text
+                imageFormat   = @{ Type = 'enum'; Allowed = @('jpeg', 'png'); Default = 'jpeg' }
+                jpegQuality   = @{ Type = 'int'; Min = 1; Max = 100; Default = 85 }
+                saveImages    = @{ Type = 'bool'; Default = $false }
+                embedImages   = @{ Type = 'bool'; Default = $true }
+                jsonSummary   = @{ Type = 'bool'; Default = $false }
+                logDir        = $text
+                failOnWarning = @{ Type = 'bool'; Default = $false }
+                openReport    = @{ Type = 'bool'; Default = $false }
+                zip           = @{ Type = 'object'; Fields = [ordered]@{
+                        enabled = @{ Type = 'bool'; Default = $false }
+                        name    = @{ Type = 'string'; Default = '{report}.zip' }
+                    }
+                }
+            }
+        }
+        report        = @{ Type = 'object'; Fields = [ordered]@{
+                title          = @{ Type = 'string'; Default = 'Audit Evidence Report' }
+                logoPath       = $text
+                showIndex      = @{ Type = 'bool'; Default = $true }
+                company        = @{ Type = 'object'; Fields = [ordered]@{ name = $text; details = $text } }
+                description    = $text
+                origin         = $text
+                generatedBy    = $text
+                period         = @{ Type = 'object'; Fields = [ordered]@{ from = $text; to = $text; label = $text } }
+                classification = @{ Type = 'enum'; Allowed = @('', 'Public', 'Internal', 'Private', 'Confidential'); Default = '' }
+            }
+        }
+        pages         = @{ Type = 'pages' }
+    }
+}
+
+function Get-VouchActionSchema {
+    <#
+        The keys each kind of page action takes. Kept beside Get-VouchConfigSchema;
+        'type' is common to all and checked separately.
+    #>
+    return [ordered]@{
+        click     = [ordered]@{ selector = @{ Type = 'string'; Required = 'the CSS selector of what to click' } }
+        clickText = [ordered]@{ text = @{ Type = 'string'; Required = 'the visible text to click' } }
+        wait      = [ordered]@{ seconds = @{ Type = 'number'; Min = 0; Max = 300; Required = 'the number of seconds to wait' } }
+        waitFor   = [ordered]@{
+            selector   = @{ Type = 'string'; Required = 'the CSS selector of the element to wait for' }
+            timeoutSec = @{ Type = 'int'; Min = 1; Max = 600 }
+        }
+        pause     = [ordered]@{ message = @{ Type = 'string' } }
+        capture   = [ordered]@{
+            label  = @{ Type = 'string' }
+            scroll = @{ Type = 'object'; Fields = [ordered]@{
+                    mode     = @{ Type = 'enum'; Allowed = @('none', 'auto', 'page', 'area'); Default = 'none' }
+                    selector = @{ Type = 'string'; Default = '' }
+                    as       = @{ Type = 'enum'; Allowed = @('segments', 'single'); Default = 'segments' }
+                }
+            }
+        }
+    }
+}
+
+function New-VouchConfigNode {
+    # Builds the default values for one object of the schema, recursively.
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Keys)
+    $node = [ordered]@{}
+    foreach ($key in $Keys.Keys) {
+        $spec = $Keys[$key]
+        $node[$key] = switch ($spec.Type) {
+            'object' { New-VouchConfigNode -Keys $spec.Fields }
+            'pages'  { , [System.Collections.Generic.List[object]]::new() }
+            default  { $spec.Default }
+        }
+    }
+    return $node
+}
+
+function Get-DefaultVouchConfig {
+    <#
+        A complete configuration holding only defaults and no pages: what the Designer's
+        New starts from, and what Complete-VouchConfig fills missing keys from.
+        Objects are ordered, case-insensitive dictionaries (the same shape
+        ConvertFrom-VouchJson produces), so either can be saved with ConvertTo-Json.
+    #>
+    return New-VouchConfigNode -Keys (Get-VouchConfigSchema)
+}
+
+function ConvertFrom-VouchJsonElement {
+    <#
+        Walks a System.Text.Json element into plain PowerShell values: objects become
+        ordered case-insensitive dictionaries, arrays List[object], numbers Int64 or
+        Double. ConvertFrom-Json is not used because it turns date-like text such as
+        "2026-07-01" into DateTime and stops on keys that differ only in case with a
+        message no user can act on.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Text.Json.JsonElement]$Element,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Path
+    )
+    switch ($Element.ValueKind.ToString()) {
+        'Object' {
+            $node = [ordered]@{}
+            foreach ($property in $Element.EnumerateObject()) {
+                $childPath = if ($Path) { "$Path.$($property.Name)" } else { $property.Name }
+                if ($node.Contains($property.Name)) {
+                    throw "'$childPath' is written twice. Keep one of them (capital letters do not make a key different)."
+                }
+                $node[$property.Name] = ConvertFrom-VouchJsonElement -Element $property.Value -Path $childPath
+            }
+            return $node
+        }
+        'Array' {
+            $list = [System.Collections.Generic.List[object]]::new()
+            $position = 0
+            foreach ($child in $Element.EnumerateArray()) {
+                $list.Add((ConvertFrom-VouchJsonElement -Element $child -Path "$Path[$position]"))
+                $position++
+            }
+            return , $list
+        }
+        'String' { return $Element.GetString() }
+        'Number' {
+            $whole = [long]0
+            if ($Element.TryGetInt64([ref]$whole)) { return $whole }
+            return $Element.GetDouble()
+        }
+        'True'  { return $true }
+        'False' { return $false }
+        default { return $null }
+    }
+}
+
+function ConvertFrom-VouchJson {
+    <#
+        Parses configuration text. Comments and trailing commas are allowed because
+        people edit the file by hand in Notepad. A syntax error is reported with the
+        line and column a person can find, not the parser's byte offsets.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { throw 'The file is empty.' }
+    $options = [System.Text.Json.JsonDocumentOptions]::new()
+    $options.CommentHandling = [System.Text.Json.JsonCommentHandling]::Skip
+    $options.AllowTrailingCommas = $true
+    try {
+        $document = [System.Text.Json.JsonDocument]::Parse($Text, $options)
+    }
+    catch {
+        $exception = $_.Exception
+        while ($null -ne $exception.InnerException) { $exception = $exception.InnerException }
+        if ($exception.PSObject.Properties['LineNumber'] -and $null -ne $exception.LineNumber) {
+            $column = if ($null -ne $exception.BytePositionInLine) { $exception.BytePositionInLine + 1 } else { 1 }
+            throw "The file is not valid JSON: there is a mistake on line $($exception.LineNumber + 1) near column $column (a missing comma, quote or bracket is the usual cause)."
+        }
+        throw "The file is not valid JSON: $($exception.Message)"
+    }
+    try {
+        if ($document.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
+            throw 'The file must hold one JSON object: it starts with { and ends with }.'
+        }
+        return ConvertFrom-VouchJsonElement -Element $document.RootElement -Path ''
+    }
+    finally {
+        $document.Dispose()
+    }
+}
+
+function Format-VouchConfigValue {
+    # How a value is shown in a validation message: as it would look in the file.
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [bool]) { return $(if ($Value) { 'true' } else { 'false' }) }
+    if ($Value -is [string]) { return '"' + $Value + '"' }
+    if ($Value -is [System.Collections.IDictionary]) { return 'an object { }' }
+    if ($Value -is [System.Collections.IList]) { return 'a list [ ]' }
+    if ($Value -is [double]) { return $Value.ToString([System.Globalization.CultureInfo]::InvariantCulture) }
+    return [string]$Value
+}
+
+function Test-VouchConfigNumber {
+    # Numbers only: a bool or "30" in quotes is not a number, whatever PowerShell would cast.
+    param([AllowNull()][object]$Value, [switch]$Whole)
+    $isNumber = $Value -is [long] -or $Value -is [int] -or $Value -is [double] -or $Value -is [decimal]
+    if (-not $isNumber) { return $false }
+    if ($Value -is [double] -and ([double]::IsNaN($Value) -or [double]::IsInfinity($Value))) { return $false }
+    if ($Whole) { return [Math]::Floor([double]$Value) -eq [double]$Value }
+    return $true
+}
+
+function Add-VouchConfigProblem {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$List,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Path,
+        [Parameter(Mandatory)][string]$Message
+    )
+    $List.Add([pscustomobject]@{ Path = $Path; Message = $Message })
+}
+
+function Test-VouchConfigScalar {
+    <#
+        Checks one plain value against its schema entry. null means "use the default"
+        and is accepted. The messages say what to write, because the reader is the
+        person editing the file, not a developer.
+    #>
+    param(
+        [AllowNull()][object]$Value,
+        [Parameter(Mandatory)][hashtable]$Spec,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Errors
+    )
+    if ($null -eq $Value) { return }
+    $found = Format-VouchConfigValue -Value $Value
+    switch ($Spec.Type) {
+        'string' {
+            if ($Value -isnot [string]) {
+                Add-VouchConfigProblem -List $Errors -Path $Path -Message "must be text in double quotes (found $found)."
+            }
+        }
+        'bool' {
+            if ($Value -isnot [bool]) {
+                Add-VouchConfigProblem -List $Errors -Path $Path -Message "must be true or false, without quotes (found $found)."
+            }
+        }
+        'int' {
+            if (-not (Test-VouchConfigNumber -Value $Value -Whole) -or $Value -lt $Spec.Min -or $Value -gt $Spec.Max) {
+                Add-VouchConfigProblem -List $Errors -Path $Path -Message "must be a whole number from $($Spec.Min) to $($Spec.Max), without quotes (found $found)."
+            }
+        }
+        'number' {
+            if (-not (Test-VouchConfigNumber -Value $Value) -or $Value -lt $Spec.Min -or $Value -gt $Spec.Max) {
+                Add-VouchConfigProblem -List $Errors -Path $Path -Message "must be a number from $($Spec.Min) to $($Spec.Max), without quotes; use a dot for decimals (found $found)."
+            }
+        }
+        'enum' {
+            if ($Value -isnot [string] -or @($spec.Allowed) -notcontains $Value) {
+                $allowed = (@($spec.Allowed) | ForEach-Object { '"' + $_ + '"' }) -join ', '
+                Add-VouchConfigProblem -List $Errors -Path $Path -Message "must be one of $allowed (found $found)."
+            }
+        }
+    }
+}
+
+function Test-VouchConfigObject {
+    <#
+        Checks an object against a schema object: unknown keys are warnings (a typo must
+        not stop a scheduled run, but the user should hear about it), known keys are
+        checked by type, nested objects recursively.
+    #>
+    param(
+        [AllowNull()][object]$Node,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Keys,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Errors,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Warnings
+    )
+    if ($null -eq $Node) { return }
+    if ($Node -isnot [System.Collections.IDictionary]) {
+        Add-VouchConfigProblem -List $Errors -Path $Path -Message "must be an object in { } (found $(Format-VouchConfigValue -Value $Node))."
+        return
+    }
+    foreach ($key in @($Node.Keys)) {
+        $childPath = if ($Path) { "$Path.$key" } else { [string]$key }
+        if (-not $Keys.Contains($key)) {
+            Add-VouchConfigProblem -List $Warnings -Path $childPath -Message 'is not a setting Vouch knows, so it is ignored. Check the spelling.'
+            continue
+        }
+        $spec = $Keys[$key]
+        $value = $Node[$key]
+        switch ($spec.Type) {
+            'object' {
+                Test-VouchConfigObject -Node $value -Keys $spec.Fields -Path $childPath -Errors $Errors -Warnings $Warnings
+            }
+            'pages' {
+                Test-VouchConfigPageList -Pages $value -Errors $Errors -Warnings $Warnings
+            }
+            'schemaVersion' {
+                if (-not (Test-VouchConfigNumber -Value $value -Whole) -or $value -lt 1) {
+                    Add-VouchConfigProblem -List $Errors -Path $childPath -Message "must be 1 (found $(Format-VouchConfigValue -Value $value))."
+                }
+                elseif ($value -gt 1) {
+                    Add-VouchConfigProblem -List $Errors -Path $childPath -Message "is $($value): this file was made by a newer version of Vouch, which this copy cannot read correctly. Use the newer vouch.ps1."
+                }
+            }
+            default {
+                Test-VouchConfigScalar -Value $value -Spec $spec -Path $childPath -Errors $Errors
+            }
+        }
+    }
+}
+
+function Get-VouchPageId {
+    <#
+        The id -Only and the Designer use for a page. A hand-written page may leave it
+        out; it then gets p001, p002, ... by position, the same ids CSV rows get.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Page,
+        [Parameter(Mandatory)][int]$Position
+    )
+    if ($Page -is [System.Collections.IDictionary] -and $Page.Contains('id') -and
+        $Page['id'] -is [string] -and -not [string]::IsNullOrWhiteSpace($Page['id'])) {
+        return $Page['id'].Trim()
+    }
+    return 'p{0:d3}' -f $Position
+}
+
+function Get-VouchActionType {
+    # The action type in the spelling the schema uses, or '' when it is not one.
+    param([AllowNull()][object]$Type)
+    if ($Type -isnot [string]) { return '' }
+    foreach ($known in (Get-VouchActionSchema).Keys) {
+        if ($known -eq $Type.Trim()) { return $known }
+    }
+    return ''
+}
+
+function Test-VouchPageAction {
+    param(
+        [AllowNull()][object]$Action,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Errors,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Warnings
+    )
+    if ($Action -isnot [System.Collections.IDictionary]) {
+        Add-VouchConfigProblem -List $Errors -Path $Path -Message "must be an object in { } with a ""type"" (found $(Format-VouchConfigValue -Value $Action))."
+        return
+    }
+    $actionSchema = Get-VouchActionSchema
+    $type = Get-VouchActionType -Type $Action['type']
+    if (-not $type) {
+        $allowed = (@($actionSchema.Keys) | ForEach-Object { '"' + $_ + '"' }) -join ', '
+        $found = if ($Action.Contains('type')) { Format-VouchConfigValue -Value $Action['type'] } else { 'nothing' }
+        Add-VouchConfigProblem -List $Errors -Path "$Path.type" -Message "must be one of $allowed (found $found)."
+        return
+    }
+    $keys = $actionSchema[$type]
+    $rest = [ordered]@{}
+    foreach ($key in @($Action.Keys)) { if ($key -ne 'type') { $rest[$key] = $Action[$key] } }
+    Test-VouchConfigObject -Node $rest -Keys $keys -Path $Path -Errors $Errors -Warnings $Warnings
+
+    foreach ($key in $keys.Keys) {
+        $spec = $keys[$key]
+        if (-not $spec.Contains('Required')) { continue }
+        $value = $Action[$key]
+        if ($null -eq $value -or ($value -is [string] -and [string]::IsNullOrWhiteSpace($value))) {
+            Add-VouchConfigProblem -List $Errors -Path "$Path.$key" -Message "is missing: a ""$type"" action needs $($spec.Required)."
+        }
+    }
+
+    if ($type -eq 'capture' -and $Action['scroll'] -is [System.Collections.IDictionary]) {
+        $scroll = $Action['scroll']
+        if ($scroll['mode'] -is [string] -and $scroll['mode'] -eq 'area' -and
+            -not ($scroll['selector'] -is [string] -and -not [string]::IsNullOrWhiteSpace($scroll['selector']))) {
+            Add-VouchConfigProblem -List $Errors -Path "$Path.scroll.selector" -Message 'is missing: scroll mode "area" needs the CSS selector of the area to scroll.'
+        }
+    }
+}
+
+function Test-VouchConfigPageList {
+    param(
+        [AllowNull()][object]$Pages,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Errors,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Warnings
+    )
+    if ($null -eq $Pages) { return }
+    if ($Pages -isnot [System.Collections.IList]) {
+        Add-VouchConfigProblem -List $Errors -Path 'pages' -Message "must be a list in [ ] (found $(Format-VouchConfigValue -Value $Pages))."
+        return
+    }
+    $schema = Get-VouchConfigSchema
+    $text = @{ Type = 'string' }
+    $pageKeys = [ordered]@{
+        id = $text; name = $text; url = $text; notes = $text
+        enabled = @{ Type = 'bool' }
+        overrides = $schema['defaults']
+        actions = @{ Type = 'actions' }
+    }
+    $seenIds = @{}
+    for ($i = 0; $i -lt $Pages.Count; $i++) {
+        $page = $Pages[$i]
+        $path = "pages[$i]"
+        if ($page -isnot [System.Collections.IDictionary]) {
+            Add-VouchConfigProblem -List $Errors -Path $path -Message "must be an object in { } (found $(Format-VouchConfigValue -Value $page))."
+            continue
+        }
+
+        # actions is a list of objects of several kinds, checked below.
+        $rest = [ordered]@{}
+        foreach ($key in @($page.Keys)) { if ($key -ne 'actions') { $rest[$key] = $page[$key] } }
+        Test-VouchConfigObject -Node $rest -Keys $pageKeys -Path $path -Errors $Errors -Warnings $Warnings
+
+        foreach ($required in 'name', 'url') {
+            $value = $page[$required]
+            if ($null -eq $value -or ($value -is [string] -and [string]::IsNullOrWhiteSpace($value))) {
+                Add-VouchConfigProblem -List $Errors -Path "$path.$required" -Message "is missing: every page needs a $required."
+            }
+        }
+        $url = $page['url']
+        if ($url -is [string] -and -not [string]::IsNullOrWhiteSpace($url) -and $url.Trim() -notmatch '^(?i)https?://\S') {
+            Add-VouchConfigProblem -List $Errors -Path "$path.url" -Message "must start with http:// or https:// (found ""$url"")."
+        }
+
+        $id = Get-VouchPageId -Page $page -Position ($i + 1)
+        if ($seenIds.ContainsKey($id)) {
+            Add-VouchConfigProblem -List $Errors -Path "$path.id" -Message "is ""$id"", which $($seenIds[$id]) already uses. Every page needs its own id."
+        }
+        else { $seenIds[$id] = "pages[$i]" }
+
+        $actions = $page['actions']
+        if ($null -eq $actions) { continue }
+        if ($actions -isnot [System.Collections.IList]) {
+            Add-VouchConfigProblem -List $Errors -Path "$path.actions" -Message "must be a list in [ ] (found $(Format-VouchConfigValue -Value $actions))."
+            continue
+        }
+        for ($j = 0; $j -lt $actions.Count; $j++) {
+            Test-VouchPageAction -Action $actions[$j] -Path "$path.actions[$j]" -Errors $Errors -Warnings $Warnings
+        }
+    }
+}
+
+function Test-VouchConfig {
+    <#
+        Checks a whole configuration and returns every problem at once, so the user can
+        fix the file in one go (as Import-CaptureDefinition does for a CSV). Pure: the
+        object is not changed and nothing is printed.
+        Returns { Errors; Warnings }, each a list of { Path; Message }. Path is where the
+        problem is in the file, such as pages[2].actions[0].selector (counting from 0).
+        Accepts the dictionaries ConvertFrom-VouchJson returns, or the objects
+        ConvertFrom-Json returns (converted first, so both are checked the same way).
+    #>
+    param([AllowNull()][object]$Config)
+
+    $errors = [System.Collections.Generic.List[object]]::new()
+    $warnings = [System.Collections.Generic.List[object]]::new()
+    if ($null -ne $Config -and $Config -isnot [System.Collections.IDictionary] -and $Config -is [System.Management.Automation.PSCustomObject]) {
+        $Config = ConvertFrom-VouchJson -Text ($Config | ConvertTo-Json -Depth 32)
+    }
+    if ($Config -isnot [System.Collections.IDictionary]) {
+        Add-VouchConfigProblem -List $errors -Path '' -Message 'The configuration must be one JSON object: it starts with { and ends with }.'
+        return [pscustomobject]@{ Errors = $errors; Warnings = $warnings }
+    }
+
+    if (-not $Config.Contains('schemaVersion')) {
+        Add-VouchConfigProblem -List $warnings -Path 'schemaVersion' -Message 'is missing; the file is read as version 1. Add "schemaVersion": 1 at the top.'
+    }
+    Test-VouchConfigObject -Node $Config -Keys (Get-VouchConfigSchema) -Path '' -Errors $errors -Warnings $warnings
+    return [pscustomobject]@{ Errors = $errors; Warnings = $warnings }
+}
+
+function Complete-VouchConfigNode {
+    # Fills missing or null keys from the defaults and writes enum values in the
+    # schema's spelling ("PNG" -> "png"). Only for a node that passed validation.
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Node,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Keys
+    )
+    foreach ($key in $Keys.Keys) {
+        $spec = $Keys[$key]
+        $value = if ($Node.Contains($key)) { $Node[$key] } else { $null }
+        if ($spec.Type -eq 'object') {
+            if ($null -eq $value) { $Node[$key] = New-VouchConfigNode -Keys $spec.Fields }
+            else { Complete-VouchConfigNode -Node $value -Keys $spec.Fields }
+        }
+        elseif ($spec.Type -eq 'pages') {
+            if ($null -eq $value) { $Node[$key] = [System.Collections.Generic.List[object]]::new() }
+        }
+        elseif ($null -eq $value) {
+            if ($spec.Contains('Default')) { $Node[$key] = $spec.Default }
+        }
+        elseif ($spec.Type -eq 'enum') {
+            $Node[$key] = @($spec.Allowed | Where-Object { $_ -eq $value })[0]
+        }
+    }
+}
+
+function Complete-VouchConfig {
+    <#
+        Turns a validated configuration into a complete one: every setting present
+        (missing ones get their defaults) and every page with an id, notes, enabled,
+        overrides and actions. Code that reads the configuration later never has to ask
+        whether a key exists. Changes the object it is given and returns it.
+    #>
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Config)
+
+    Complete-VouchConfigNode -Node $Config -Keys (Get-VouchConfigSchema)
+    $overrideKeys = (Get-VouchConfigSchema)['defaults'].Fields
+    $position = 0
+    foreach ($page in $Config['pages']) {
+        $position++
+        $page['id'] = Get-VouchPageId -Page $page -Position $position
+        if ($null -eq $page['notes']) { $page['notes'] = '' }
+        if ($null -eq $page['enabled']) { $page['enabled'] = $true }
+        if ($null -eq $page['overrides']) { $page['overrides'] = [ordered]@{} }
+        if ($null -eq $page['actions']) { $page['actions'] = [System.Collections.Generic.List[object]]::new() }
+        foreach ($key in @($page['overrides'].Keys)) {
+            $spec = $overrideKeys[$key]
+            if ($null -ne $spec -and $spec.Type -eq 'enum' -and $null -ne $page['overrides'][$key]) {
+                $page['overrides'][$key] = @($spec.Allowed | Where-Object { $_ -eq $page['overrides'][$key] })[0]
+            }
+        }
+    }
+    return $Config
+}
+
+function Resolve-VouchConfigPath {
+    <#
+        A folder or file named in a configuration is read from the configuration file's
+        folder when it is relative, not from the current directory: Task Scheduler
+        starts in C:\Windows\System32, and the Designer may start anywhere.
+    #>
+    param(
+        [AllowEmptyString()][string]$Path,
+        [Parameter(Mandatory)][string]$BaseDirectory
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    if ([System.IO.Path]::IsPathFullyQualified($Path)) { return $Path }
+    return [System.IO.Path]::GetFullPath((Join-Path -Path $BaseDirectory -ChildPath $Path))
+}
+
+function Import-VouchConfig {
+    <#
+        Reads, checks and completes a configuration file for a run. All problems are
+        listed together and nothing is launched, like Import-CaptureDefinition. Unknown
+        keys are listed as warnings and the run goes on. Relative folders (browser
+        profile, output, log, logo) are made absolute against the file's own folder.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Configuration file not found: $Path`nCreate one from captures.sample.json, or pass -CsvPath instead."
+    }
+    $fullPath = (Resolve-Path -LiteralPath $Path).Path
+    try {
+        $config = ConvertFrom-VouchJson -Text ([System.IO.File]::ReadAllText($fullPath))
+    }
+    catch {
+        throw "The configuration file '$fullPath' could not be read. $($_.Exception.Message) Nothing was launched."
+    }
+
+    $result = Test-VouchConfig -Config $config
+    $describe = { param($Problem) if ($Problem.Path) { "$($Problem.Path): $($Problem.Message)" } else { $Problem.Message } }
+    if ($result.Warnings.Count -gt 0) {
+        Write-Host "The configuration file has $($result.Warnings.Count) note(s):" -ForegroundColor Yellow
+        foreach ($warning in $result.Warnings) { Write-Host "  - $(& $describe $warning)" -ForegroundColor Yellow }
+    }
+    if ($result.Errors.Count -gt 0) {
+        Write-Host ''
+        Write-Host "The configuration file has $($result.Errors.Count) problem(s):" -ForegroundColor Red
+        foreach ($problem in $result.Errors) { Write-Host "  - $(& $describe $problem)" -ForegroundColor Red }
+        Write-Host ''
+        throw "Fix '$fullPath' and run again. Nothing was launched."
+    }
+
+    $config = Complete-VouchConfig -Config $config
+    $folder = Split-Path -Path $fullPath -Parent
+    $config['browser']['profileDir'] = Resolve-VouchConfigPath -Path $config['browser']['profileDir'] -BaseDirectory $folder
+    $config['output']['dir'] = Resolve-VouchConfigPath -Path $config['output']['dir'] -BaseDirectory $folder
+    $config['output']['logDir'] = Resolve-VouchConfigPath -Path $config['output']['logDir'] -BaseDirectory $folder
+    $config['report']['logoPath'] = Resolve-VouchConfigPath -Path $config['report']['logoPath'] -BaseDirectory $folder
+    return $config
+}
+
+function ConvertTo-ActionList {
+    <#
+        CSV steps as configuration actions: click:/clicktext:/wait: in order, then one
+        capture that scrolls ("auto") when ScrollFullPage is Y and takes one screen
+        ("none") when it is not.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Steps,
+        [Parameter(Mandatory)][bool]$ScrollFullPage
+    )
+    $actions = [System.Collections.Generic.List[object]]::new()
+    foreach ($step in $Steps) {
+        switch ($step.Verb) {
+            'click'     { $actions.Add([ordered]@{ type = 'click'; selector = [string]$step.Argument }) }
+            'clicktext' { $actions.Add([ordered]@{ type = 'clickText'; text = [string]$step.Argument }) }
+            'wait'      { $actions.Add([ordered]@{ type = 'wait'; seconds = [double]$step.Argument }) }
+        }
+    }
+    $mode = if ($ScrollFullPage) { 'auto' } else { 'none' }
+    $actions.Add([ordered]@{ type = 'capture'; label = ''; scroll = [ordered]@{ mode = $mode; selector = ''; as = 'segments' } })
+    return , $actions
+}
+
+function ConvertTo-NormalizedActionList {
+    <#
+        A page's actions in one predictable shape: type in the schema's spelling, only
+        the keys that type uses, defaults filled in, and a capture appended when the
+        page has none (a page is there to be captured). Expects validated actions.
+    #>
+    param([AllowNull()][object]$Actions)
+    $result = [System.Collections.Generic.List[object]]::new()
+    foreach ($action in @($Actions)) {
+        if ($null -eq $action) { continue }
+        $type = Get-VouchActionType -Type $action['type']
+        $normal = [ordered]@{ type = $type }
+        switch ($type) {
+            'click'     { $normal['selector'] = ([string]$action['selector']).Trim() }
+            'clickText' { $normal['text'] = ([string]$action['text']).Trim() }
+            'wait'      { $normal['seconds'] = [double]$action['seconds'] }
+            'waitFor' {
+                $normal['selector'] = ([string]$action['selector']).Trim()
+                $normal['timeoutSec'] = if ($null -ne $action['timeoutSec']) { [int]$action['timeoutSec'] } else { $null }
+            }
+            'pause' { $normal['message'] = [string]$action['message'] }
+            'capture' {
+                $scroll = $action['scroll']
+                $scrollKeys = (Get-VouchActionSchema)['capture']['scroll'].Fields
+                $normalScroll = New-VouchConfigNode -Keys $scrollKeys
+                if ($scroll -is [System.Collections.IDictionary]) {
+                    foreach ($key in @($scrollKeys.Keys)) {
+                        if ($null -ne $scroll[$key]) { $normalScroll[$key] = [string]$scroll[$key] }
+                    }
+                    Complete-VouchConfigNode -Node $normalScroll -Keys $scrollKeys
+                }
+                $normal['label'] = [string]$action['label']
+                $normal['scroll'] = $normalScroll
+            }
+        }
+        $result.Add($normal)
+    }
+    if (-not @($result | Where-Object { $_['type'] -eq 'capture' })) {
+        $result.Add((ConvertTo-ActionList -Steps @() -ScrollFullPage $false)[0])
+    }
+    return , $result
+}
+
+function ConvertTo-LegacyStepText {
+    # One action as the CSV-style text the report's steps column and step log show.
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Action)
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    switch ($Action['type']) {
+        'click'     { return "click:$($Action['selector'])" }
+        'clickText' { return "clicktext:$($Action['text'])" }
+        'wait'      { return 'wait:' + ([double]$Action['seconds']).ToString($invariant) }
+        'waitFor'   { return "waitfor:$($Action['selector'])" }
+        'pause'     { return $(if ($Action['message']) { "pause:$($Action['message'])" } else { 'pause' }) }
+        'capture'   { return $(if ($Action['label']) { "capture:$($Action['label'])" } else { 'capture' }) }
+    }
+    return [string]$Action['type']
+}
+
+function ConvertTo-StepText {
+    <#
+        A page's actions as the semicolon-separated text of the CSV Steps column
+        ("click:#tab; wait:2"), for the report's steps column. The final capture of a
+        page with only one capture is left out: that is what every CSV row does
+        implicitly, so a converted CSV row reads exactly as before.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Actions)
+    $captures = @($Actions | Where-Object { $_['type'] -eq 'capture' })
+    $parts = for ($i = 0; $i -lt $Actions.Count; $i++) {
+        $action = $Actions[$i]
+        if ($action['type'] -eq 'capture' -and $captures.Count -eq 1 -and $i -eq $Actions.Count - 1) { continue }
+        ConvertTo-LegacyStepText -Action $action
+    }
+    return (@($parts) -join '; ')
+}
+
+function ConvertTo-CaptureDefinition {
+    <#
+        One configuration page as the definition object Invoke-CaptureItem takes: the
+        same properties a CSV row gets from Import-CaptureDefinition. Actions is the
+        normalised action list; Steps, StepsText and ScrollFullPage are derived from it,
+        so the report, the JSON summary and the current engine work unchanged.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Page,
+        # Position in the run (file names and the report number items by it).
+        [Parameter(Mandatory)][int]$Index,
+        # Position in the file, for the default id; defaults to Index.
+        [int]$Position = 0
+    )
+    if ($Position -lt 1) { $Position = $Index }
+    $actions = ConvertTo-NormalizedActionList -Actions $Page['actions']
+    $steps = [System.Collections.Generic.List[object]]::new()
+    foreach ($action in $actions) {
+        $verb = switch ($action['type']) { 'click' { 'click' } 'clickText' { 'clicktext' } 'wait' { 'wait' } default { '' } }
+        if (-not $verb) { continue }
+        $argument = switch ($verb) { 'click' { $action['selector'] } 'clicktext' { $action['text'] } 'wait' { [double]$action['seconds'] } }
+        $steps.Add([pscustomobject]@{ Verb = $verb; Argument = $argument; Text = (ConvertTo-LegacyStepText -Action $action) })
+    }
+    $lastCapture = @($actions | Where-Object { $_['type'] -eq 'capture' })[-1]
+    $overrides = if ($Page['overrides'] -is [System.Collections.IDictionary]) { $Page['overrides'] } else { [ordered]@{} }
+
+    return [pscustomobject]@{
+        Index          = $Index
+        LineNumber     = 0
+        Name           = ([string]$Page['name']).Trim()
+        Url            = ([string]$Page['url']).Trim()
+        StepsText      = (ConvertTo-StepText -Actions @($actions))
+        Steps          = $steps
+        ScrollFullPage = ($lastCapture['scroll']['mode'] -ne 'none')
+        Notes          = [string]$Page['notes']
+        Id             = (Get-VouchPageId -Page $Page -Position $Position)
+        Enabled        = ($Page['enabled'] -ne $false)
+        Overrides      = $overrides
+        Actions        = $actions
+    }
+}
+
+function ConvertTo-VouchConfig {
+    <#
+        A capture CSV as a configuration: default settings plus one page per row, ids
+        p001, p002, ... The Designer's "Import CSV" calls this. Reuses
+        Import-CaptureDefinition, so a CSV with problems is refused with the same
+        messages a run would give.
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'Path')]
+    param(
+        [Parameter(Mandatory, ParameterSetName = 'Path')][string]$Path,
+        [Parameter(Mandatory, ParameterSetName = 'Definitions')][AllowEmptyCollection()][object[]]$Definitions
+    )
+    $config = Get-DefaultVouchConfig
+    if ($PSCmdlet.ParameterSetName -eq 'Path') {
+        $Definitions = (Import-CaptureDefinition -Path $Path).ToArray()
+        $config['name'] = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+    }
+    foreach ($definition in $Definitions) {
+        $actions = [System.Collections.Generic.List[object]]::new()
+        foreach ($action in $definition.Actions) { $actions.Add($action) }
+        $config['pages'].Add([ordered]@{
+            id        = $definition.Id
+            name      = $definition.Name
+            url       = $definition.Url
+            notes     = $definition.Notes
+            enabled   = $true
+            overrides = [ordered]@{}
+            actions   = $actions
+        })
+    }
+    return $config
+}
+
+function Select-VouchPage {
+    <#
+        The pages a run captures: with -Only, the pages named there by id or name (in
+        the file's order, even if switched off); otherwise every enabled page. Index is
+        renumbered 1..n so the progress line, the report and the file names count the
+        pages actually run. A name or id that matches nothing stops the run: a typo in a
+        scheduled task must not quietly capture nothing.
+        A single -Only value with commas is split when it matches nothing as a whole,
+        because "pwsh -File vouch.ps1 -Only p001,p002" passes it as one string.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Definitions,
+        [AllowEmptyCollection()][string[]]$Only = @()
+    )
+    $wanted = @($Only | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+    $selected = [System.Collections.Generic.List[object]]::new()
+    if ($wanted.Count -eq 0) {
+        foreach ($definition in $Definitions) { if ($definition.Enabled) { $selected.Add($definition) } }
+    }
+    else {
+        # Positions of the matching pages; -eq ignores case, like the rest of Vouch.
+        $find = {
+            param([string]$Token)
+            @(for ($i = 0; $i -lt $Definitions.Count; $i++) {
+                if ($Definitions[$i].Id -eq $Token -or $Definitions[$i].Name -eq $Token) { $i }
+            })
+        }
+        $chosen = [System.Collections.Generic.HashSet[int]]::new()
+        $unknown = [System.Collections.Generic.List[string]]::new()
+        foreach ($token in $wanted) {
+            $tokens = @($token)
+            if (@(& $find $token).Count -eq 0 -and $token.Contains(',')) {
+                $tokens = @($token.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            }
+            foreach ($part in $tokens) {
+                $found = @(& $find $part)
+                if ($found.Count -eq 0) { $unknown.Add($part) }
+                foreach ($position in $found) { [void]$chosen.Add($position) }
+            }
+        }
+        if ($unknown.Count -gt 0) {
+            $available = (@($Definitions | ForEach-Object { "$($_.Id) ($($_.Name))" }) -join ', ')
+            throw "-Only: no page has the id or name '$($unknown -join "', '")'. The pages are: $available"
+        }
+        for ($i = 0; $i -lt $Definitions.Count; $i++) { if ($chosen.Contains($i)) { $selected.Add($Definitions[$i]) } }
+    }
+    for ($i = 0; $i -lt $selected.Count; $i++) { $selected[$i].Index = $i + 1 }
+    return , $selected
+}
+
+function Test-LegacyActionList {
+    <#
+        TEMPORARY - remove when the engine runs action lists (Invoke-PageAction).
+        The engine still runs a page as "steps, then one capture that scrolls the page or
+        not". A configuration may already describe more (waiting for an element,
+        pausing for the user, several captures, scrolling a chosen area); running such a
+        page the old way would produce different evidence than the file asks for, so the
+        page is refused with a reason instead. Returns { Supported; Reason }.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Actions)
+
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $captures = @($Actions | Where-Object { $_['type'] -eq 'capture' })
+    if ($captures.Count -gt 1) { $problems.Add("$($captures.Count) captures") }
+    foreach ($type in 'waitFor', 'pause') {
+        if (@($Actions | Where-Object { $_['type'] -eq $type }).Count -gt 0) { $problems.Add("a ""$type"" action") }
+    }
+    if ($Actions.Count -gt 0 -and $Actions[-1]['type'] -ne 'capture') { $problems.Add('actions after the capture') }
+    foreach ($capture in $captures) {
+        $mode = [string]$capture['scroll']['mode']
+        if ($mode -in 'page', 'area' -and -not $problems.Contains("scroll mode ""$mode""")) { $problems.Add("scroll mode ""$mode""") }
+        if ($mode -ne 'none' -and $capture['scroll']['as'] -eq 'single' -and -not $problems.Contains('one tall image ("as": "single")')) {
+            $problems.Add('one tall image ("as": "single")')
+        }
+    }
+    if ($problems.Count -eq 0) { return [pscustomobject]@{ Supported = $true; Reason = '' } }
+    return [pscustomobject]@{
+        Supported = $false
+        Reason    = "Not captured: this page uses $($problems -join ', '), which this version of Vouch cannot run yet. Remove it or use a newer vouch.ps1."
+    }
+}
+
+function Get-InactiveConfigSetting {
+    <#
+        TEMPORARY - shrink as each setting starts working (capture area and zoom,
+        prompts, report fields, zip, open when done).
+        Settings the file may set that this engine does not apply yet. A non-default
+        value is listed so the user is told it had no effect rather than finding out
+        from the evidence. Returns the setting paths, each once.
+    #>
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Config)
+
+    $defaults = Get-DefaultVouchConfig
+    $names = [System.Collections.Generic.List[string]]::new()
+    $check = {
+        param([string]$Name, $Value, $Default)
+        if ($null -eq $Value) { return }
+        if ($Value -is [string] -and [string]::IsNullOrWhiteSpace($Value) -and [string]::IsNullOrWhiteSpace([string]$Default)) { return }
+        if ($Value -ne $Default -and -not $names.Contains($Name)) { $names.Add($Name) }
+    }
+    $pageKeys = 'account', 'captureArea', 'zoomPercent', 'waitFor', 'onNotReady', 'promptTimeoutSec'
+    foreach ($key in $pageKeys) { & $check "defaults.$key" $Config['defaults'][$key] $defaults['defaults'][$key] }
+    foreach ($key in 'embedImages', 'openReport') { & $check "output.$key" $Config['output'][$key] $defaults['output'][$key] }
+    & $check 'output.zip.enabled' $Config['output']['zip']['enabled'] $false
+    foreach ($key in @($defaults['report'].Keys)) {
+        if ($defaults['report'][$key] -is [System.Collections.IDictionary]) {
+            foreach ($inner in @($defaults['report'][$key].Keys)) {
+                & $check "report.$key.$inner" $Config['report'][$key][$inner] $defaults['report'][$key][$inner]
+            }
+        }
+        else { & $check "report.$key" $Config['report'][$key] $defaults['report'][$key] }
+    }
+    foreach ($page in $Config['pages']) {
+        if ($page['overrides'] -isnot [System.Collections.IDictionary]) { continue }
+        foreach ($key in $pageKeys) { & $check "page overrides: $key" $page['overrides'][$key] $defaults['defaults'][$key] }
+    }
+    return , $names
 }
 
 #endregion
@@ -2463,8 +3377,8 @@ function Get-RunSettingDefinition {
         The one list of run-level settings: the script parameter each one comes from, the
         type it is used as, and where a configuration file keeps it. Resolve-RunSettings
         and Invoke-Main both read it, so a setting added here is picked up by both.
-        Settings without a config location (CsvPath, Verify, LoginSetup) are command-line
-        only: they choose what the run does, not how it captures.
+        Settings without a config location (CsvPath, ConfigPath, Only, Verify, LoginSetup)
+        are command-line only: they choose what the run does, not how it captures.
     #>
     return @(
         [pscustomobject]@{ Name = 'CsvPath';              Type = 'string'; Section = '';         Key = '' }
@@ -2486,6 +3400,8 @@ function Get-RunSettingDefinition {
         [pscustomobject]@{ Name = 'UseVirtualDesktop';    Type = 'bool';   Section = 'browser';  Key = 'useVirtualDesktop' }
         [pscustomobject]@{ Name = 'Verify';               Type = 'string'; Section = '';         Key = '' }
         [pscustomobject]@{ Name = 'LoginSetup';           Type = 'bool';   Section = '';         Key = '' }
+        [pscustomobject]@{ Name = 'ConfigPath';           Type = 'string'; Section = '';         Key = '' }
+        [pscustomobject]@{ Name = 'Only';                 Type = 'list';   Section = '';         Key = '' }
     )
 }
 
@@ -2559,16 +3475,132 @@ function Resolve-RunSettings {
             elseif ($null -ne $Defaults -and @($Defaults.Keys) -contains $name) { $value = $Defaults[$name] }
         }
 
-        # [bool] turns a [switch] into a plain true/false; [string] turns a missing value
-        # into '' - both read the same way the script's own parameters did.
-        $settings[$name] = switch ($definition.Type) {
-            'bool'   { [bool]$value }
-            'int'    { [int]$value }
-            'double' { [double]$value }
-            default  { [string]$value }
-        }
+        $settings[$name] = ConvertTo-SettingValue -Type $definition.Type -Value $value
     }
     return [pscustomobject]$settings
+}
+
+function ConvertTo-SettingValue {
+    <#
+        [bool] turns a [switch] into a plain true/false; [string] turns a missing value
+        into '' - both read the same way the script's own parameters did. Config values
+        reach this only after Test-VouchConfig accepted their type, so no conversion
+        here can fail on a user's typo.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Type,
+        [AllowNull()][object]$Value
+    )
+    if ($Type -eq 'list') {
+        return , [string[]]@(@($Value) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { ([string]$_).Trim() })
+    }
+    switch ($Type) {
+        'bool'   { return [bool]$Value }
+        'int'    { return [int]$Value }
+        'double' { return [double]$Value }
+        default  { return [string]$Value }
+    }
+}
+
+function Split-BoundParameter {
+    <#
+        Sorts the setting values visible to Invoke-Main into "typed by the user" and
+        "parameter defaults". An unbound script parameter still holds its default, so the
+        values of the parameters missing from $PSBoundParameters are the defaults and are
+        not written out a second time. Without bound parameters (the end-to-end tests set
+        plain variables) every visible value counts as typed. Pure.
+    #>
+    param(
+        # Setting name -> current value, as read from the calling scope.
+        [AllowNull()][System.Collections.IDictionary]$InScope = @{},
+        [AllowNull()][System.Collections.IDictionary]$BoundParameters = $null
+    )
+    $bound = @{}
+    $defaults = @{}
+    if ($null -eq $InScope) { $InScope = @{} }
+    if ($null -eq $BoundParameters) {
+        foreach ($name in @($InScope.Keys)) { $bound[$name] = $InScope[$name] }
+    }
+    else {
+        $boundNames = @($BoundParameters.Keys)
+        foreach ($name in $boundNames) { $bound[$name] = $BoundParameters[$name] }
+        foreach ($name in @($InScope.Keys)) {
+            if ($boundNames -notcontains $name) { $defaults[$name] = $InScope[$name] }
+        }
+    }
+    return [pscustomobject]@{ Bound = $bound; Defaults = $defaults }
+}
+
+function Get-PageSettings {
+    <#
+        The settings for one page: the run's settings with the page's "overrides"
+        applied, plus the page-level settings the configuration adds (Account,
+        CaptureArea, ZoomPercent, WaitFor, OnNotReady, PromptTimeoutSec). One object per
+        page, so Invoke-CaptureItem reads everything from -Settings and never has to
+        know where a value came from.
+        A value typed on the command line beats a page override too: the precedence is
+        command line > configuration > default, whatever part of the file it is in.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Settings,
+        [Parameter(Mandatory)][object]$Definition,
+        [AllowNull()][object]$Config = $null,
+        # Settings typed on the command line.
+        [AllowEmptyCollection()][string[]]$BoundNames = @()
+    )
+    $page = [ordered]@{}
+    foreach ($property in $Settings.PSObject.Properties) { $page[$property.Name] = $property.Value }
+
+    $overrides = $null
+    if ($Definition.PSObject.Properties['Overrides'] -and $Definition.Overrides -is [System.Collections.IDictionary]) {
+        $overrides = @{ defaults = $Definition.Overrides }
+    }
+    foreach ($setting in @(Get-RunSettingDefinition | Where-Object Section -eq 'defaults')) {
+        if ($BoundNames -contains $setting.Name) { continue }
+        $fromPage = Get-ConfigValue -Config $overrides -Section 'defaults' -Key $setting.Key
+        if ($fromPage.Found) { $page[$setting.Name] = ConvertTo-SettingValue -Type $setting.Type -Value $fromPage.Value }
+    }
+
+    $schemaDefaults = Get-DefaultVouchConfig
+    foreach ($key in 'account', 'captureArea', 'zoomPercent', 'waitFor', 'onNotReady', 'promptTimeoutSec') {
+        $value = $schemaDefaults['defaults'][$key]
+        $fromConfig = Get-ConfigValue -Config $Config -Section 'defaults' -Key $key
+        if ($fromConfig.Found) { $value = $fromConfig.Value }
+        $fromPage = Get-ConfigValue -Config $overrides -Section 'defaults' -Key $key
+        if ($fromPage.Found) { $value = $fromPage.Value }
+        $name = $key.Substring(0, 1).ToUpperInvariant() + $key.Substring(1)
+        $page[$name] = if ($value -is [string]) { $value } else { [int]$value }
+    }
+    return [pscustomobject]$page
+}
+
+function Get-RunLogDirectory {
+    <#
+        The transcript starts before Invoke-Main, so that a configuration that fails to
+        load is still logged; it therefore needs output.logDir before the settings are
+        resolved. Reads only that one value: -LogDir typed on the command line wins, then
+        the configuration (relative to its folder), then the -LogDir default. Any
+        problem with the file is left for Invoke-Main to report.
+    #>
+    param(
+        [AllowNull()][System.Collections.IDictionary]$BoundParameters,
+        [AllowEmptyString()][string]$LogDir = '',
+        [AllowEmptyString()][string]$ConfigPath = ''
+    )
+    if ($null -ne $BoundParameters -and @($BoundParameters.Keys) -contains 'LogDir') { return $LogDir }
+    if ([string]::IsNullOrWhiteSpace($ConfigPath)) { return $LogDir }
+    try {
+        $fullPath = (Resolve-Path -LiteralPath $ConfigPath -ErrorAction Stop).Path
+        $config = ConvertFrom-VouchJson -Text ([System.IO.File]::ReadAllText($fullPath))
+        $fromConfig = Get-ConfigValue -Config $config -Section 'output' -Key 'logDir'
+        if ($fromConfig.Found -and $fromConfig.Value -is [string]) {
+            return Resolve-VouchConfigPath -Path $fromConfig.Value -BaseDirectory (Split-Path -Path $fullPath -Parent)
+        }
+    }
+    catch {
+        Write-Verbose "Log folder not read from the configuration: $($_.Exception.Message)"
+    }
+    return $LogDir
 }
 
 function New-CaptureItem {
@@ -2611,7 +3643,6 @@ function Invoke-ScrollCapture {
         [Parameter(Mandatory)][hashtable]$CaptureContext
     )
 
-    $item = $Item
     $maxScrollSegments = $Settings.MaxScrollSegments
     $scrollSettleMs = [int]($Settings.ScrollSettleSeconds * 1000)
 
@@ -2625,18 +3656,18 @@ function Invoke-ScrollCapture {
 
             $viewportHeight = [double]$scrollTarget.view
             $pageHeight = [double]$scrollTarget.total
-            $item.ScrollArea = switch ([string]$scrollTarget.kind) {
+            $Item.ScrollArea = switch ([string]$scrollTarget.kind) {
                 'window'  { 'the page' }
                 'none'    { 'nothing to scroll - the content fits on one screen' }
                 default   { [string]$scrollTarget.description }
             }
             foreach ($other in @($scrollTarget.others)) {
-                if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-                $item.Details.Add("Another scrolling area ($other) was not scrolled; content hidden in it is not captured.")
+                if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+                $Item.Details.Add("Another scrolling area ($other) was not scrolled; content hidden in it is not captured.")
             }
             foreach ($frameName in @($scrollTarget.blockedFrames)) {
-                if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-                $item.Details.Add("A frame from another site ($frameName) cannot be scrolled; content hidden in it is not captured.")
+                if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+                $Item.Details.Add("A frame from another site ($frameName) cannot be scrolled; content hidden in it is not captured.")
             }
 
             if ($viewportHeight -gt 0 -and $pageHeight -gt 0) {
@@ -2645,8 +3676,8 @@ function Invoke-ScrollCapture {
             if ($segmentCount -lt 1) { $segmentCount = 1 }
         }
         catch {
-            if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-            $item.Details.Add("The page height could not be measured, so only the first screen was captured: $($_.Exception.Message)")
+            if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+            $Item.Details.Add("The page height could not be measured, so only the first screen was captured: $($_.Exception.Message)")
             $segmentCount = 1
             $viewportHeight = 0
         }
@@ -2656,8 +3687,8 @@ function Invoke-ScrollCapture {
     $truncationNoted = $false
     if ($segmentCount -gt $maxScrollSegments) {
         $segmentCount = $maxScrollSegments
-        if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-        $item.Details.Add($truncationMessage)
+        if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+        $Item.Details.Add($truncationMessage)
         $truncationNoted = $true
     }
 
@@ -2678,9 +3709,9 @@ function Invoke-ScrollCapture {
                         if ($recomputed -gt $segmentCount) {
                             if ($recomputed -gt $maxScrollSegments) {
                                 $recomputed = $maxScrollSegments
-                                if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
+                                if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
                                 if (-not $truncationNoted) {
-                                    $item.Details.Add($truncationMessage)
+                                    $Item.Details.Add($truncationMessage)
                                     $truncationNoted = $true
                                 }
                             }
@@ -2693,15 +3724,15 @@ function Invoke-ScrollCapture {
                 }
             }
 
-            $segmentUrl = if ($BrowserErrorPage) { $item.FinalUrl } else { Get-CurrentPageUrl }
-            Add-ItemCapture -Item $item -SegmentIndex ($segment + 1) -SegmentCount $segmentCount -PageUrl $segmentUrl -Context $CaptureContext
+            $segmentUrl = if ($BrowserErrorPage) { $Item.FinalUrl } else { Get-CurrentPageUrl }
+            Add-ItemCapture -Item $Item -SegmentIndex ($segment + 1) -SegmentCount $segmentCount -PageUrl $segmentUrl -Context $CaptureContext
         }
 
         try { [void](Invoke-CdpEval -Expression 'window.__vouchTarget.to(0)' -TimeoutSec 10) }
         catch { Write-Verbose "Could not scroll back to the top: $($_.Exception.Message)" }
     }
     else {
-        Add-ItemCapture -Item $item -SegmentIndex 1 -SegmentCount 1 -PageUrl $item.FinalUrl -Context $CaptureContext
+        Add-ItemCapture -Item $Item -SegmentIndex 1 -SegmentCount 1 -PageUrl $Item.FinalUrl -Context $CaptureContext
     }
 }
 
@@ -2715,9 +3746,9 @@ function Invoke-CaptureItem {
         run before visiting the page); otherwise a new one is made. Returns the item.
     #>
     param(
-        # One row from Import-CaptureDefinition.
+        # One row from Import-CaptureDefinition or one page from ConvertTo-CaptureDefinition.
         [Parameter(Mandatory)][object]$Definition,
-        # From Resolve-RunSettings.
+        # From Resolve-RunSettings, or Get-PageSettings for the page's own overrides.
         [Parameter(Mandatory)][object]$Settings,
         # Run-wide capture values for Add-ItemCapture (RunId, Format, ImagesDir, ...).
         [Parameter(Mandatory)][hashtable]$CaptureContext,
@@ -2727,37 +3758,45 @@ function Invoke-CaptureItem {
     )
 
     if ($null -eq $Item) { $Item = New-CaptureItem -Definition $Definition }
-    $item = $Item
-    $definition = $Definition
     $navigationTimeoutSec = $Settings.NavigationTimeoutSec
     $settleSeconds = $Settings.SettleSeconds
 
-    Write-Host ("[{0}/{1}] {2} - {3}" -f $definition.Index, $ItemCount, $definition.Name, $definition.Url)
+    Write-Host ("[{0}/{1}] {2} - {3}" -f $Definition.Index, $ItemCount, $Definition.Name, $Definition.Url)
+
+    if ($Definition.PSObject.Properties['Actions']) {
+        $legacy = Test-LegacyActionList -Actions @($Definition.Actions)
+        if (-not $legacy.Supported) {
+            $Item.Status = 'FAILED'
+            $Item.Details.Add($legacy.Reason)
+            Write-RowStatus -Message "    FAILED - $($legacy.Reason)" -Status 'FAILED'
+            return $Item
+        }
+    }
 
     try {
         Set-NavigationMarker
-        $navigation = Send-CdpCommand -Method 'Page.navigate' -Params @{ url = $definition.Url } -TimeoutSec $navigationTimeoutSec
+        $navigation = Send-CdpCommand -Method 'Page.navigate' -Params @{ url = $Definition.Url } -TimeoutSec $navigationTimeoutSec
         $browserErrorPage = $false
         if ($null -ne $navigation -and $navigation.PSObject.Properties['errorText'] -and
             -not [string]::IsNullOrWhiteSpace([string]$navigation.errorText)) {
             $errorText = [string]$navigation.errorText
-            $item.Status = 'FAILED'
+            $Item.Status = 'FAILED'
             if ($errorText -eq 'net::ERR_HTTP_RESPONSE_CODE_FAILURE') {
                 # An HTTP error with an empty body: Edge shows its own error page
                 # instead, which is evidence like any other error page.
                 $browserErrorPage = $true
-                $item.Details.Add("The server returned an HTTP error with an empty body ($errorText). The browser's error page is captured below as evidence.")
+                $Item.Details.Add("The server returned an HTTP error with an empty body ($errorText). The browser's error page is captured below as evidence.")
             }
             else {
-                $item.Details.Add("The page could not be loaded: $errorText")
+                $Item.Details.Add("The page could not be loaded: $errorText")
                 Write-RowStatus -Message "    FAILED - $errorText" -Status 'FAILED'
-                return $item
+                return $Item
             }
         }
 
         if (-not (Wait-PageReady -TimeoutSec $navigationTimeoutSec)) {
-            if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-            $item.Details.Add("The page did not finish loading within $navigationTimeoutSec seconds; it was captured in whatever state it had reached.")
+            if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+            $Item.Details.Add("The page did not finish loading within $navigationTimeoutSec seconds; it was captured in whatever state it had reached.")
         }
 
         Start-Sleep -Milliseconds ([int]($settleSeconds * 1000))
@@ -2766,30 +3805,30 @@ function Invoke-CaptureItem {
         # PerformanceNavigationTiming entry; older builds return 0.
         try {
             $statusValue = Invoke-CdpEval -Expression "(performance.getEntriesByType('navigation')[0]||{}).responseStatus||0" -TimeoutSec 10
-            if ($null -ne $statusValue) { $item.HttpStatus = [int]$statusValue }
+            if ($null -ne $statusValue) { $Item.HttpStatus = [int]$statusValue }
         }
         catch {
-            $item.Details.Add("The HTTP status could not be read from the page: $($_.Exception.Message)")
+            $Item.Details.Add("The HTTP status could not be read from the page: $($_.Exception.Message)")
         }
 
-        if ($item.HttpStatus -ge 400) {
-            $item.Status = 'FAILED'
-            $item.Details.Add("The server returned HTTP $($item.HttpStatus). The error page is captured below as evidence.")
+        if ($Item.HttpStatus -ge 400) {
+            $Item.Status = 'FAILED'
+            $Item.Details.Add("The server returned HTTP $($Item.HttpStatus). The error page is captured below as evidence.")
         }
 
         # Edge's error page lives at chrome-error://; the browser stayed on the
         # requested URL, so record that rather than report a redirect.
-        $item.FinalUrl = if ($browserErrorPage) { $definition.Url } else { Get-CurrentPageUrl }
-        $requestedOrigin = Get-OriginFromUrl -Url $definition.Url
-        $finalOrigin = Get-OriginFromUrl -Url $item.FinalUrl
+        $Item.FinalUrl = if ($browserErrorPage) { $Definition.Url } else { Get-CurrentPageUrl }
+        $requestedOrigin = Get-OriginFromUrl -Url $Definition.Url
+        $finalOrigin = Get-OriginFromUrl -Url $Item.FinalUrl
         if (-not [string]::IsNullOrWhiteSpace($finalOrigin) -and
             -not [string]::IsNullOrWhiteSpace($requestedOrigin) -and
             $finalOrigin -ne $requestedOrigin -and
-            -not (Test-HttpsUpgrade -RequestedUrl $definition.Url -FinalUrl $item.FinalUrl)) {
-            if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-            $item.Details.Add("Redirected to $finalOrigin - possible login required.")
+            -not (Test-HttpsUpgrade -RequestedUrl $Definition.Url -FinalUrl $Item.FinalUrl)) {
+            if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+            $Item.Details.Add("Redirected to $finalOrigin - possible login required.")
         }
-        elseif (-not $browserErrorPage -and -not [string]::IsNullOrWhiteSpace($item.FinalUrl)) {
+        elseif (-not $browserErrorPage -and -not [string]::IsNullOrWhiteSpace($Item.FinalUrl)) {
             $hasPasswordField = $false
             try {
                 $hasPasswordField = [bool](Invoke-CdpEval -TimeoutSec 10 -Expression (
@@ -2799,21 +3838,21 @@ function Invoke-CaptureItem {
             catch {
                 Write-Verbose "Could not look for a password field: $($_.Exception.Message)"
             }
-            if (Test-LoginRedirect -RequestedUrl $definition.Url -FinalUrl $item.FinalUrl -HasPasswordField $hasPasswordField) {
-                if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-                $item.Details.Add("Redirected to a sign-in page ($(([Uri]$item.FinalUrl).AbsolutePath)) - the session has probably expired. Run -LoginSetup.")
+            if (Test-LoginRedirect -RequestedUrl $Definition.Url -FinalUrl $Item.FinalUrl -HasPasswordField $hasPasswordField) {
+                if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+                $Item.Details.Add("Redirected to a sign-in page ($(([Uri]$Item.FinalUrl).AbsolutePath)) - the session has probably expired. Run -LoginSetup.")
             }
         }
 
-        if ($definition.Steps.Count -gt 0) {
-            $stepLog = Invoke-RowSteps -Steps @($definition.Steps) -SettleSeconds $settleSeconds -NavigationTimeoutSec $navigationTimeoutSec
-            foreach ($entry in $stepLog) { $item.StepLog.Add($entry) }
+        if ($Definition.Steps.Count -gt 0) {
+            $stepLog = Invoke-RowSteps -Steps @($Definition.Steps) -SettleSeconds $settleSeconds -NavigationTimeoutSec $navigationTimeoutSec
+            foreach ($entry in $stepLog) { $Item.StepLog.Add($entry) }
             $failedSteps = @($stepLog | Where-Object { -not $_.Ok })
             if ($failedSteps.Count -gt 0) {
-                if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-                $item.Details.Add("Completed with errors: $($failedSteps.Count) of $($stepLog.Count) step(s) failed.")
+                if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+                $Item.Details.Add("Completed with errors: $($failedSteps.Count) of $($stepLog.Count) step(s) failed.")
             }
-            if (-not $browserErrorPage) { $item.FinalUrl = Get-CurrentPageUrl }
+            if (-not $browserErrorPage) { $Item.FinalUrl = Get-CurrentPageUrl }
         }
 
         try { [void](Send-CdpCommand -Method 'Page.bringToFront' -TimeoutSec 10) }
@@ -2825,23 +3864,23 @@ function Invoke-CaptureItem {
 
         $focusWarning = Set-EdgeForeground -ExpectedTitle $pageTitle
         if ($null -ne $focusWarning) {
-            if ($item.Status -eq 'OK') { $item.Status = 'WARNING' }
-            $item.Details.Add($focusWarning)
+            if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+            $Item.Details.Add($focusWarning)
         }
 
-        Invoke-ScrollCapture -Item $item -ScrollFullPage ([bool]$definition.ScrollFullPage) -BrowserErrorPage $browserErrorPage `
+        Invoke-ScrollCapture -Item $Item -ScrollFullPage ([bool]$Definition.ScrollFullPage) -BrowserErrorPage $browserErrorPage `
             -Settings $Settings -CaptureContext $CaptureContext
 
-        $summary = "    $($item.Status) - $($item.Captures.Count) capture(s)"
-        if ($item.Details.Count -gt 0) { $summary += " - $($item.Details[0])" }
-        Write-RowStatus -Message $summary -Status $item.Status
+        $summary = "    $($Item.Status) - $($Item.Captures.Count) capture(s)"
+        if ($Item.Details.Count -gt 0) { $summary += " - $($Item.Details[0])" }
+        Write-RowStatus -Message $summary -Status $Item.Status
     }
     catch {
-        $item.Status = 'FAILED'
-        $item.Details.Add("Unhandled error while capturing this item: $($_.Exception.Message)")
+        $Item.Status = 'FAILED'
+        $Item.Details.Add("Unhandled error while capturing this item: $($_.Exception.Message)")
         Write-RowStatus -Message "    FAILED - $($_.Exception.Message)" -Status 'FAILED'
     }
-    return $item
+    return $Item
 }
 
 function Invoke-Main {
@@ -2854,6 +3893,8 @@ function Invoke-Main {
         variables and call Invoke-Main with no arguments), every value visible in the
         calling scope counts as explicitly chosen, so it would also beat a config file.
         Nothing below the settings resolution reads a script parameter directly.
+        With -ConfigPath the pages and settings come from the configuration file, and
+        each page runs with its own settings (Get-PageSettings).
     #>
     param([AllowNull()][System.Collections.IDictionary]$BoundParameters = $null)
 
@@ -2862,15 +3903,18 @@ function Invoke-Main {
         $variable = Get-Variable -Name $definition.Name -ErrorAction SilentlyContinue
         if ($null -ne $variable) { $inScope[$definition.Name] = $variable.Value }
     }
-    if ($null -eq $BoundParameters) {
-        $settings = Resolve-RunSettings -BoundParameters $inScope -Defaults @{} -Config $null
+    $split = Split-BoundParameter -InScope $inScope -BoundParameters $BoundParameters
+    $boundNames = [string[]]@($split.Bound.Keys)
+    if ($boundNames -contains 'CsvPath' -and $boundNames -contains 'ConfigPath') {
+        throw 'Use either -CsvPath or -ConfigPath, not both. -CsvPath reads the pages from a CSV file; -ConfigPath reads the pages and all settings from a configuration file.'
     }
-    else {
-        $defaults = @{}
-        foreach ($name in $inScope.Keys) {
-            if (@($BoundParameters.Keys) -notcontains $name) { $defaults[$name] = $inScope[$name] }
-        }
-        $settings = Resolve-RunSettings -BoundParameters $BoundParameters -Defaults $defaults -Config $null
+
+    # The configuration path is command-line only, so it is known before the file is read.
+    $settings = Resolve-RunSettings -BoundParameters $split.Bound -Defaults $split.Defaults -Config $null
+    $config = $null
+    if ($settings.ConfigPath -and -not $settings.Verify) {
+        $config = Import-VouchConfig -Path $settings.ConfigPath
+        $settings = Resolve-RunSettings -BoundParameters $split.Bound -Defaults $split.Defaults -Config $config
     }
 
     Assert-Environment
@@ -2896,13 +3940,39 @@ function Invoke-Main {
         return
     }
 
-    if (-not (Test-Path -LiteralPath $settings.CsvPath -PathType Leaf)) {
-        throw "Capture definition CSV not found: $($settings.CsvPath)`nCreate one from captures.sample.csv, or pass -CsvPath."
+    if ($null -ne $config) {
+        $sourcePath = (Resolve-Path -LiteralPath $settings.ConfigPath).Path
+        $allDefinitions = [System.Collections.Generic.List[object]]::new()
+        foreach ($page in $config['pages']) {
+            $allDefinitions.Add((ConvertTo-CaptureDefinition -Page $page -Index ($allDefinitions.Count + 1)))
+        }
+        if ($allDefinitions.Count -eq 0) {
+            throw "The configuration file '$sourcePath' has no pages. Add at least one page under ""pages""."
+        }
     }
-    $resolvedCsvPath = (Resolve-Path -LiteralPath $settings.CsvPath).Path
+    else {
+        if (-not (Test-Path -LiteralPath $settings.CsvPath -PathType Leaf)) {
+            throw "Capture definition CSV not found: $($settings.CsvPath)`nCreate one from captures.sample.csv, or pass -CsvPath."
+        }
+        $sourcePath = (Resolve-Path -LiteralPath $settings.CsvPath).Path
+        $allDefinitions = Import-CaptureDefinition -Path $sourcePath
+    }
 
-    $definitions = Import-CaptureDefinition -Path $resolvedCsvPath
-    Write-Host "Loaded $($definitions.Count) capture item(s) from $resolvedCsvPath" -ForegroundColor Cyan
+    $definitions = Select-VouchPage -Definitions @($allDefinitions) -Only $settings.Only
+    if ($definitions.Count -eq 0) {
+        throw "Every page in '$sourcePath' is switched off (""enabled"": false), so there is nothing to capture."
+    }
+    $loaded = "Loaded $($definitions.Count) capture item(s) from $sourcePath"
+    if ($definitions.Count -lt $allDefinitions.Count) {
+        $loaded += " ($($allDefinitions.Count - $definitions.Count) other page(s) not selected or switched off)"
+    }
+    Write-Host $loaded -ForegroundColor Cyan
+    if ($null -ne $config) {
+        $inactive = Get-InactiveConfigSetting -Config $config
+        if ($inactive.Count -gt 0) {
+            Write-Host "WARNING: this version of Vouch does not apply these configuration settings yet, so they have no effect: $($inactive -join ', ')." -ForegroundColor Yellow
+        }
+    }
 
     if (-not (Test-Path -LiteralPath $settings.OutputDir)) {
         [void](New-Item -ItemType Directory -Path $settings.OutputDir -Force)
@@ -2981,8 +4051,9 @@ function Invoke-Main {
             # Added before the page is visited, so it is reported whatever happens to it.
             $item = New-CaptureItem -Definition $definition
             $items.Add($item)
+            $pageSettings = Get-PageSettings -Settings $settings -Definition $definition -Config $config -BoundNames $boundNames
             [void](Invoke-CaptureItem -Definition $definition -Item $item -ItemCount $definitions.Count `
-                -Settings $settings -CaptureContext $captureContext)
+                -Settings $pageSettings -CaptureContext $captureContext)
         }
     }
     finally {
@@ -3031,7 +4102,7 @@ function Invoke-Main {
         BrowserInstance  = $browserInstance
         CaptureDesktop   = $desktopNote
         ToolVersion      = $script:ToolVersion
-        CsvPath          = $resolvedCsvPath
+        CsvPath          = $sourcePath
         ImageFormat      = $settings.ImageFormat
         ImageDescription = $imageDescription
         ScreenResolution = $screenResolution
@@ -3070,7 +4141,7 @@ function Invoke-Main {
     if ($summaryPath) { Write-Host "Summary: $summaryPath" }
 }
 
-$transcribing = Start-RunLog -Directory $LogDir
+$transcribing = Start-RunLog -Directory (Get-RunLogDirectory -BoundParameters $PSBoundParameters -LogDir $LogDir -ConfigPath $ConfigPath)
 try {
     Invoke-Main -BoundParameters $PSBoundParameters
 }
