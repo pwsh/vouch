@@ -2674,6 +2674,8 @@ function Invoke-DesktopShortcut {
     return $false
 }
 
+#endregion
+
 #region Image metadata ----------------------------------------------------------
 
 function New-CaptureMetadata {
@@ -2920,6 +2922,8 @@ function Get-Sha256Hex {
 }
 
 #endregion
+
+#region Screen grab and image files --------------------------------------------
 
 function Get-ScreenCapture {
     <#
@@ -5655,7 +5659,7 @@ function New-HtmlReport {
 
 #endregion
 
-#region Main ------------------------------------------------------------------
+#region Run helpers: browser session, login setup, JSON summary ----------------
 
 function Write-RowStatus {
     param(
@@ -5868,6 +5872,10 @@ function ConvertTo-RunSummaryJson {
         })
     return ($summary | ConvertTo-Json -Depth 6)
 }
+
+#endregion
+
+#region Verify (-Verify) -------------------------------------------------------
 
 function Get-KnownReportCssHash {
     <#
@@ -6546,6 +6554,10 @@ function Invoke-VerifyReport {
     return 4
 }
 
+#endregion
+
+#region Output names and archive -----------------------------------------------
+
 function Expand-NameTemplate {
     <#
         Fills the tokens of a file name template ("{title} {period}.zip"). Token names
@@ -6851,6 +6863,10 @@ function Open-ReportFile {
     Invoke-Item -LiteralPath $Path
 }
 
+#endregion
+
+#region Run settings -----------------------------------------------------------
+
 function Start-RunLog {
     <#
         Unattended runs have no console to read, so -LogDir keeps a transcript of each
@@ -7152,6 +7168,10 @@ function Get-RunLogDirectory {
     }
     return $LogDir
 }
+
+#endregion
+
+#region Capture run ------------------------------------------------------------
 
 function New-CaptureItem {
     <#
@@ -8266,6 +8286,10 @@ function Write-RunFailedEvent {
         exitCode = 1; reportPath = ''; jsonSummaryPath = ''; counts = $null; stopped = [bool]$script:StopRequested
         logPath = $script:CaptureLogPath; logComplete = [bool]$script:CaptureLogComplete })
 }
+
+#endregion
+
+#region Entry: -Designer, the transcript and the run ---------------------------
 
 function Invoke-DesignerMode {
     <#
