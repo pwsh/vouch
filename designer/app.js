@@ -1276,8 +1276,8 @@
       ]),
       section('What each screenshot shows', null, [
         radioField({ path: 'defaults.captureArea', label: 'Capture area (run default)', options: [
-          { value: 'screen', label: AREA_TEXT.screen, help: 'The whole screen: the Windows clock and date are in every picture. What auditors usually expect.' },
-          { value: 'window', label: AREA_TEXT.window, help: 'The Edge window with its title bar, tabs and address bar; no taskbar.' },
+          { value: 'screen', label: AREA_TEXT.screen, help: 'The whole screen: the Windows clock and date are in every picture. What auditors usually expect. The Vouch browser must be on the main screen (with more than one monitor: the one Windows calls the main display), or the pictures show the main screen instead of the page.' },
+          { value: 'window', label: AREA_TEXT.window, help: 'The Edge window with its title bar, tabs and address bar; no taskbar. The Vouch browser must be on the main screen.' },
           { value: 'page', label: AREA_TEXT.page, help: 'Taken by the browser itself; Edge need not be in front. No address bar or clock in the picture - the time and address are in the report and inside each image file.' }] }),
         settingNumber('defaults.zoomPercent', 'Zoom', 'Shows the pages zoomed, like Ctrl+plus or minus, without changing anything in Edge.', '%'),
         checkField({ path: 'browser.useVirtualDesktop', label: 'Capture on a separate, empty virtual desktop', help: 'Other programs then do not appear in the taskbar of the screenshots. Your windows are untouched and you return to them at the end. A page test from the Designer ignores this setting.' }),

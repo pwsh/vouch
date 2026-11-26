@@ -1712,9 +1712,9 @@ Describe 'Capture area: Edge window (window position mocked)' -Tag 'Integration'
             }
             finally { $bitmap.Dispose() }
         }
-        function Invoke-WindowPage {
+        function Invoke-WindowPage([string]$Area = 'window') {
             $definition = ConvertTo-CaptureDefinition -Index 2 -Page ([ordered]@{ name = 'Window'; url = "$Web/ok" })
-            $run = Resolve-RunSettings -BoundParameters @{ CaptureArea = 'window' } -Config $null -Defaults @{
+            $run = Resolve-RunSettings -BoundParameters @{ CaptureArea = $Area } -Config $null -Defaults @{
                 NavigationTimeoutSec = 10; SettleSeconds = 0.1; ScrollSettleSeconds = 0.1; MaxScrollSegments = 10 }
             $context = @{ RunId = [guid]::NewGuid().ToString(); Format = 'png'; Quality = 85; Extension = 'png'; SaveImages = $false; ImagesDir = ''; Screen = '1920x1080' }
             Invoke-CaptureItem -Definition $definition -Settings $run -CaptureContext $context 6>$null
@@ -1766,6 +1766,28 @@ Describe 'Capture area: Edge window (window position mocked)' -Tag 'Integration'
         $item.Captures[0].CaptureArea | Should -Be 'window'
         $image = [System.Drawing.Bitmap]::new([System.IO.MemoryStream]::new([Convert]::FromBase64String($item.Captures[0].Base64)))
         try { @($image.Width, $image.Height) | Should -Be @(320, 480) } finally { $image.Dispose() }
+    }
+
+    It 'full screen: <Case> (the image is still the whole main screen)' -ForEach @(
+        @{ Case = 'the window is on the main display'; Bounds = @(0, 0, 1920, 1080); Status = 'OK'; Detail = '' }
+        @{ Case = 'the window is partly on it'; Bounds = @(1600, 50, 640, 480); Status = 'WARNING'
+            Detail = 'Part of the Edge window is outside the main display, so the images show only the part on it (320x480 of the 640x480 window).' }
+        @{ Case = 'the window is on another screen'; Bounds = @(1920, 0, 1920, 1080); Status = 'WARNING'
+            Detail = 'The browser window is on another screen; this image shows the main screen, not the page. Move the Vouch browser to the main screen.' }
+        @{ Case = 'the window is not found (as before)'; Bounds = $null; Status = 'OK'; Detail = '' }
+    ) {
+        $script:TestBounds = if ($Bounds) { [System.Drawing.Rectangle]::new($Bounds[0], $Bounds[1], $Bounds[2], $Bounds[3]) } else { $null }
+        # Like the real one: it remembers the window it found (none when not found).
+        Mock Set-EdgeForeground { $script:EdgeForegroundHandle = if ($script:TestBounds) { [IntPtr]::new(1) } else { [IntPtr]::Zero }; $null }
+        Mock Get-EdgeWindowBounds { $script:TestBounds }
+        try { $item = Invoke-WindowPage -Area 'screen' }
+        finally { $script:EdgeForegroundHandle = [IntPtr]::Zero }
+        $item.Status | Should -Be $Status -Because ($item.Details -join ' | ')
+        if ($Detail) { @($item.Details) | Should -Be @($Detail) } else { @($item.Details).Count | Should -Be 0 }
+        $item.Captures.Count | Should -Be 1
+        $item.Captures[0].CaptureArea | Should -Be 'screen'
+        Should -Invoke Get-ScreenCapture -Times 1 -Exactly
+        if (-not $Bounds) { Should -Invoke Get-EdgeWindowBounds -Times 0 -Exactly }
     }
 }
 

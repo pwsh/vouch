@@ -1182,6 +1182,78 @@ Describe 'Capture area: window crop' {
     }
 }
 
+Describe 'Full-screen capture: is the browser on the main screen? (final fix wave)' {
+    BeforeAll {
+        Add-Type -AssemblyName System.Drawing
+        function New-PlacementItem {
+            [pscustomobject]@{ Status = 'OK'; Details = [System.Collections.Generic.List[string]]::new() }
+        }
+    }
+    BeforeEach {
+        Mock Get-PrimaryScreenBounds { [System.Drawing.Rectangle]::new(0, 0, 1920, 1080) }
+        # Set-EdgeForeground found the window.
+        $script:EdgeForegroundHandle = [IntPtr]::new(1)
+    }
+    AfterEach { $script:EdgeForegroundHandle = [IntPtr]::Zero }
+
+    It 'adds nothing when the window is on the main screen (<Case>)' -ForEach @(
+        @{ Case = 'maximised'; Bounds = @(0, 0, 1920, 1080) }
+        @{ Case = 'maximised, GetWindowRect borders'; Bounds = @(-8, -8, 1936, 1096) }
+        @{ Case = 'inside'; Bounds = @(100, 50, 800, 600) }
+    ) {
+        $script:TestBounds = [System.Drawing.Rectangle]::new($Bounds[0], $Bounds[1], $Bounds[2], $Bounds[3])
+        Mock Get-EdgeWindowBounds { $script:TestBounds }
+        $item = New-PlacementItem
+        Add-ScreenPlacementDetail -Item $item -PageTitle 'x'
+        $item.Status | Should -Be 'OK'
+        $item.Details.Count | Should -Be 0
+    }
+
+    It 'warns that only part of the window is in the image when it is partly on the main screen' {
+        Mock Get-EdgeWindowBounds { [System.Drawing.Rectangle]::new(1600, 50, 640, 480) }
+        $item = New-PlacementItem
+        Add-ScreenPlacementDetail -Item $item -PageTitle 'x'
+        $item.Status | Should -Be 'WARNING'
+        @($item.Details) | Should -Be @('Part of the Edge window is outside the main display, so the images show only the part on it (320x480 of the 640x480 window).')
+    }
+
+    It 'warns that the image shows the main screen, not the page, when the window is entirely on another screen (<Case>)' -ForEach @(
+        @{ Case = 'right of it'; Bounds = @(1920, 0, 1920, 1080) }
+        @{ Case = 'left of it'; Bounds = @(-1920, 0, 1920, 1080) }
+        @{ Case = 'above it'; Bounds = @(0, -1200, 1920, 1200) }
+    ) {
+        $script:TestBounds = [System.Drawing.Rectangle]::new($Bounds[0], $Bounds[1], $Bounds[2], $Bounds[3])
+        Mock Get-EdgeWindowBounds { $script:TestBounds }
+        $item = New-PlacementItem
+        Add-ScreenPlacementDetail -Item $item -PageTitle 'x'
+        Add-ScreenPlacementDetail -Item $item -PageTitle 'x'
+        $item.Status | Should -Be 'WARNING'
+        @($item.Details) | Should -Be @('The browser window is on another screen; this image shows the main screen, not the page. Move the Vouch browser to the main screen.')
+    }
+
+    It 'behaves as before when the window cannot be found' {
+        Mock Get-EdgeWindowBounds { $null }
+        $item = New-PlacementItem
+        Add-ScreenPlacementDetail -Item $item -PageTitle 'x'
+        $item.Status | Should -Be 'OK'
+        $item.Details.Count | Should -Be 0
+        # Set-EdgeForeground did not find it: no second search (no extra wait per capture).
+        $script:EdgeForegroundHandle = [IntPtr]::Zero
+        Add-ScreenPlacementDetail -Item $item -PageTitle 'x'
+        Should -Invoke Get-EdgeWindowBounds -Times 1 -Exactly
+        $item.Details.Count | Should -Be 0
+    }
+
+    It 'keeps a FAILED page failed' {
+        Mock Get-EdgeWindowBounds { [System.Drawing.Rectangle]::new(1920, 0, 1920, 1080) }
+        $item = New-PlacementItem
+        $item.Status = 'FAILED'
+        Add-ScreenPlacementDetail -Item $item -PageTitle 'x'
+        $item.Status | Should -Be 'FAILED'
+        $item.Details.Count | Should -Be 1
+    }
+}
+
 Describe 'Page zoom: the device metrics override' {
     It 'zooms <Percent>% from a <Width>x<Height> window to a <ExpectedWidth>x<ExpectedHeight> layout' -ForEach @(
         @{ Percent = 50; Width = 1256; Height = 708; ExpectedWidth = 2512; ExpectedHeight = 1416 }

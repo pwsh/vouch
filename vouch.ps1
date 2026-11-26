@@ -386,6 +386,8 @@ $script:CaptureLogWarned   = $false
 # The page whose details become "detail" events, and how many of them were written.
 $script:EventItem          = $null
 $script:EventDetailCount   = 0
+# The Edge window Set-EdgeForeground last found (Zero = none).
+$script:EdgeForegroundHandle = [IntPtr]::Zero
 # The -LogDir console log (transcript) of this run, '' when none is kept.
 $script:RunLogFile         = ''
 
@@ -2440,6 +2442,8 @@ function Set-EdgeForeground {
     )
 
     $handle = Get-EdgeWindowHandle -TimeoutSec $TimeoutSec -ExpectedTitle $ExpectedTitle
+    # Kept so Add-ScreenPlacementDetail looks for the window only when it was found here.
+    $script:EdgeForegroundHandle = $handle
     if ($handle -eq [IntPtr]::Zero) {
         return 'Could not locate the Edge window; the screenshot may show another application.'
     }
@@ -4361,12 +4365,15 @@ function Invoke-PageAction {
 
         # Page-content captures are taken by the browser itself: the window does not need
         # to be in front, so it is left where the person has it.
-        if ((Get-PageCaptureMode -Settings $Settings).Area -ne 'page') {
+        $captureArea = (Get-PageCaptureMode -Settings $Settings).Area
+        if ($captureArea -ne 'page') {
             $focusWarning = Set-EdgeForeground -ExpectedTitle $pageTitle
             if ($null -ne $focusWarning) {
                 if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
                 if (-not $Item.Details.Contains($focusWarning)) { $Item.Details.Add($focusWarning) }
             }
+            # A window capture checks this itself for each image (Add-ItemCapture).
+            if ($captureArea -eq 'screen') { Add-ScreenPlacementDetail -Item $Item -PageTitle $pageTitle }
         }
 
         $scroll = $Action['scroll']
@@ -4857,6 +4864,35 @@ function Get-PartialWindowDetail {
     if ($WindowBounds.Width - $Visible.Width -le 16 -and $WindowBounds.Height - $Visible.Height -le 16) { return '' }
     return 'Part of the Edge window is outside the main display, so the images show only the part on it ({0}x{1} of the {2}x{3} window).' -f
         $Visible.Width, $Visible.Height, $WindowBounds.Width, $WindowBounds.Height
+}
+
+function Add-ScreenPlacementDetail {
+    <#
+        A full-screen capture grabs the primary display (Get-ScreenCapture), but
+        Set-EdgeForeground maximises Edge on whichever monitor it is on. With the audit
+        Edge on a second monitor every image would show the main screen instead of the
+        page, and the run would still look fine - so the page gets a WARNING when the
+        window is not on the main display at all, and the usual partial-window detail
+        when only part of it is. What is captured does not change. A window that cannot
+        be found was already reported by Set-EdgeForeground: nothing is added then.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Item,
+        [AllowEmptyString()][string]$PageTitle = ''
+    )
+    # Only when Set-EdgeForeground has just found the window (then this look is quick):
+    # a run without a window does not wait again for each capture.
+    if ($script:EdgeForegroundHandle -eq [IntPtr]::Zero) { return }
+    $windowBounds = Get-EdgeWindowBounds -ExpectedTitle $PageTitle -TimeoutSec 2
+    if ($null -eq $windowBounds) { return }
+    $visible = Get-WindowCaptureRectangle -WindowBounds $windowBounds -ScreenBounds (Get-PrimaryScreenBounds)
+    $detail = if ($null -eq $visible) {
+        'The browser window is on another screen; this image shows the main screen, not the page. Move the Vouch browser to the main screen.'
+    }
+    else { Get-PartialWindowDetail -WindowBounds $windowBounds -Visible $visible }
+    if (-not $detail) { return }
+    if ($Item.Status -eq 'OK') { $Item.Status = 'WARNING' }
+    if (-not $Item.Details.Contains($detail)) { $Item.Details.Add($detail) }
 }
 
 function Get-CaptureManifest {
