@@ -538,7 +538,9 @@ Every line should say **OK**, ending with **VERIFIED: … check(s) passed**. If 
 does not match, the lines concerned say **FAIL** and the result is **NOT VERIFIED**.
 The check works on any Windows computer with PowerShell 7 and a copy of the Vouch
 folder — Edge and logins are not needed. For a report with linked picture files, keep
-its `images` folder next to it.
+its `images` folder next to it. A report without any screenshot (for example, every page
+failed before its first picture) cannot be verified: there is nothing to check, and the
+result is **NOT VERIFIED**.
 
 **What a successful check proves:**
 
@@ -797,6 +799,11 @@ the file in Notepad, check that the columns are separated by commas, and save it
   organisation controls this setting — ask IT to allow the Vouch scripts to run.
 - **The console says the Designer window could not be opened**: it prints an address
   starting with `http://localhost:`. Open that address in Edge on this computer.
+- **"The Vouch Designer is already open. Look for its window on the taskbar."** (I
+  double-clicked twice): only one Designer can be open at a time. Use the window that is
+  already open — Vouch tries to bring it to the front; otherwise find it on the taskbar.
+  If that window only shows an error, close it and start the Designer again. Press any key
+  to close the second console window.
 
 ### "Browser not connected"
 
@@ -848,6 +855,23 @@ right-click inside that part → **Open frame in new tab** (if offered) shows it
 (…) cannot be scrolled".** The page has more than one part that scrolls on its own, and
 Vouch captured the largest one. Add a capture with **Pick a scroll area** for the other
 part, or capture that part's own address as another page.
+
+**WARNING: "The browser window is on another screen; this image shows the main screen, not the page."**
+You have more than one monitor, and the Vouch browser was on one that is not the main
+display. *Full screen* and *Edge window only* captures need the Vouch browser on the main
+screen (the one Windows calls the main display). Drag it there and run again — or use
+*Page content only*, which works wherever the window is.
+
+**"Nothing was captured: … would be saved as …, which is the configuration file …"**
+The report name and output folder would make the run write its report, summary or log
+over your configuration file (for example a file `Q3.json` with report name `Q3`, saved in
+the output folder itself). Nothing was changed. Choose another report name in the Output
+tab, or another output folder.
+
+**"The report cannot be saved … Vouch cannot save any file in the output folder"**
+The output folder does not exist, is on a network share that cannot be reached right now,
+or you may not save files there. Check the folder (and your network connection), or choose
+another one. Output folders on a network share work when the share can be reached.
 
 **Other windows or pop-ups appear in the screenshots.** Something came to the front
 during the run. Turn on *Do not disturb* (click the clock → the bell icon) before a run,

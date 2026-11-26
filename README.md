@@ -489,7 +489,8 @@ stand in the company header at the top and is shown at most 220 × 64 pixels (a 
 without report options has no header and no logo). A report rebuilt from scratch with
 new images and new hashes verifies; **only a manifest hash recorded elsewhere at capture
 time shows that a report is the original.** `-Verify` says nothing about the capture
-log, the JSON summary or the zip.
+log, the JSON summary or the zip. A report with no screenshots (every page failed before
+its first image, or every page was stopped) cannot be verified: there is nothing to check.
 
 **Hand-edited reports.** A *structural* edit stops a report verifying, even when it was
 honest: an element or attribute Vouch does not write (a paragraph or comment added), a
@@ -581,7 +582,9 @@ from screenshots, including when a run is started from the Designer.
 - **Configuration files from other people**: treat them like any document. Opening one in
   the Designer runs nothing and reads no other file. **Running it visits its addresses in
   your signed-in audit browser** and clicks what it says, and reads the logo file it
-  names — look at the pages and steps first.
+  names — look at the pages and steps first. The file also decides **where the report and
+  its files are written** (any folder or network share you can write to) and **which browser
+  profile** the run uses (`browser.profileDir`) — check the Output and Browser settings too.
 
 Full runs from the Designer with the `screen` area show the Designer's taskbar button in
 the evidence; the virtual-desktop option avoids that (the Designer closes the Edge it
@@ -613,6 +616,8 @@ robust*, *Robust*, *Less robust*, *Fragile*. Limits:
 - A page that reloads during a pick is shielded until the layer is back (not inside
   frames from other sites); the picker removes itself if the Designer stops answering
   (5 s; 20 s while a click is checked).
+- Pop-ups and new tabs that the page opens by itself during a pick are not protected:
+  the layer is only on the page you pick in, so a click there acts normally.
 
 Hands-on check not yet done: real IME, emoji panel and voice input during a pick (tested
 through DevTools input only).
@@ -724,7 +729,12 @@ a login screen" apart from "the setting really is off".
   images). Same for RDP: minimising or disconnecting stops the desktop from rendering.
 - Do not use the mouse or keyboard during a `screen` or `window` run; a window brought to
   the front or a notification ends up in the evidence.
-- **Multi-monitor:** only the primary display is captured; keep Edge on it.
+- **Multi-monitor:** only the primary (main) display is captured; keep the Vouch browser on it.
+  With the browser on another screen, `screen` captures show the main screen instead of the
+  page, and the page gets a WARNING saying so.
+- **Output folder on a network share:** works — a UNC path such as
+  `\\server\share\Evidence` or a mapped drive, for `-OutputDir` or `output.dir`. If the share
+  cannot be reached, the run stops at its start and says the output folder is the problem.
 - **Report size:** JPEG at quality 85 costs roughly 200–400 KB per screenshot. PNG is
   typically 4–8 times larger. Linked images keep the HTML small.
 - Test a new page (Designer: **Test this page**; command line: `-Only p003`) before a
@@ -762,6 +772,20 @@ otherwise `.\vouch.ps1 -LoginSetup`).
 stopped. Close the panel window too, and start the Designer again. Closing the console
 with X does not close the panel.
 
+**"The Vouch Designer is already open"** — you started the Designer a second time (for
+example, double-clicked twice). Only one Designer window can be open at a time; use the one
+that is already open (its window is brought to the front, or look on the taskbar). If that
+window only shows an error, close it and start the Designer again.
+
+**A WARNING "The browser window is on another screen"** — with more than one monitor, the
+Vouch browser was on a screen other than the main one, so `screen` captures show the main
+screen, not the page. Move the Vouch browser to the main display and run again.
+
+**"... of this run would be saved as ... which is the configuration file"** — the report
+name and output folder would make the run write its report, JSON summary or capture log
+over the configuration (or CSV) file itself, for example `Q3.json` with report name `Q3` in
+its own folder. Nothing is written; choose another report name or output folder.
+
 **PowerShell refuses to run the script** — unblock the files once
 (`Get-ChildItem -Recurse | Unblock-File`) or start it with
 `pwsh -ExecutionPolicy Bypass -File .\vouch.ps1`.
@@ -776,7 +800,7 @@ Designer's server, panel, picker and runs from the panel.
 
 ```powershell
 Install-Module Pester -Scope CurrentUser -MinimumVersion 5.0   # once
-pwsh .\tests\Invoke-Tests.ps1                       # everything (a few minutes)
+pwsh .\tests\Invoke-Tests.ps1                       # everything (about 7 minutes, mostly the integration tests)
 pwsh .\tests\Invoke-Tests.ps1 -UnitOnly             # no browser needed
 pwsh .\tests\Invoke-Tests.ps1 -IncludeInteractive   # also shows the real Vouch dialog once (opt-in)
 ```

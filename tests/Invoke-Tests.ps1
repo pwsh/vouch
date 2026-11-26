@@ -8,6 +8,9 @@
     Microsoft Edge; they run it headless with a throwaway profile, so no window appears
     and neither your own Edge profile nor the Vouch audit profile is touched.
 
+    The whole suite takes about 7 minutes, most of it the integration tests; -UnitOnly
+    is much quicker.
+
     Tests tagged KnownIssue assert the correct behaviour for bugs that are not fixed yet
     and are expected to fail. Use -ExcludeKnownIssues for a green/red regression signal.
 
