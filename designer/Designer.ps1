@@ -1720,12 +1720,79 @@ function Assert-DesignerProfileSeparate {
     $State.AuditProfileDir = Resolve-DesignerPath -Path $AuditProfile
 }
 
+function Get-DesignerAlreadyOpenMessage {
+    # What a second Designer says before it stops (exit code 1).
+    return 'The Vouch Designer is already open. Look for its window on the taskbar. (If that window shows only an error, close it and start the Designer again.)'
+}
+
+function Show-DesignerExistingPanel {
+    <#
+        Brings the window of the Designer that is already open to the front, so a second
+        double-click is not left wondering. Best effort: Windows may refuse, and nothing
+        else is done to that Edge.
+    #>
+    param([AllowNull()][object]$Process)
+    if ($null -eq $Process) { return }
+    try {
+        Add-Type -AssemblyName Microsoft.VisualBasic
+        [Microsoft.VisualBasic.Interaction]::AppActivate([int]$Process.Id)
+    }
+    catch { Write-Verbose "The open Designer window could not be brought to the front: $($_.Exception.Message)" }
+}
+
+function Enter-DesignerInstance {
+    <#
+        One Designer with a panel per Windows session. A second one would join the first
+        one's panel Edge (one profile, one browser process), watch that process instead
+        of its own window, close or kill it - unsaved edits and all - when it stops, and
+        drive the same audit Edge on the same port. So a second start stops with a plain
+        message. Two signs that a Designer is open: a live Edge holds the panel profile
+        (also left over from a Designer that was killed, whose window is still open), or
+        another process holds the named mutex. Windows releases a mutex when its owner
+        dies, however it ends, so a killed Designer never blocks the next start (no marker
+        file to go stale). Returns the held mutex for Exit-DesignerInstance; throws the
+        message otherwise. Designers started with -NoPanel (tests, programs) do not call it.
+    #>
+    param(
+        [string]$Name = 'Local\VouchDesignerPanel',
+        [string]$PanelProfile = (Get-DesignerPanelProfile)
+    )
+    $holder = Find-EdgeBrowserProcess -ProfileDir $PanelProfile
+    if ($null -ne $holder) {
+        Show-DesignerExistingPanel -Process $holder
+        throw (Get-DesignerAlreadyOpenMessage)
+    }
+    $mutex = [System.Threading.Mutex]::new($false, $Name)
+    $owned = $false
+    try { $owned = $mutex.WaitOne(0) }
+    catch {
+        # The previous owner ended without releasing it: the mutex is now ours.
+        if ($_.Exception.GetBaseException() -is [System.Threading.AbandonedMutexException]) { $owned = $true }
+        else { $mutex.Dispose(); throw }
+    }
+    if (-not $owned) {
+        $mutex.Dispose()
+        throw (Get-DesignerAlreadyOpenMessage)
+    }
+    return $mutex
+}
+
+function Exit-DesignerInstance {
+    # Lets the next Designer start (Enter-DesignerInstance). Same thread that entered.
+    param([AllowNull()][object]$Instance)
+    if ($null -eq $Instance) { return }
+    try { $Instance.ReleaseMutex() } catch { Write-Verbose "The Designer instance was already released: $($_.Exception.Message)" }
+    $Instance.Dispose()
+}
+
 function Start-DesignerPanel {
     <#
         Opens the panel in its own Edge process. With a profile no other Edge holds, the
         process Start-Process returns is the browser itself (spike 2), so its exit means
-        the person closed the panel. If an Edge already holds the profile (a second
-        Designer), the new window joins it and that process is watched instead.
+        the person closed the panel. An Edge that already holds the profile belongs to
+        another Designer (Enter-DesignerInstance normally stops before this): the window
+        is not opened into it, because this Designer would then watch - and at its end
+        close - that other Designer's window.
     #>
     param(
         [Parameter(Mandatory)][string]$Url,
@@ -1736,10 +1803,8 @@ function Start-DesignerPanel {
     if ($problem) { throw $problem }
     $edge = Find-EdgeExecutable
     if (-not (Test-Path -LiteralPath $ProfileDir)) { [void](New-Item -ItemType Directory -Path $ProfileDir -Force) }
-    $existing = Find-EdgeBrowserProcess -ProfileDir $ProfileDir
-    $process = Start-Process -FilePath $edge -ArgumentList (Get-DesignerPanelArgument -Url $Url -ProfileDir $ProfileDir -Bounds (Get-DesignerPanelBounds)) -PassThru
-    if ($null -ne $existing) { return $existing }
-    return $process
+    if ($null -ne (Find-EdgeBrowserProcess -ProfileDir $ProfileDir)) { throw (Get-DesignerAlreadyOpenMessage) }
+    return Start-Process -FilePath $edge -ArgumentList (Get-DesignerPanelArgument -Url $Url -ProfileDir $ProfileDir -Bounds (Get-DesignerPanelBounds)) -PassThru
 }
 
 function Test-DesignerProcessExited {
@@ -1788,9 +1853,23 @@ function Stop-DesignerPanel {
     <#
         Closes the panel window the way a person would (WM_CLOSE), so Edge does not offer
         to "restore pages" next time; kills it only if it does not go within 3 seconds.
+        Only a process this session started: one that started before -LaunchedAt (the
+        moment this Designer opened its panel), or whose start time cannot be read, or
+        any process when no panel was launched, may belong to another Designer or to the
+        person, and is never closed or killed.
     #>
-    param([AllowNull()][System.Diagnostics.Process]$Process)
+    param(
+        [AllowNull()][System.Diagnostics.Process]$Process,
+        [datetime]$LaunchedAt = [datetime]::MinValue
+    )
     if ($null -eq $Process) { return }
+    if ($LaunchedAt -eq [datetime]::MinValue) { return }
+    $started = Get-DesignerProcessStartTime -Process $Process
+    # A second of leeway: the process start time and Get-Date are read from different clocks.
+    if ($started -eq [datetime]::MinValue -or $started -lt $LaunchedAt.AddSeconds(-1)) {
+        Write-Verbose "The window process $($Process.Id) was not started by this Designer and is left open."
+        return
+    }
     try {
         if (Test-DesignerProcessExited -Process $Process) { return }
         [void]$Process.CloseMainWindow()
@@ -3709,7 +3788,11 @@ function Start-VouchDesigner {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     $designerFolder = Join-Path -Path (Split-Path -Path ([System.IO.Path]::GetFullPath($ScriptPath)) -Parent) -ChildPath 'designer'
-    $started = Start-DesignerListener -Port $Port
+    # A second Designer with a window stops here, before it opens or changes anything.
+    $instance = if ($NoPanel) { $null } else { Enter-DesignerInstance -PanelProfile $PanelProfileDir }
+    $panelLaunchedAt = [datetime]::MinValue
+    try { $started = Start-DesignerListener -Port $Port }
+    catch { Exit-DesignerInstance -Instance $instance; throw }
     $listener = $started.Listener
     $state = $null
     try {
@@ -3741,11 +3824,14 @@ function Start-VouchDesigner {
         }
         if (-not $NoPanel) {
             try {
+                $panelLaunchedAt = Get-Date
                 $state.PanelProcess = Start-DesignerPanel -Url $url -ProfileDir $PanelProfileDir -AuditProfileDir $state.AuditProfileDir
                 $state.PanelStartedAt = Get-Date
                 $state.PanelProcessStart = Get-DesignerProcessStartTime -Process $state.PanelProcess
             }
             catch {
+                # Another Designer opened its window in the meantime: stop, as at the start.
+                if ($_.Exception.Message -eq (Get-DesignerAlreadyOpenMessage)) { throw }
                 Write-Host "The Designer window could not be opened: $($_.Exception.Message)" -ForegroundColor Yellow
                 Write-Host "Open this address in Edge or another browser on this computer instead:`n  $url"
             }
@@ -3766,7 +3852,8 @@ function Start-VouchDesigner {
             try { Close-DesignerBrowser -State $state }
             catch { Write-Host "The audit Edge could not be closed: $($_.Exception.Message)" -ForegroundColor Yellow }
         }
-        if ($null -ne $state -and $null -ne $state.PanelProcess) { Stop-DesignerPanel -Process $state.PanelProcess }
+        if ($null -ne $state -and $null -ne $state.PanelProcess) { Stop-DesignerPanel -Process $state.PanelProcess -LaunchedAt $panelLaunchedAt }
+        Exit-DesignerInstance -Instance $instance
         Write-Host 'Vouch Designer stopped.'
     }
 }

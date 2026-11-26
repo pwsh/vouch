@@ -1614,6 +1614,87 @@ Describe 'Designer mode in vouch.ps1 and the panel window' {
         $bounds.Height | Should -Be ($area.Height + 7)
     }
 
+    It 'refuses a second Designer while the first one holds the instance, and allows one after it has gone (final fix wave)' {
+        $name = "Local\VouchDesignerTest-$([guid]::NewGuid().ToString('N'))"
+        $panelProfile = Join-Path $TestDrive 'no-panel-profile'
+        Mock Find-EdgeBrowserProcess { $null }
+        Mock Show-DesignerExistingPanel { }
+        # The first Designer is another process that holds the instance and stays alive.
+        $holderScript = "`$m = [System.Threading.Mutex]::new(`$false, '$name'); [void]`$m.WaitOne(); Set-Content -LiteralPath '$TestDrive\held.txt' -Value 1; Start-Sleep -Seconds 60"
+        $holder = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile', '-NonInteractive', '-Command', $holderScript -PassThru -WindowStyle Hidden
+        try {
+            $deadline = (Get-Date).AddSeconds(20)
+            while (-not (Test-Path -LiteralPath "$TestDrive\held.txt") -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+            { Enter-DesignerInstance -Name $name -PanelProfile $panelProfile } | Should -Throw -ExpectedMessage 'The Vouch Designer is already open. Look for its window on the taskbar.*'
+        }
+        finally { Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue; $holder.WaitForExit() }
+        # The first one was killed (its hold is abandoned, nothing is left to clean up): allowed.
+        $instance = Enter-DesignerInstance -Name $name -PanelProfile $panelProfile
+        try {
+            $instance | Should -Not -BeNullOrEmpty
+            # ... and while this one is open, a start in another process is refused.
+            $second = Start-Process -FilePath (Get-Process -Id $PID).Path -Wait -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-NonInteractive', '-Command',
+                "`$m = [System.Threading.Mutex]::new(`$false, '$name'); try { if (`$m.WaitOne(0)) { exit 0 } else { exit 5 } } catch { exit 0 }"
+            $second.ExitCode | Should -Be 5
+        }
+        finally { Exit-DesignerInstance -Instance $instance }
+        # Released at the end: the next start is allowed.
+        $again = Enter-DesignerInstance -Name $name -PanelProfile $panelProfile
+        Exit-DesignerInstance -Instance $again
+    }
+
+    It 'refuses a second Designer while a panel Edge holds the panel profile, and brings that window forward (final fix wave)' {
+        $script:Holder = Get-Process -Id $PID
+        Mock Find-EdgeBrowserProcess { $script:Holder }
+        Mock Show-DesignerExistingPanel { }
+        { Enter-DesignerInstance -Name "Local\VouchDesignerTest-$([guid]::NewGuid().ToString('N'))" -PanelProfile (Join-Path $TestDrive 'held-profile') } |
+            Should -Throw -ExpectedMessage 'The Vouch Designer is already open. Look for its window on the taskbar.*'
+        Should -Invoke Show-DesignerExistingPanel -Times 1 -Exactly
+        # A stale profile (no live Edge holds it any more) does not count.
+        Mock Find-EdgeBrowserProcess { $null }
+        $instance = Enter-DesignerInstance -Name "Local\VouchDesignerTest-$([guid]::NewGuid().ToString('N'))" -PanelProfile (Join-Path $TestDrive 'held-profile')
+        Exit-DesignerInstance -Instance $instance
+    }
+
+    It 'Start-VouchDesigner stops with the plain message before opening anything when a Designer is already open (final fix wave)' {
+        Mock Enter-DesignerInstance { throw 'The Vouch Designer is already open. Look for its window on the taskbar.' }
+        Mock Start-DesignerListener { throw 'The listener must not be started.' }
+        Mock Start-DesignerPanel { throw 'No panel may be opened.' }
+        { Start-VouchDesigner -ScriptPath $script:VouchPath -PanelProfileDir (Join-Path $TestDrive 'p') 6>$null } | Should -Throw -ExpectedMessage 'The Vouch Designer is already open*'
+        Should -Invoke Start-DesignerListener -Times 0 -Exactly
+        # -NoPanel servers (tests, programs) are not single-instance: they open no panel.
+        Mock Start-DesignerListener { throw 'listener reached' }
+        { Start-VouchDesigner -ScriptPath $script:VouchPath -NoPanel 6>$null } | Should -Throw -ExpectedMessage 'listener reached'
+        Should -Invoke Enter-DesignerInstance -Times 1 -Exactly
+    }
+
+    It 'Start-DesignerPanel never joins an Edge that already holds the panel profile (final fix wave)' {
+        Mock Find-EdgeExecutable { 'C:\edge.exe' }
+        $script:Holder = Get-Process -Id $PID
+        Mock Find-EdgeBrowserProcess { $script:Holder }
+        Mock Start-Process { throw 'No Edge may be started.' }
+        { Start-DesignerPanel -Url 'http://localhost:5/' -ProfileDir (Join-Path $TestDrive 'panel-held') -AuditProfileDir (Join-Path $TestDrive 'audit') } |
+            Should -Throw -ExpectedMessage 'The Vouch Designer is already open*'
+        Should -Invoke Start-Process -Times 0 -Exactly
+    }
+
+    It 'Stop-DesignerPanel leaves alone a process this session did not start (final fix wave)' {
+        $foreign = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 60' -PassThru -WindowStyle Hidden
+        try {
+            Start-Sleep -Milliseconds 300
+            # Started before this session launched its panel: not ours.
+            Stop-DesignerPanel -Process $foreign -LaunchedAt (Get-Date).AddSeconds(1)
+            $foreign.HasExited | Should -BeFalse
+            # Never launched at all: not ours either.
+            Stop-DesignerPanel -Process $foreign -LaunchedAt ([datetime]::MinValue)
+            $foreign.HasExited | Should -BeFalse
+            # Ours (started after the launch moment): closed, or killed after 3 s.
+            Stop-DesignerPanel -Process $foreign -LaunchedAt $foreign.StartTime.AddSeconds(-1)
+            $foreign.WaitForExit(5000) | Should -BeTrue
+        }
+        finally { Stop-Process -Id $foreign.Id -Force -ErrorAction SilentlyContinue }
+    }
+
     It 'stops the loop when the panel window has gone' {
         $state = New-TestState
         $state.PanelProcess = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile', '-Command', 'exit 0' -PassThru -WindowStyle Hidden
