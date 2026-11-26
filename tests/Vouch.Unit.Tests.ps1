@@ -2551,3 +2551,178 @@ Describe 'Ending a run with an error: details and log state (fix round 1)' {
         $runEnd.logComplete | Should -BeTrue
     }
 }
+
+Describe 'Output folder on a network share or given as a provider path (final fix wave)' {
+    BeforeAll {
+        # The same folder seen through the administrative share of this machine.
+        function ConvertTo-LocalUncPath {
+            param([string]$Path)
+            return '\\localhost\' + $Path.Substring(0, 1).ToLowerInvariant() + '$' + $Path.Substring(2)
+        }
+        $script:UncReason = ''
+        try {
+            $probe = ConvertTo-LocalUncPath -Path $TestDrive
+            if (-not [System.IO.Directory]::Exists($probe)) { $script:UncReason = "the administrative share $probe is not reachable on this machine" }
+        }
+        catch { $script:UncReason = "the administrative share is not reachable: $($_.Exception.Message)" }
+    }
+    AfterEach {
+        $script:EventLogPath = ''
+        $script:CaptureLogPath = ''
+    }
+
+    It 'proves a report can be saved in a folder given as \\localhost\c$\...' {
+        if ($script:UncReason) { Set-ItResult -Skipped -Because $script:UncReason; return }
+        $folder = Join-Path $TestDrive 'unc-direct'
+        [void](New-Item -ItemType Directory -Path $folder)
+        $unc = ConvertTo-LocalUncPath -Path $folder
+        Assert-ReportLocation -ReportPath (Join-Path $unc 'r.html') -ImagesDir (Join-Path $unc 'images\r')
+        (Join-Path $folder 'images\r') | Should -Exist
+    }
+
+    It 'starts a run whose CSV and output folder are on a share (<Kind>), up to the browser' -ForEach @(
+        @{ Kind = 'UNC path' }
+        @{ Kind = 'provider-qualified path' }
+    ) {
+        if ($Kind -eq 'UNC path' -and $script:UncReason) { Set-ItResult -Skipped -Because $script:UncReason; return }
+        $folder = Join-Path $TestDrive "share-$($Kind.Replace(' ', '-'))"
+        [void](New-Item -ItemType Directory -Path $folder)
+        Set-Content -LiteralPath (Join-Path $folder 'pages.csv') -Value "Name,Url`nOne,http://127.0.0.1:1/" -Encoding utf8
+        $base = if ($Kind -eq 'UNC path') { ConvertTo-LocalUncPath -Path $folder } else { "Microsoft.PowerShell.Core\FileSystem::$folder" }
+        Mock Assert-Environment { }
+        Mock Initialize-NativeInterop { }
+        Mock Find-EdgeExecutable { 'C:\edge.exe' }
+        Mock Start-EdgeDebug { throw 'The browser part is not tested here.' }
+        $bound = @{ CsvPath = (Join-Path $base 'pages.csv'); OutputDir = (Join-Path $base 'out'); ReportName = 'r'; SaveImages = [switch]$true; NoPrompt = [switch]$true }
+        { Invoke-Main -BoundParameters $bound 6>$null } | Should -Throw -ExpectedMessage 'The browser part is not tested here.'
+        # The capture log was started in the folder, under its plain Windows path.
+        (Join-Path $folder 'out\r.log') | Should -Exist
+        (Join-Path $folder 'out\images\r') | Should -Exist
+    }
+
+    It 'says the FOLDER is the problem when the folder cannot be written to' {
+        $missing = Join-Path $TestDrive 'no-such-folder'
+        { Assert-ReportLocation -ReportPath (Join-Path $missing 'r.html') } |
+            Should -Throw -ExpectedMessage "*output folder*$missing*"
+        try { Assert-ReportLocation -ReportPath (Join-Path $missing 'r.html') } catch { $message = $_.Exception.Message }
+        $message | Should -Not -BeLike '*shorter or simpler report name*'
+    }
+}
+
+Describe 'Files a run writes never replace its inputs or each other (final fix wave)' {
+    BeforeAll {
+        function New-CollisionConfig {
+            param([string]$Folder, [string]$Name, [hashtable]$Output)
+            [void](New-Item -ItemType Directory -Path $Folder -Force)
+            $config = [ordered]@{
+                schemaVersion = 1
+                output = $Output
+                pages = @(@{ id = 'p001'; name = 'One'; url = 'http://127.0.0.1:1/'; actions = @(@{ type = 'capture' }) })
+            }
+            $path = Join-Path $Folder $Name
+            [System.IO.File]::WriteAllText($path, ($config | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+            return $path
+        }
+    }
+    BeforeEach {
+        Mock Assert-Environment { }
+        Mock Initialize-NativeInterop { }
+        Mock Find-EdgeExecutable { 'C:\edge.exe' }
+        Mock Start-EdgeDebug { throw 'The browser part is not tested here.' }
+    }
+    AfterEach {
+        $script:EventLogPath = ''
+        $script:CaptureLogPath = ''
+    }
+
+    It 'refuses a JSON summary that would replace the configuration file, before writing anything' {
+        $folder = Join-Path $TestDrive 'q3-summary'
+        $config = New-CollisionConfig -Folder $folder -Name 'Q3.json' -Output @{ dir = '.'; reportName = 'Q3'; jsonSummary = $true }
+        $before = [System.IO.File]::ReadAllText($config)
+        { Invoke-Main -BoundParameters @{ ConfigPath = $config; NoPrompt = [switch]$true } 6>$null } |
+            Should -Throw -ExpectedMessage "*JSON summary*$config*configuration file*report name*output folder*"
+        [System.IO.File]::ReadAllText($config) | Should -Be $before
+        (Join-Path $folder 'Q3.log') | Should -Not -Exist
+        (Join-Path $folder 'images') | Should -Not -Exist
+    }
+
+    It 'refuses a capture log that would replace the CSV file' {
+        $folder = Join-Path $TestDrive 'csv-log'
+        [void](New-Item -ItemType Directory -Path $folder)
+        $csv = Join-Path $folder 'pages.log'
+        Set-Content -LiteralPath $csv -Value "Name,Url`nOne,http://127.0.0.1:1/" -Encoding utf8
+        $before = [System.IO.File]::ReadAllText($csv)
+        { Invoke-Main -BoundParameters @{ CsvPath = $csv; OutputDir = $folder; ReportName = 'pages'; NoPrompt = [switch]$true } 6>$null } |
+            Should -Throw -ExpectedMessage "*capture log*$csv*CSV file*"
+        [System.IO.File]::ReadAllText($csv) | Should -Be $before
+    }
+
+    It 'refuses a report that would replace the configuration file (case-insensitively)' {
+        $folder = Join-Path $TestDrive 'html-config'
+        $config = New-CollisionConfig -Folder $folder -Name 'Pages.HTML' -Output @{ dir = '.'; reportName = 'pages.html' }
+        $before = [System.IO.File]::ReadAllText($config)
+        { Invoke-Main -BoundParameters @{ ConfigPath = $config; NoPrompt = [switch]$true } 6>$null } |
+            Should -Throw -ExpectedMessage '*report*configuration file*'
+        [System.IO.File]::ReadAllText($config) | Should -Be $before
+    }
+
+    It 'refuses an event file that is the configuration file, and writes no event into it' {
+        $folder = Join-Path $TestDrive 'event-config'
+        $config = New-CollisionConfig -Folder $folder -Name 'run.json' -Output @{ dir = 'out' }
+        $before = [System.IO.File]::ReadAllText($config)
+        { Invoke-Main -BoundParameters @{ ConfigPath = $config; EventLogPath = $config; NoPrompt = [switch]$true } 6>$null } |
+            Should -Throw -ExpectedMessage '*event file*configuration file*'
+        [System.IO.File]::ReadAllText($config) | Should -Be $before
+    }
+
+    It 'refuses an event file that is the capture log of the run' {
+        $folder = Join-Path $TestDrive 'event-log'
+        $config = New-CollisionConfig -Folder $folder -Name 'run.json' -Output @{ dir = 'out'; reportName = 'r' }
+        $events = Join-Path $folder 'out\r.log'
+        { Invoke-Main -BoundParameters @{ ConfigPath = $config; EventLogPath = $events; NoPrompt = [switch]$true } 6>$null } |
+            Should -Throw -ExpectedMessage '*capture log*event file*'
+    }
+
+    It 'refuses a zip that would be the configuration file' {
+        $folder = Join-Path $TestDrive 'zip-config'
+        $config = New-CollisionConfig -Folder $folder -Name 'pack.zip' -Output @{ dir = '.'; reportName = 'r'; zip = @{ enabled = $true; name = 'pack' } }
+        # A .zip "configuration" is still read as JSON: the name is all that matters here.
+        $before = [System.IO.File]::ReadAllText($config)
+        { Invoke-Main -BoundParameters @{ ConfigPath = $config; NoPrompt = [switch]$true } 6>$null } |
+            Should -Throw -ExpectedMessage '*zip file*configuration file*'
+        [System.IO.File]::ReadAllText($config) | Should -Be $before
+    }
+
+    It 'refuses a console log (-LogDir) that is one of the run''s own files' {
+        $folder = Join-Path $TestDrive 'transcript'
+        $config = New-CollisionConfig -Folder $folder -Name 'run.json' -Output @{ dir = 'out'; reportName = 'vouch_console' }
+        $script:RunLogFile = Join-Path $folder 'out\vouch_console.log'
+        try {
+            { Invoke-Main -BoundParameters @{ ConfigPath = $config; NoPrompt = [switch]$true } 6>$null } |
+                Should -Throw -ExpectedMessage '*capture log*console log*'
+        }
+        finally { $script:RunLogFile = '' }
+    }
+
+    It 'Assert-RunFileSeparate compares after normalisation and names both files' {
+        $inputs = [ordered]@{ 'the configuration file' = 'C:\Data\Q3.json' }
+        { Assert-RunFileSeparate -Inputs $inputs -Outputs ([ordered]@{ 'the JSON summary' = 'c:\data\sub\..\q3.JSON' }) } |
+            Should -Throw -ExpectedMessage "*JSON summary*c:\data\sub\..\q3.JSON*configuration file*C:\Data\Q3.json*"
+        { Assert-RunFileSeparate -Inputs $inputs -Outputs ([ordered]@{ 'the JSON summary' = 'C:\Data\Q3.json. ' }) } | Should -Throw
+        { Assert-RunFileSeparate -Inputs $inputs -Outputs ([ordered]@{ 'the JSON summary' = 'C:\Data\Q3.summary.json'; 'the capture log' = 'C:\Data\Q3.log'; 'the event file' = '' }) } | Should -Not -Throw
+        { Assert-RunFileSeparate -Inputs @{} -Outputs ([ordered]@{ 'the capture log' = 'C:\Data\a.log'; 'the event file' = 'C:\DATA\A.LOG' }) } |
+            Should -Throw -ExpectedMessage '*capture log*event file*'
+    }
+
+    It 'the console log (-LogDir) never overwrites a file that is already there' {
+        $folder = Join-Path $TestDrive 'logdir'
+        [void](New-Item -ItemType Directory -Path $folder)
+        Mock Get-Date { [datetime]'2026-11-25T10:00:00' }
+        Set-Content -LiteralPath (Join-Path $folder 'vouch_2026-11-25_100000.log') -Value 'keep me'
+        Mock Start-Transcript { }
+        Start-RunLog -Directory $folder | Should -BeTrue
+        $script:RunLogFile | Should -Be (Join-Path $folder 'vouch_2026-11-25_100000_2.log')
+        Get-Content -LiteralPath (Join-Path $folder 'vouch_2026-11-25_100000.log') | Should -Be 'keep me'
+        $script:RunLogFile = ''
+    }
+}

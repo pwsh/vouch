@@ -347,7 +347,7 @@ function Get-DesignerRunPlan {
     $plan = [pscustomobject]@{
         Kind = $Kind; PageId = ''; PageName = ''; Errors = $check.Errors; Warnings = $check.Warnings
         ConfigPath = $ConfigPath; BaseFolder = $base; OutputFolder = ''; Unsaved = $true; Config = $null
-        VirtualDesktop = 'off'; Notes = [System.Collections.Generic.List[string]]::new(); Problem = ''
+        VirtualDesktop = 'off'; Notes = [System.Collections.Generic.List[string]]::new(); Problem = ''; FileProblem = ''
     }
     $plan.Unsaved = Test-DesignerConfigUnsaved -Config $config -ConfigPath $ConfigPath
     if ($Kind -eq 'page') {
@@ -359,6 +359,9 @@ function Get-DesignerRunPlan {
     $resolved = Resolve-DesignerRunConfig -Config $config -BaseFolder $base
     $plan.Config = $resolved.Config
     $plan.OutputFolder = $resolved.OutputFolder
+    if ($Kind -eq 'full') {
+        $plan.FileProblem = Get-DesignerRunFileProblem -Config $resolved.Config -OutputFolder $resolved.OutputFolder -ConfigPath $ConfigPath -ScriptPath ([string]$State.ScriptPath)
+    }
     if (-not $ConfigPath) {
         $plan.Notes.Add("This configuration has not been saved yet, so its folders are read from $base.")
     }
@@ -381,6 +384,58 @@ function Get-DesignerRunPlan {
         $plan.Notes.Add('A page test saves its report and images in a temporary preview folder (never in the output folder), makes no zip and does not open the report; the preview is shown here.')
     }
     return $plan
+}
+
+function Get-DesignerRunFileProblem {
+    <#
+        The engine refuses a run whose report, summary, log or zip would replace one of its
+        inputs (Assert-RunFileSeparate) - but a run from the panel reads a copy of the
+        configuration in the session folder, so the engine never sees the person's own
+        file. The same check is made here against that file, so a full run that would
+        overwrite it is refused in the panel with the same plain message. The names are
+        made by the engine's own naming functions (Get-DesignerNamePreview). '' when
+        nothing collides (or the names cannot be worked out; the engine checks again).
+        A page test writes into a temporary preview folder and needs no check.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Config,
+        [AllowEmptyString()][string]$OutputFolder = '',
+        [AllowEmptyString()][string]$ConfigPath = '',
+        [AllowEmptyString()][string]$ScriptPath = ''
+    )
+    if (-not $OutputFolder) { return '' }
+    $names = Get-DesignerNamePreview -Config $Config
+    if ($null -eq $names) { return '' }
+    try {
+        $completed = Complete-VouchConfig -Config (Copy-VouchConfig -Config $Config)
+        $settings = Resolve-RunSettings -BoundParameters @{} -Defaults @{} -Config $completed
+    }
+    catch {
+        Write-Verbose "No check of the run's files: $($_.Exception.Message)"
+        return ''
+    }
+    try {
+        $reportPath = Join-Path -Path $OutputFolder -ChildPath $names.reportFile
+        $stem = [System.IO.Path]::GetFileNameWithoutExtension($names.reportFile)
+        $inputs = [ordered]@{}
+        if ($ConfigPath) { $inputs['the configuration file'] = $ConfigPath }
+        if ($ScriptPath) {
+            $scriptFolder = Split-Path -Path $ScriptPath -Parent
+            $inputs['the script vouch.ps1'] = $ScriptPath
+            $inputs['the script Install-VouchSchedule.ps1'] = Join-Path -Path $scriptFolder -ChildPath 'Install-VouchSchedule.ps1'
+            $inputs['the script designer\Designer.ps1'] = Join-Path -Path $scriptFolder -ChildPath 'designer\Designer.ps1'
+            $inputs['the script designer\Designer.Run.ps1'] = Join-Path -Path $scriptFolder -ChildPath 'designer\Designer.Run.ps1'
+        }
+        Assert-RunFileSeparate -Inputs $inputs -Outputs ([ordered]@{
+            'the report'        = $reportPath
+            'the JSON summary'  = $(if ($settings.JsonSummary) { [System.IO.Path]::ChangeExtension($reportPath, '.json') } else { '' })
+            'the capture log'   = $(if ($settings.NoCaptureLog) { '' } else { [System.IO.Path]::ChangeExtension($reportPath, '.log') })
+            'the zip file'      = $(if ($settings.Zip) { Join-Path -Path $OutputFolder -ChildPath $names.zipFile } else { '' })
+            'the images folder' = $(if ($settings.SaveImages -or $settings.LinkImages) { Join-Path -Path $OutputFolder -ChildPath (Join-Path 'images' $stem) } else { '' })
+        })
+    }
+    catch { return [string]$_.Exception.Message }
+    return ''
 }
 
 function Get-DesignerRunSessionFlag {
@@ -1291,6 +1346,7 @@ function ConvertTo-DesignerPlanData {
         errors         = (ConvertTo-DesignerProblem -Problems $Plan.Errors)
         notes          = $Plan.Notes.ToArray()
         problem        = $Plan.Problem
+        fileProblem    = $Plan.FileProblem
     }
 }
 
@@ -1350,6 +1406,7 @@ function Invoke-DesignerRunStart {
                 errors = (ConvertTo-DesignerProblem -Problems $plan.Errors); warnings = (ConvertTo-DesignerProblem -Problems $plan.Warnings) })
     }
     if ($plan.Problem) { return New-DesignerError -Status 400 -Code 'page' -Message $plan.Problem -Detail 'Select the page in the Pages tab, then press Test this page.' }
+    if ($plan.FileProblem) { return New-DesignerError -Status 400 -Code 'output-files' -Message 'The run would replace a file it needs, so it was not started.' -Detail $plan.FileProblem }
     try { [void](Start-DesignerRun -State $State -Plan $plan) }
     catch { return New-DesignerError -Status 500 -Code 'not-started' -Message 'The run could not be started.' -Detail ([string]$_.Exception.Message) }
     return New-DesignerJsonResponse -Data (Get-DesignerRunData -State $State)

@@ -3507,6 +3507,33 @@ Describe 'Runs from the panel: routes, plan and rules (no browser, no child)' {
         $script:R.Run.State | Should -Be 'idle'
     }
 
+    It 'refuses (in the panel) a full run whose summary would replace the saved configuration, and says so in the plan' {
+        $script:R.Browser.Connected = $true
+        $folder = Join-Path $TestDrive 'q3-panel'
+        [void](New-Item -ItemType Directory -Path $folder -Force)
+        $config = New-RunConfig
+        $config['output']['dir'] = '.'
+        $config['output']['reportName'] = 'Q3'
+        $config['output']['jsonSummary'] = $true
+        $file = Join-Path $folder 'Q3.json'
+        [System.IO.File]::WriteAllText($file, (ConvertTo-VouchConfigText -Config $config), [System.Text.UTF8Encoding]::new($false))
+        $before = [System.IO.File]::ReadAllText($file)
+        $path = Add-DesignerKnownPath -State $script:R -Path $file -Kind config
+        $plan = Invoke-TestRoute POST '/api/run/plan' ([ordered]@{ config = $config; path = $path; kind = 'full' }) -State $script:R
+        $plan.Data.fileProblem | Should -BeLike "*JSON summary*$file*configuration file*report name*output folder*"
+        $r = Invoke-TestRoute POST '/api/run' ([ordered]@{ config = $config; path = $path; kind = 'full' }) -State $script:R
+        $r.Status | Should -Be 400
+        $r.Data.code | Should -Be 'output-files'
+        $r.Data.detail | Should -BeLike '*JSON summary*configuration file*'
+        $script:R.Run.State | Should -Be 'idle'
+        [System.IO.File]::ReadAllText($file) | Should -Be $before
+        # Another report name: no problem; a page test writes into a preview folder and is never refused for this.
+        $config['output']['reportName'] = 'Q3 report'
+        (Invoke-TestRoute POST '/api/run/plan' ([ordered]@{ config = $config; path = $path; kind = 'full' }) -State $script:R).Data.fileProblem | Should -Be ''
+        $config['output']['reportName'] = 'Q3'
+        (Invoke-TestRoute POST '/api/run/plan' ([ordered]@{ config = $config; path = $path; kind = 'page'; pageId = 'p001' }) -State $script:R).Data.fileProblem | Should -Be ''
+    }
+
     It 'keeps every run route behind the gate: <_>' -ForEach @('POST /api/run', 'GET /api/run', 'POST /api/run/stop', 'POST /api/run/plan', 'GET /preview/0123/001_a.jpg') {
         $method, $path = $_ -split ' ', 2
         $headers = New-GoodHeaders $script:R -Post:($method -eq 'POST')

@@ -1646,6 +1646,48 @@ Describe 'Capture area: page content as PNG, and the end of a failed run' -Tag '
     }
 }
 
+Describe 'An output folder on a network share (\\localhost\c$, headless Edge, page capture area)' -Tag 'Integration' {
+    AfterEach { Assert-GeneratedReportMarkup }
+    BeforeAll {
+        Close-CdpSocket
+        Mock Set-EdgeForeground { throw 'page captures must not bring the window to the front' }
+        Mock Get-ScreenCapture { throw 'page captures must not grab the screen' }
+        $script:ShareFolder = Join-Path -Path $TestDrive -ChildPath 'share'
+        [void](New-Item -ItemType Directory -Path $script:ShareFolder)
+        $script:ShareUnc = '\\localhost\' + $script:ShareFolder.Substring(0, 1).ToLowerInvariant() + '$' + $script:ShareFolder.Substring(2)
+        $script:ShareSkip = if ([System.IO.Directory]::Exists($script:ShareUnc)) { '' } else { "the administrative share $($script:ShareUnc) is not reachable on this machine" }
+    }
+    AfterAll { Close-CdpSocket }
+
+    It 'writes the report, summary, log, images and zip there, and the report verifies' {
+        if ($script:ShareSkip) { Set-ItResult -Skipped -Because $script:ShareSkip; return }
+        $config = Get-DefaultVouchConfig
+        $config['browser']['profileDir'] = $script:ProfileDir
+        $config['browser']['debugPort'] = $script:CdpPort
+        $config['defaults']['captureArea'] = 'page'
+        $config['defaults']['navigationTimeoutSec'] = 10
+        $config['defaults']['settleSeconds'] = 0.1
+        $config['output']['dir'] = (Join-Path $script:ShareUnc 'out')
+        $config['output']['reportName'] = 'shared'
+        $config['output']['saveImages'] = $true
+        $config['output']['jsonSummary'] = $true
+        $config['output']['zip'] = [ordered]@{ enabled = $true; name = '{report}.zip' }
+        $config['pages'].Add([ordered]@{ name = 'Plain'; url = "$Web/ok" })
+        # The configuration itself is read from the share too.
+        $path = Join-Path -Path $script:ShareUnc -ChildPath 'shared.json'
+        [System.IO.File]::WriteAllText($path, ($config | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+
+        Invoke-Main -BoundParameters @{ ConfigPath = $path; NoPrompt = [switch]$true } 6>$null
+        $script:ExitCode | Should -Be 0
+        $out = Join-Path $script:ShareFolder 'out'
+        foreach ($name in 'shared.html', 'shared.json', 'shared.log', 'shared.zip', 'images\shared\SHA256SUMS') {
+            (Join-Path $out $name) | Should -Exist
+        }
+        (Get-Content -LiteralPath (Join-Path $out 'shared.json') -Raw | ConvertFrom-Json).Report | Should -BeLike '\\localhost\*'
+        @(Test-ReportIntegrity -Path (Join-Path $script:ShareUnc 'out\shared.html') | Where-Object { -not $_.Ok }).Count | Should -Be 0
+    }
+}
+
 Describe 'Capture area: Edge window (window position mocked)' -Tag 'Integration' {
     AfterEach { Assert-GeneratedReportMarkup }
     BeforeAll {

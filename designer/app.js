@@ -1375,6 +1375,9 @@
     else if (plan.outputFolder) {
       parts.push(h('p', { class: 'run-where' }, h('span', { class: 'run-where-label', text: 'Reports of a full run go to: ' }), h('code', { class: 'path-text', text: plan.outputFolder })));
     }
+    if (plan.fileProblem) {
+      parts.push(h('p', { class: 'callout callout-error', role: 'note', text: 'A full run cannot start: ' + plan.fileProblem }));
+    }
     const notes = [].concat(plan.notes || []);
     const pagePlan = S.pagePlan;
     if (pagePlan && pagePlan.notes) for (const n of pagePlan.notes) if (!notes.includes(n)) notes.push(n);

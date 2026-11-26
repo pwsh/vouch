@@ -386,6 +386,8 @@ $script:CaptureLogWarned   = $false
 # The page whose details become "detail" events, and how many of them were written.
 $script:EventItem          = $null
 $script:EventDetailCount   = 0
+# The -LogDir console log (transcript) of this run, '' when none is kept.
+$script:RunLogFile         = ''
 
 # DevTools binds to the IPv4 loopback only; "localhost" can resolve to ::1 and fail.
 $script:CdpHost = '127.0.0.1'
@@ -558,7 +560,7 @@ function Find-EdgeExecutable {
             if ($null -ne $defaultValue) {
                 $candidate = [string]$defaultValue.Value
                 if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate)) {
-                    return (Resolve-Path -LiteralPath $candidate).Path
+                    return (Resolve-Path -LiteralPath $candidate).ProviderPath
                 }
             }
         }
@@ -574,7 +576,7 @@ function Find-EdgeExecutable {
     )
     foreach ($path in $fallbacks) {
         if (-not [string]::IsNullOrWhiteSpace($path) -and (Test-Path -LiteralPath $path)) {
-            return (Resolve-Path -LiteralPath $path).Path
+            return (Resolve-Path -LiteralPath $path).ProviderPath
         }
     }
 
@@ -6595,8 +6597,68 @@ function Assert-ReportLocation {
         }
     }
     catch {
-        throw ("The report cannot be saved as '$([System.IO.Path]::GetFileName($ReportPath))' in '$(Split-Path -Path $ReportPath -Parent)': $($_.Exception.Message)`n" +
+        $reason = $_.Exception.Message
+        $folder = Split-Path -Path $ReportPath -Parent
+        # Whether any file at all can be made there: if not, the folder is the problem
+        # (missing, unreachable share, no permission), and a new name would not help.
+        $folderWritable = $false
+        try {
+            $probe = [System.IO.FileStream]::new((Join-Path -Path $folder -ChildPath "vouch-write-test-$([guid]::NewGuid().ToString('N')).tmp"),
+                [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None, 1, [System.IO.FileOptions]::DeleteOnClose)
+            $probe.Dispose()
+            $folderWritable = $true
+        }
+        catch { Write-Verbose "The output folder '$folder' cannot be written to: $($_.Exception.Message)" }
+        if (-not $folderWritable) {
+            throw ("The report cannot be saved as '$([System.IO.Path]::GetFileName($ReportPath))' in '$folder': Vouch cannot save any file in the output folder '$folder' ($reason).`n" +
+                'Check that the folder exists, can be reached (for a network share: that you are connected) and that you may save files in it, or choose another output folder (-OutputDir, or "dir" under "output" in the configuration file).')
+        }
+        throw ("The report cannot be saved as '$([System.IO.Path]::GetFileName($ReportPath))' in '$folder': $reason`n" +
             'Choose a shorter or simpler report name (-ReportName, or "reportName" in the configuration file) or another output folder.')
+    }
+}
+
+function Assert-RunFileSeparate {
+    <#
+        A run writes (or empties) several files whose names all come from the report name
+        and the output folder, plus the event file and the -LogDir console log. Pointed
+        at the folder of its own configuration with the same name, one of them is the
+        configuration itself (Q3.json summarised into Q3.json) and the next scheduled run
+        finds "no pages". So before anything is written, no output may be an input
+        (the configuration, the CSV, the scripts) or another output. Paths are compared as
+        Windows does: full path, any case, trailing dots and spaces dropped. Empty paths
+        (an output switched off) are skipped. Short (8.3) and long spellings of the same
+        folder are not matched; both sides normally come from the same spelling.
+    #>
+    param(
+        # Label (as said to the person, e.g. 'the configuration file') -> path.
+        [AllowNull()][System.Collections.IDictionary]$Inputs = $null,
+        [AllowNull()][System.Collections.IDictionary]$Outputs = $null
+    )
+    $normalize = {
+        param([string]$Path)
+        try { $full = [System.IO.Path]::GetFullPath($Path.Trim()) } catch { $full = $Path.Trim() }
+        return $full.TrimEnd('\', '/').TrimEnd('.', ' ')
+    }
+    $seen = [System.Collections.Generic.List[object]]::new()
+    foreach ($side in @(@{ Kind = 'input'; Map = $Inputs }, @{ Kind = 'output'; Map = $Outputs })) {
+        if ($null -eq $side.Map) { continue }
+        foreach ($label in @($side.Map.Keys)) {
+            $path = [string]$side.Map[$label]
+            if ([string]::IsNullOrWhiteSpace($path)) { continue }
+            $key = & $normalize $path
+            foreach ($earlier in $seen) {
+                if (-not [string]::Equals($earlier.Key, $key, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+                if ($side.Kind -eq 'input') { continue }
+                if ($earlier.Kind -eq 'input') {
+                    throw ("Nothing was captured: $label of this run would be saved as '$path', which is $($earlier.Label) '$($earlier.Path)', and would replace it.`n" +
+                        'Change the report name (-ReportName, or "reportName" in the configuration file) or the output folder (-OutputDir, or "dir" under "output"), so that the files of the run are saved under another name.')
+                }
+                throw ("Nothing was captured: $($earlier.Label) and $label of this run would both be saved as '$path'.`n" +
+                    'Change the report name (-ReportName, or "reportName" in the configuration file) or the output folder, or choose another event file or log folder.')
+            }
+            $seen.Add([pscustomobject]@{ Kind = $side.Kind; Label = $label; Path = $path; Key = $key })
+        }
     }
 }
 
@@ -6730,17 +6792,22 @@ function Start-RunLog {
     <#
         Unattended runs have no console to read, so -LogDir keeps a transcript of each
         run (everything the console would have shown, including the exit code).
-        Returns $true when a transcript was started.
+        Returns $true when a transcript was started. It never replaces a file that is
+        already there (a second run in the same second, or a file someone named like
+        it), and its path is kept so the run can check it against its own files.
     #>
     param([string]$Directory)
 
+    $script:RunLogFile = ''
     if ([string]::IsNullOrWhiteSpace($Directory)) { return $false }
     try {
         if (-not (Test-Path -LiteralPath $Directory)) {
             [void](New-Item -ItemType Directory -Path $Directory -Force)
         }
-        $logPath = Join-Path -Path $Directory -ChildPath "vouch_$((Get-Date).ToString('yyyy-MM-dd_HHmmss')).log"
+        $folder = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Directory)
+        $logPath = Get-AvailableFilePath -Path (Join-Path -Path $folder -ChildPath "vouch_$((Get-Date).ToString('yyyy-MM-dd_HHmmss')).log")
         [void](Start-Transcript -LiteralPath $logPath -Force)
+        $script:RunLogFile = $logPath
         return $true
     }
     catch {
@@ -7663,6 +7730,21 @@ function Invoke-CaptureRun {
     if ($boundNames -contains 'CsvPath' -and $boundNames -contains 'ConfigPath') {
         throw 'Use either -CsvPath or -ConfigPath, not both. -CsvPath reads the pages from a CSV file; -ConfigPath reads the pages and all settings from a configuration file.'
     }
+    # An event file that is the configuration or the CSV would have events (even the
+    # error of this refusal) appended to it: refused before anything is written there.
+    if ($script:EventLogPath) {
+        $sourceName = if ($settings.ConfigPath) { 'the configuration file' } else { 'the CSV file' }
+        $sourceText = if ($settings.ConfigPath) { $settings.ConfigPath } else { $settings.CsvPath }
+        try {
+            $sourceFull = if ($sourceText) { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($sourceText) } else { '' }
+            Assert-RunFileSeparate -Inputs ([ordered]@{ $sourceName = $sourceFull }) -Outputs ([ordered]@{ 'the event file (-EventLogPath)' = $script:EventLogPath })
+        }
+        catch {
+            $script:EventLogPath = ''
+            throw
+        }
+    }
+
     $config = $null
     if ($settings.ConfigPath -and -not $settings.Verify) {
         $config = Import-VouchConfig -Path $settings.ConfigPath
@@ -7706,7 +7788,7 @@ function Invoke-CaptureRun {
         if (-not (Test-Path -LiteralPath $settings.CsvPath -PathType Leaf)) {
             throw "Capture definition CSV not found: $($settings.CsvPath)`nCreate one from captures.sample.csv, or pass -CsvPath."
         }
-        $sourcePath = (Resolve-Path -LiteralPath $settings.CsvPath).Path
+        $sourcePath = (Resolve-Path -LiteralPath $settings.CsvPath).ProviderPath
         $allDefinitions = Import-CaptureDefinition -Path $sourcePath
     }
 
@@ -7723,7 +7805,7 @@ function Invoke-CaptureRun {
     if (-not (Test-Path -LiteralPath $settings.OutputDir)) {
         [void](New-Item -ItemType Directory -Path $settings.OutputDir -Force)
     }
-    $resolvedOutputDir = (Resolve-Path -LiteralPath $settings.OutputDir).Path
+    $resolvedOutputDir = (Resolve-Path -LiteralPath $settings.OutputDir).ProviderPath
 
     # One moment names everything of this run: the default report name, {date}, {time}.
     $runStamp = Get-Date
@@ -7752,6 +7834,34 @@ function Invoke-CaptureRun {
     if ($settings.SaveImages) {
         $imagesDir = Join-Path -Path $resolvedOutputDir -ChildPath (Join-Path 'images' ([System.IO.Path]::GetFileNameWithoutExtension($effectiveReportName)))
     }
+
+    # Every file this run will write or empty, checked against its inputs and each other
+    # before the first of them is touched. The zip is checked under the name it asks for
+    # (it is later moved to a free name, but never onto an input).
+    $zipCandidate = ''
+    if ($settings.Zip) {
+        $zipTemplate = if ([string]::IsNullOrWhiteSpace($settings.ZipName)) { '{report}.zip' } else { $settings.ZipName }
+        $zipText = (Expand-NameTemplate -Template $zipTemplate -Values (Get-NameTokenValues @tokenArguments -Report $reportStem)).Text
+        $zipCandidate = Join-Path -Path $resolvedOutputDir -ChildPath (ConvertTo-SafeOutputName -Name $zipText -Extension 'zip' -Fallback $reportStem)
+    }
+    $runInputs = [ordered]@{}
+    $runInputs[$(if ($null -ne $config) { 'the configuration file' } else { 'the CSV file' })] = $sourcePath
+    if ($PSCommandPath) {
+        $scriptFolder = Split-Path -Path $PSCommandPath -Parent
+        $runInputs['the script vouch.ps1'] = $PSCommandPath
+        $runInputs['the script Install-VouchSchedule.ps1'] = Join-Path -Path $scriptFolder -ChildPath 'Install-VouchSchedule.ps1'
+        $runInputs['the script designer\Designer.ps1'] = Join-Path -Path $scriptFolder -ChildPath 'designer\Designer.ps1'
+        $runInputs['the script designer\Designer.Run.ps1'] = Join-Path -Path $scriptFolder -ChildPath 'designer\Designer.Run.ps1'
+    }
+    Assert-RunFileSeparate -Inputs $runInputs -Outputs ([ordered]@{
+        'the report'                       = $reportPath
+        'the JSON summary'                 = $(if ($settings.JsonSummary) { [System.IO.Path]::ChangeExtension($reportPath, '.json') } else { '' })
+        'the capture log'                  = $(if ($settings.NoCaptureLog) { '' } else { [System.IO.Path]::ChangeExtension($reportPath, '.log') })
+        'the zip file'                     = $zipCandidate
+        'the images folder'                = $imagesDir
+        'the event file (-EventLogPath)'   = $script:EventLogPath
+        'the console log (-LogDir)'        = $script:RunLogFile
+    })
     Assert-ReportLocation -ReportPath $reportPath -ImagesDir $imagesDir
 
     $imageExtension = if ($settings.ImageFormat -eq 'png') { 'png' } else { 'jpg' }
