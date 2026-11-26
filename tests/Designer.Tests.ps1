@@ -64,6 +64,12 @@ namespace VouchTest {
         Copy-Item -LiteralPath $script:SamplePath -Destination $target -Force
         return $target
     }
+    # The gate as the server applies it (Invoke-DesignerExchange): the header half, then the body half.
+    function Invoke-TestGate([object]$Request, [object]$State) {
+        $refusal = Test-DesignerRequestHeader -Request $Request -State $State
+        if ($null -ne $refusal) { return $refusal }
+        return Test-DesignerRequestBody -Request $Request -State $State
+    }
     function New-GoodHeaders([object]$State, [switch]$Post) {
         $headers = @{ Host = $State.HostHeader; 'X-Vouch-Token' = $State.Token }
         if ($Post) { $headers['Origin'] = $State.Origin; $headers['Content-Type'] = 'application/json' }
@@ -134,7 +140,7 @@ Start-VouchDesigner -ScriptPath $(& $literal $script:VouchPath) -ConfigPath $(& 
     }
 }
 
-Describe 'Designer request gate (Test-DesignerRequest)' {
+Describe 'Designer request gate (Test-DesignerRequestHeader, then Test-DesignerRequestBody)' {
     BeforeAll { $script:Gate = New-TestState; $script:Known = Add-DesignerKnownPath -State $script:Gate -Path (Join-Path $TestDrive 'known.json') -Kind config }
 
     It 'lets a request through: <Case>' -ForEach @(
@@ -149,7 +155,7 @@ Describe 'Designer request gate (Test-DesignerRequest)' {
         if ($Type) { $headers['Content-Type'] = $Type }
         $text = if ($Body -eq 'KNOWN') { (@{ path = $script:Known } | ConvertTo-Json) } else { [string]$Body }
         $request = New-DesignerRequest -Method $Method -Path $Path -Headers $headers -BodyText $text
-        Test-DesignerRequest -Request $request -State $script:Gate | Should -BeNullOrEmpty
+        Invoke-TestGate -Request $request -State $script:Gate | Should -BeNullOrEmpty
     }
 
     It 'refuses <Case> with <Status> (<Code>)' -ForEach @(
@@ -178,7 +184,7 @@ Describe 'Designer request gate (Test-DesignerRequest)' {
         $m = if ($Method) { $Method } else { 'POST' }
         $p = if ($Path) { $Path } else { '/api/config/validate' }
         $request = New-DesignerRequest -Method $m -Path $p -Headers $headers -BodyText '{"config":{}}'
-        $refusal = Test-DesignerRequest -Request $request -State $script:Gate
+        $refusal = Invoke-TestGate -Request $request -State $script:Gate
         $refusal.Status | Should -Be $Status
         (ConvertFrom-TestBody $refusal).code | Should -Be $Code
         (ConvertFrom-TestBody $refusal).error | Should -Not -BeNullOrEmpty
@@ -186,15 +192,15 @@ Describe 'Designer request gate (Test-DesignerRequest)' {
 
     It 'refuses an oversized body (413) and a body that is not JSON (400)' {
         $request = New-DesignerRequest -Method POST -Path '/api/config/validate' -Headers (New-GoodHeaders $script:Gate -Post) -BodyTooLarge
-        (Test-DesignerRequest -Request $request -State $script:Gate).Status | Should -Be 413
+        (Invoke-TestGate -Request $request -State $script:Gate).Status | Should -Be 413
         $request = New-DesignerRequest -Method POST -Path '/api/config/validate' -Headers (New-GoodHeaders $script:Gate -Post) -BodyText '{ not json'
-        (Test-DesignerRequest -Request $request -State $script:Gate).Status | Should -Be 400
+        (Invoke-TestGate -Request $request -State $script:Gate).Status | Should -Be 400
     }
 
     It 'refuses a file path the server did not hand out, on <_>' -ForEach @('/api/config/open', '/api/config/save', '/api/config/import-csv', '/api/command') {
         $body = @{ path = 'C:\Windows\win.ini'; config = @{} } | ConvertTo-Json
         $request = New-DesignerRequest -Method POST -Path $_ -Headers (New-GoodHeaders $script:Gate -Post) -BodyText $body
-        $refusal = Test-DesignerRequest -Request $request -State $script:Gate
+        $refusal = Invoke-TestGate -Request $request -State $script:Gate
         $refusal.Status | Should -Be 403
         (ConvertFrom-TestBody $refusal).code | Should -Be 'unknown-path'
         # The router refuses it as well (defence in depth), without opening anything.
@@ -292,8 +298,9 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
         $r.Data.config.report.title | Should -Be 'Audit Evidence Report'
     }
 
-    It 'has no route left that answers 501 (runs are implemented)' {
-        (Get-DesignerLaterRoute).Count | Should -Be 0
+    It 'has no route that answers 501, and matches addresses exactly (case-sensitive)' {
+        (Invoke-TestRoute GET '/API/STATE' -State $script:State).Status | Should -Be 404
+        (Invoke-DesignerRequest -Method get -Path '/api/state' -State $script:State).Status | Should -Be 200
         (Invoke-TestRoute GET '/api/run' -State $script:State).Status | Should -Be 200
         (Invoke-TestRoute GET '/preview/run1/001.jpg' -State $script:State).Status | Should -Be 404
     }
@@ -626,7 +633,7 @@ Describe 'Designer router (Invoke-DesignerRequest, no socket)' {
                 $r = Invoke-TestRoute POST $case[0] ([ordered]@{ path = $case[1]; config = $minimal }) -State $script:State
                 $r.Status | Should -Be 403 -Because "$($case[0]) must refuse $($case[1])"
                 $request = New-DesignerRequest -Method POST -Path $case[0] -Headers (New-GoodHeaders $script:State -Post) -BodyText (@{ path = $case[1]; config = @{} } | ConvertTo-Json)
-                (Test-DesignerRequest -Request $request -State $script:State).Status | Should -Be 403
+                (Invoke-TestGate -Request $request -State $script:State).Status | Should -Be 403
             }
             [System.IO.File]::ReadAllBytes($logo) | Should -Be ([byte[]](1, 2, 3))
             (Invoke-TestRoute POST '/api/config/import-csv' ([ordered]@{ path = $csv }) -State $script:State).Status | Should -Be 200
@@ -1761,18 +1768,18 @@ Describe 'Browser link and picker: routes and rules without a browser' {
         foreach ($path in '/api/browser/connect', '/api/browser/navigate', '/api/browser/layout', '/api/browser/zoom-off', '/api/page/from-current', '/api/pick/start', '/api/pick/cancel', '/api/action/test') {
             $headers = New-GoodHeaders -State $script:State -Post
             $headers.Remove('X-Vouch-Token')
-            (Test-DesignerRequest -Request (New-DesignerRequest -Method POST -Path $path -Headers $headers -BodyText '{}') -State $script:State).Status | Should -Be 403
+            (Invoke-TestGate -Request (New-DesignerRequest -Method POST -Path $path -Headers $headers -BodyText '{}') -State $script:State).Status | Should -Be 403
             $headers = New-GoodHeaders -State $script:State -Post
             $headers.Remove('Origin')
-            (Test-DesignerRequest -Request (New-DesignerRequest -Method POST -Path $path -Headers $headers -BodyText '{}') -State $script:State).Body | Should -Match 'no-origin'
+            (Invoke-TestGate -Request (New-DesignerRequest -Method POST -Path $path -Headers $headers -BodyText '{}') -State $script:State).Body | Should -Match 'no-origin'
             $headers = New-GoodHeaders -State $script:State -Post
             $headers['Content-Type'] = 'text/plain'
-            (Test-DesignerRequest -Request (New-DesignerRequest -Method POST -Path $path -Headers $headers -BodyText '{}') -State $script:State).Status | Should -Be 415
+            (Invoke-TestGate -Request (New-DesignerRequest -Method POST -Path $path -Headers $headers -BodyText '{}') -State $script:State).Status | Should -Be 415
             $headers = New-GoodHeaders -State $script:State -Post
-            Test-DesignerRequest -Request (New-DesignerRequest -Method POST -Path $path -Headers $headers -BodyText '{}') -State $script:State | Should -BeNullOrEmpty
+            Invoke-TestGate -Request (New-DesignerRequest -Method POST -Path $path -Headers $headers -BodyText '{}') -State $script:State | Should -BeNullOrEmpty
         }
         foreach ($path in '/api/browser/current', '/api/pick') {
-            (Test-DesignerRequest -Request (New-DesignerRequest -Method GET -Path $path -Headers @{ Host = $script:State.HostHeader }) -State $script:State).Status | Should -Be 403
+            (Invoke-TestGate -Request (New-DesignerRequest -Method GET -Path $path -Headers @{ Host = $script:State.HostHeader }) -State $script:State).Status | Should -Be 403
         }
     }
 
@@ -3583,7 +3590,7 @@ Describe 'Runs from the panel: routes, plan and rules (no browser, no child)' {
         foreach ($route in '/api/run', '/api/run/plan') {
             (Invoke-TestRoute POST $route ([ordered]@{ config = (New-RunConfig); path = 'C:\Windows\win.ini'; kind = 'full' }) -State $script:R).Status | Should -Be 403
             $request = New-DesignerRequest -Method POST -Path $route -Headers (New-GoodHeaders $script:R -Post) -BodyText '{"path":"C:\\Windows\\win.ini","config":{}}'
-            (Test-DesignerRequest -Request $request -State $script:R).Status | Should -Be 403
+            (Invoke-TestGate -Request $request -State $script:R).Status | Should -Be 403
         }
         $script:R.Run.State | Should -Be 'idle'
     }
@@ -3620,12 +3627,12 @@ Describe 'Runs from the panel: routes, plan and rules (no browser, no child)' {
         $headers = New-GoodHeaders $script:R -Post:($method -eq 'POST')
         $headers.Remove('X-Vouch-Token')
         $request = New-DesignerRequest -Method $method -Path $path -Headers $headers -BodyText '{}'
-        $refusal = Test-DesignerRequest -Request $request -State $script:R
+        $refusal = Invoke-TestGate -Request $request -State $script:R
         $refusal.Status | Should -Be 403
         (ConvertFrom-TestBody $refusal).code | Should -Be 'token'
         $headers = New-GoodHeaders $script:R -Post:($method -eq 'POST')
         $headers['Origin'] = 'https://evil.example'
-        (Test-DesignerRequest -Request (New-DesignerRequest -Method $method -Path $path -Headers $headers -BodyText '{}') -State $script:R).Status | Should -Be 403
+        (Invoke-TestGate -Request (New-DesignerRequest -Method $method -Path $path -Headers $headers -BodyText '{}') -State $script:R).Status | Should -Be 403
     }
 
     It 'answers 409 to a stop with nothing running, and 405 for a POST to a preview' {

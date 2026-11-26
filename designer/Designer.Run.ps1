@@ -1313,22 +1313,18 @@ function Invoke-DesignerPreview {
 #region Run routes ----------------------------------------------------------------------
 
 function Get-DesignerRunBodyKind {
-    # 'full' or 'page' from a request ("all" is the panel's older word for full).
+    # 'full' or 'page' from a request.
     param([AllowNull()][object]$Body)
     $kind = Get-DesignerBodyText -Body $Body -Name 'kind'
-    if ($kind -cin 'full', 'all') { return 'full' }
+    if ($kind -ceq 'full') { return 'full' }
     if ($kind -ceq 'page') { return 'page' }
     return ''
 }
 
 function Get-DesignerRunBodyPage {
-    # The page id of a page test: "pageId", or the first of "only".
+    # The page id of a page test ("pageId"), '' when none.
     param([AllowNull()][object]$Body)
-    $id = Get-DesignerBodyText -Body $Body -Name 'pageId'
-    if ($id) { return $id }
-    $only = Get-DesignerValue -Object $Body -Name 'only'
-    if ($only -is [System.Collections.IEnumerable] -and $only -isnot [string]) { foreach ($item in $only) { if ($item -is [string]) { return $item } } }
-    return ''
+    return (Get-DesignerBodyText -Body $Body -Name 'pageId')
 }
 
 function ConvertTo-DesignerPlanData {

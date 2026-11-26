@@ -282,19 +282,6 @@ function Get-DesignerPathRoute {
     }
 }
 
-function Test-DesignerRequest {
-    <#
-        The whole gate for a request whose body is already read (the tests, and the
-        router's callers): the header checks, then the body checks.
-    #>
-    param(
-        [Parameter(Mandatory)][object]$Request,
-        [Parameter(Mandatory)][object]$State
-    )
-    $refusal = Test-DesignerRequestHeader -Request $Request -State $State
-    if ($null -ne $refusal) { return $refusal }
-    return Test-DesignerRequestBody -Request $Request -State $State
-}
 
 function Test-DesignerRequestHeader {
     <#
@@ -498,13 +485,6 @@ function Get-DesignerBodyText {
     return ''
 }
 
-function Get-DesignerLaterRoute {
-    <#
-        Endpoints a later step implements answer 501 with a plain message, so the panel
-        can be built against them before. None are left; the table stays for the next.
-    #>
-    return [ordered]@{}
-}
 
 function Get-DesignerQueryNumber {
     # A whole number from the query string (?since=12), or -Default.
@@ -522,7 +502,8 @@ function Invoke-DesignerRequest {
         The router: method + path + parsed body + state in, a response object out. Pure
         apart from what the handlers do on purpose (file dialogs, reading and writing the
         chosen files), so every route can be tested without a socket. Assumes the request
-        passed Test-DesignerRequest; the file-path rule is checked again here anyway.
+        passed the gate (Test-DesignerRequestHeader, then Test-DesignerRequestBody, as
+        Invoke-DesignerExchange calls them); the file-path rule is checked again here anyway.
     #>
     param(
         [Parameter(Mandatory)][string]$Method,
@@ -550,62 +531,60 @@ function Invoke-DesignerRequest {
             }
         }
 
+        # The one table of routes: what each answers, and (below) which addresses exist
+        # for the 405 answer. Ordinal keys: the method and the address are case-sensitive.
+        $routes = [System.Collections.Generic.Dictionary[string, scriptblock]]::new([System.StringComparer]::Ordinal)
+        $routes['GET /api/state']              = { New-DesignerJsonResponse -Data (Get-DesignerStateData -State $State) }
+        $routes['POST /api/config/new']        = { Invoke-DesignerNewConfig -State $State }
+        $routes['POST /api/config/open']       = { Invoke-DesignerOpenConfig -Body $Body -State $State }
+        $routes['POST /api/config/save']       = { Invoke-DesignerSaveConfig -Body $Body -State $State }
+        $routes['POST /api/config/import-csv'] = { Invoke-DesignerImportCsv -Body $Body -State $State }
+        $routes['POST /api/config/validate']   = { Invoke-DesignerValidateConfig -Body $Body -State $State }
+        $routes['POST /api/dialog']            = { Invoke-DesignerDialog -Body $Body -State $State }
+        $routes['POST /api/command']           = { Invoke-DesignerCommand -Body $Body -State $State }
+        $routes['POST /api/open']              = { Invoke-DesignerOpenTarget -Body $Body -State $State }
+        $routes['GET /api/browser/current']    = { Invoke-DesignerBrowserCurrent -State $State }
+        $routes['POST /api/browser/connect']   = { Invoke-DesignerBrowserConnect -State $State }
+        $routes['POST /api/browser/navigate']  = { Invoke-DesignerNavigate -Body $Body -State $State }
+        $routes['POST /api/browser/layout']    = { Invoke-DesignerLayoutRequest -State $State }
+        $routes['POST /api/browser/zoom-off']  = { Invoke-DesignerZoomOff -State $State }
+        $routes['POST /api/page/from-current'] = { Invoke-DesignerPageFromCurrent -State $State }
+        $routes['POST /api/pick/start']        = { Invoke-DesignerPickStart -Body $Body -State $State }
+        $routes['GET /api/pick']               = { New-DesignerJsonResponse -Data (Get-ElementPickResult -State $State) }
+        $routes['POST /api/pick/cancel']       = { Invoke-DesignerPickCancel -State $State }
+        $routes['POST /api/action/test']       = { Invoke-DesignerActionTest -Body $Body -State $State }
+        $routes['POST /api/run']               = { Invoke-DesignerRunStart -Body $Body -State $State }
+        $routes['GET /api/run']                = { New-DesignerJsonResponse -Data (Get-DesignerRunData -State $State -Since (Get-DesignerQueryNumber -Query $Query -Name 'since')) }
+        $routes['POST /api/run/plan']          = { Invoke-DesignerRunPlan -Body $Body -State $State }
+        $routes['POST /api/run/stop']          = { Invoke-DesignerRunStop -Body $Body -State $State }
+        $routes['POST /api/shutdown']          = {
+            if (Test-DesignerRunActive -State $State) {
+                # Closing during a run: the panel asked the person first; stop the run
+                # cleanly, and the loop ends when it has (Complete-DesignerRun).
+                if ($Body['stopRun'] -ne $true) {
+                    return New-DesignerError -Status 409 -Code 'running' -Message 'A run is going.' -Detail 'Stop the run first, or confirm closing the Designer, which stops it.'
+                }
+                $State.ShutdownAfterRun = $true
+                [void](Stop-DesignerRun -State $State)
+                return New-DesignerJsonResponse -Data ([ordered]@{ ok = $true; waiting = $true; message = 'Stopping the run first; the Vouch Designer closes when it has stopped.' })
+            }
+            $State.Running = $false
+            $State.StopReason = 'The Designer was closed from its window.'
+            return New-DesignerJsonResponse -Data ([ordered]@{ ok = $true; message = 'The Vouch Designer has stopped. You can close this window.' })
+        }
+
         $route = "$Method $Path"
         $busy = Get-DesignerRunRefusal -State $State -Route $route
         if ($null -ne $busy) { return $busy }
-        switch -CaseSensitive ($route) {
-            'GET /api/state'               { return New-DesignerJsonResponse -Data (Get-DesignerStateData -State $State) }
-            'POST /api/config/new'         { return Invoke-DesignerNewConfig -State $State }
-            'POST /api/config/open'        { return Invoke-DesignerOpenConfig -Body $Body -State $State }
-            'POST /api/config/save'        { return Invoke-DesignerSaveConfig -Body $Body -State $State }
-            'POST /api/config/import-csv'  { return Invoke-DesignerImportCsv -Body $Body -State $State }
-            'POST /api/config/validate'    { return Invoke-DesignerValidateConfig -Body $Body -State $State }
-            'POST /api/dialog'             { return Invoke-DesignerDialog -Body $Body -State $State }
-            'POST /api/command'            { return Invoke-DesignerCommand -Body $Body -State $State }
-            'POST /api/open'               { return Invoke-DesignerOpenTarget -Body $Body -State $State }
-            'GET /api/browser/current'     { return Invoke-DesignerBrowserCurrent -State $State }
-            'POST /api/browser/connect'    { return Invoke-DesignerBrowserConnect -State $State }
-            'POST /api/browser/navigate'   { return Invoke-DesignerNavigate -Body $Body -State $State }
-            'POST /api/browser/layout'     { return Invoke-DesignerLayoutRequest -State $State }
-            'POST /api/browser/zoom-off'   { return Invoke-DesignerZoomOff -State $State }
-            'POST /api/page/from-current'  { return Invoke-DesignerPageFromCurrent -State $State }
-            'POST /api/pick/start'         { return Invoke-DesignerPickStart -Body $Body -State $State }
-            'GET /api/pick'                { return New-DesignerJsonResponse -Data (Get-ElementPickResult -State $State) }
-            'POST /api/pick/cancel'        { return Invoke-DesignerPickCancel -State $State }
-            'POST /api/action/test'        { return Invoke-DesignerActionTest -Body $Body -State $State }
-            'POST /api/run'                { return Invoke-DesignerRunStart -Body $Body -State $State }
-            'GET /api/run'                 { return New-DesignerJsonResponse -Data (Get-DesignerRunData -State $State -Since (Get-DesignerQueryNumber -Query $Query -Name 'since')) }
-            'POST /api/run/plan'           { return Invoke-DesignerRunPlan -Body $Body -State $State }
-            'POST /api/run/stop'           { return Invoke-DesignerRunStop -Body $Body -State $State }
-            'POST /api/shutdown' {
-                if (Test-DesignerRunActive -State $State) {
-                    # Closing during a run: the panel asked the person first; stop the run
-                    # cleanly, and the loop ends when it has (Complete-DesignerRun).
-                    if ($Body['stopRun'] -ne $true) {
-                        return New-DesignerError -Status 409 -Code 'running' -Message 'A run is going.' -Detail 'Stop the run first, or confirm closing the Designer, which stops it.'
-                    }
-                    $State.ShutdownAfterRun = $true
-                    [void](Stop-DesignerRun -State $State)
-                    return New-DesignerJsonResponse -Data ([ordered]@{ ok = $true; waiting = $true; message = 'Stopping the run first; the Vouch Designer closes when it has stopped.' })
-                }
-                $State.Running = $false
-                $State.StopReason = 'The Designer was closed from its window.'
-                return New-DesignerJsonResponse -Data ([ordered]@{ ok = $true; message = 'The Vouch Designer has stopped. You can close this window.' })
-            }
-        }
+        # A handler runs in a child scope of this function: it reads $Body, $State and $Query from here.
+        if ($routes.ContainsKey($route)) { return (& $routes[$route]) }
 
-        $later = Get-DesignerLaterRoute
-        if ($later.Contains($route)) {
-            return New-DesignerError -Status 501 -Code 'later' -Message 'Not available yet.' -Detail $later[$route]
-        }
         if ($Path.StartsWith('/preview/', [System.StringComparison]::Ordinal)) {
             return Invoke-DesignerPreview -Method $Method -Path $Path -State $State
         }
-        foreach ($known in @('/api/state', '/api/config/new', '/api/config/open', '/api/config/save', '/api/config/import-csv', '/api/config/validate',
-                '/api/dialog', '/api/command', '/api/open', '/api/shutdown', '/api/browser/current', '/api/browser/connect', '/api/browser/navigate',
-                '/api/browser/layout', '/api/browser/zoom-off', '/api/page/from-current', '/api/pick/start', '/api/pick', '/api/pick/cancel',
-                '/api/action/test', '/api/run', '/api/run/plan', '/api/run/stop') + @($later.Keys | ForEach-Object { ($_ -split ' ', 2)[1] })) {
-            if ($known -ceq $Path) { return New-DesignerError -Status 405 -Code 'method' -Message 'This kind of request is not supported here.' -Detail "$Method is not used for $Path." }
+        # A known address asked with the other method: 405, from the same route table.
+        foreach ($known in $routes.Keys) {
+            if (($known -split ' ', 2)[1] -ceq $Path) { return New-DesignerError -Status 405 -Code 'method' -Message 'This kind of request is not supported here.' -Detail "$Method is not used for $Path." }
         }
         return New-DesignerError -Status 404 -Code 'not-found' -Message 'There is nothing at this address.' -Detail $Path
     }
@@ -1543,9 +1522,10 @@ function Get-VouchCommandLine {
 
 function Initialize-DesignerInterop {
     <#
-        ShowWindow/SetForegroundWindow for the dialog owner. A type of its own (not
-        Vouch.Native): Initialize-NativeInterop also makes the process DPI-aware, which
-        would change the units of the panel's screen position.
+        ShowWindow/SetForegroundWindow for the dialog owner, in a small type of its own so
+        that showing a file dialog does not need Initialize-NativeInterop, which also makes
+        the whole process DPI-aware. The Designer does that only where it measures and
+        places windows in physical pixels (Set-DesignerLayout, Show-DesignerAuditWindow).
     #>
     if (-not ('Vouch.DesignerNative' -as [type])) {
         Add-Type -TypeDefinition @'
