@@ -832,7 +832,8 @@ function Get-VouchConfigSchema {
         schemaVersion = @{ Type = 'schemaVersion'; Default = 1 }
         name          = $text
         browser       = @{ Type = 'object'; Fields = [ordered]@{
-                profileDir        = $text
+                # FolderPath: reaches Edge's command line inside quotes (Start-EdgeDebug).
+                profileDir        = @{ Type = 'string'; Default = ''; FolderPath = $true }
                 debugPort         = @{ Type = 'int'; Min = 1024; Max = 65535; Default = 9222 }
                 useVirtualDesktop = @{ Type = 'bool'; Default = $false }
                 keepBrowserOpen   = @{ Type = 'bool'; Default = $false }
@@ -1072,6 +1073,9 @@ function Test-VouchConfigScalar {
             if ($Value -isnot [string]) {
                 Add-VouchConfigProblem -List $Errors -Path $Path -Message "must be text in double quotes (found $found)."
             }
+            elseif ($Spec.ContainsKey('FolderPath') -and ($problem = Get-FolderPathProblem -Path $Value)) {
+                Add-VouchConfigProblem -List $Errors -Path $Path -Message $problem
+            }
         }
         'bool' {
             if ($Value -isnot [bool]) {
@@ -1095,6 +1099,29 @@ function Test-VouchConfigScalar {
             }
         }
     }
+}
+
+function Get-FolderPathProblem {
+    <#
+        Why a folder path cannot be used, or ''. The browser profile folder reaches Edge's
+        command line inside quotes Vouch adds itself (Start-EdgeDebug): a " in it would
+        end the quoted value and turn the rest into other Edge switches. Windows does not
+        allow " < > | ? * or control characters in a path, nor a colon except after the
+        drive letter, so such a value can only be a mistake; it is refused plainly here
+        instead of failing later with a puzzling message. A \\?\ or \\.\ prefix is left alone.
+    #>
+    param([AllowEmptyString()][string]$Path)
+    if ([string]::IsNullOrEmpty($Path)) { return '' }
+    $rest = if ($Path -match '^\\\\[?.]\\') { $Path.Substring(4) } else { $Path }
+    $bad = [System.Collections.Generic.List[string]]::new()
+    foreach ($char in $rest.ToCharArray()) {
+        $shown = if ([int]$char -lt 32) { 'a control character' } elseif ('"<>|?*'.Contains($char)) { [string]$char } else { '' }
+        if ($shown -and -not $bad.Contains($shown)) { $bad.Add($shown) }
+    }
+    $colons = $rest.Split(':').Count - 1
+    if ($colons -gt 1 -or ($colons -eq 1 -and $rest -notmatch '^[A-Za-z]:')) { $bad.Add(':') }
+    if ($bad.Count -eq 0) { return '' }
+    return "must be a folder path without $($bad -join ' ') (found ""$Path""). Windows does not allow these characters in a folder name; a colon belongs only after the drive letter, as in C:\Vouch."
 }
 
 function Test-VouchConfigObject {
@@ -7799,10 +7826,12 @@ function Invoke-CaptureRun {
         return
     }
 
-    $edgePath = Find-EdgeExecutable
-
     # Absolute, so Edge receives the same path the process lookups search for.
     $profileDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($settings.EdgeProfileDir)
+    $profileProblem = Get-FolderPathProblem -Path $profileDir
+    if ($profileProblem) { throw "The browser profile folder (-EdgeProfileDir, or ""profileDir"" under ""browser"" in the configuration file) $profileProblem" }
+
+    $edgePath = Find-EdgeExecutable
 
     if ($settings.LoginSetup) {
         Invoke-LoginSetup -EdgePath $edgePath -ProfileDir $profileDir
@@ -8264,6 +8293,10 @@ function Invoke-DesignerMode {
     if (-not (Test-Path -LiteralPath $designerScript -PathType Leaf) -or -not (Test-Path -LiteralPath $designerRunScript -PathType Leaf)) {
         throw ("The Vouch Designer needs the folder 'designer' next to vouch.ps1 ($(Split-Path -Path $designerScript -Parent)), and it is not there. " +
             'Copy the whole Vouch folder, not only vouch.ps1. Everything else vouch.ps1 does works without it.')
+    }
+    if ($EdgeProfileDir) {
+        $profileProblem = Get-FolderPathProblem -Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($EdgeProfileDir)
+        if ($profileProblem) { throw "The browser profile folder (-EdgeProfileDir) $profileProblem" }
     }
     if ($IgnoredParameters.Count -gt 0) {
         Write-Host "NOTE: with -Designer only -ConfigPath, -DesignerPort, -EdgeProfileDir, -DebugPort and -KeepBrowserOpen are used; these are ignored: -$($IgnoredParameters -join ', -')" -ForegroundColor Yellow

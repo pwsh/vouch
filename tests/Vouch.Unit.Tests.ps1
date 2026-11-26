@@ -2798,3 +2798,40 @@ Describe 'Files a run writes never replace its inputs or each other (final fix w
         $script:RunLogFile = ''
     }
 }
+Describe 'Browser profile folder: characters Windows does not allow (final fix wave)' {
+    It 'accepts ordinary folder paths: <_>' -ForEach @('', 'C:\Users\Jo Doe\Vouch\EdgeProfile', 'profiles\audit', '\\server\share\Vouch', '\\?\C:\long\path', 'D:\it''s here (2)') {
+        Get-FolderPathProblem -Path $_ | Should -Be ''
+    }
+
+    It 'refuses <Case>' -ForEach @(
+        @{ Case = 'a double quote'; Path = 'C:\Vouch" --remote-allow-origins=*'; Shown = '"' }
+        @{ Case = 'a pipe'; Path = 'C:\a|b'; Shown = '|' }
+        @{ Case = 'a question mark'; Path = 'C:\a?b'; Shown = '?' }
+        @{ Case = 'a control character'; Path = "C:\a`tb"; Shown = 'a control character' }
+        @{ Case = 'a colon not after the drive letter'; Path = 'C:\a:b'; Shown = ':' }
+    ) {
+        Get-FolderPathProblem -Path $Path | Should -BeLike "must be a folder path without *$Shown*"
+    }
+
+    It 'is a configuration error for browser.profileDir, with a plain message' {
+        $config = Get-DefaultVouchConfig
+        $config['browser']['profileDir'] = 'C:\Vouch"Profile'
+        $config['pages'].Add([ordered]@{ name = 'One'; url = 'https://example.com/' })
+        $check = Test-VouchConfig -Config $config
+        @($check.Errors | Where-Object Path -eq 'browser.profileDir').Count | Should -Be 1
+        ($check.Errors | Where-Object Path -eq 'browser.profileDir').Message | Should -BeLike '*without "*Windows does not allow*'
+        $config['browser']['profileDir'] = 'C:\Vouch\Profile'
+        @((Test-VouchConfig -Config $config).Errors).Count | Should -Be 0
+    }
+
+    It 'stops a run with -EdgeProfileDir holding a " before Edge is looked for' {
+        Mock Assert-Environment { }
+        Mock Initialize-NativeInterop { }
+        Mock Find-EdgeExecutable { throw 'Edge must not be looked for.' }
+        $csv = Join-Path $TestDrive 'profile.csv'
+        Set-Content -LiteralPath $csv -Value "Name,Url`nOne,http://127.0.0.1:1/" -Encoding utf8
+        { Invoke-Main -BoundParameters @{ CsvPath = $csv; EdgeProfileDir = 'C:\Vouch"x'; NoPrompt = [switch]$true } 6>$null } |
+            Should -Throw -ExpectedMessage 'The browser profile folder (-EdgeProfileDir*must be a folder path without "*'
+        $script:EventLogPath = ''
+    }
+}
