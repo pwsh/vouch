@@ -761,6 +761,11 @@ Describe 'Command lines (Get-VouchCommandLine)' {
         It 'gives a schedule command that parses as PowerShell and binds to the real param block of Install-VouchSchedule.ps1' {
             $installer = Join-Path (Split-Path $script:VouchPath -Parent) 'Install-VouchSchedule.ps1'
             $script:Cmd.ScheduleNote | Should -Not -Match 'later step'
+            # Scheduler policy: the command never allows warnings; the note says they count as failure.
+            $script:Cmd.Schedule | Should -Not -Match 'AllowWarnings'
+            $script:Cmd.ScheduleCmd | Should -Not -Match 'AllowWarnings'
+            $script:Cmd.ScheduleNote | Should -Match 'Scheduled runs count warnings as failure, whatever the file says'
+            $script:Cmd.ScheduleNote | Should -Match 'add -AllowWarnings to allow warnings'
             $errors = $null
             $ast = [System.Management.Automation.Language.Parser]::ParseInput($script:Cmd.Schedule, [ref]$null, [ref]$errors)
             $errors.Count | Should -Be 0
@@ -1506,6 +1511,20 @@ Describe 'Designer mode in vouch.ps1 and the panel window' {
         $state.PanelProcess = $self
         Invoke-DesignerTick -State $state
         $state.Running | Should -BeTrue
+        # A panel whose handle cannot be read but whose id now belongs to another program
+        # (another start time) counts as closed; the same start time counts as open.
+        $unreadable = [pscustomobject]@{}
+        $unreadable | Add-Member -MemberType ScriptMethod -Name get_HasExited -Value { throw 'Access is denied.' }
+        $unreadable | Add-Member -MemberType ScriptMethod -Name get_Id -Value { $PID }
+        $state.PanelProcess = $unreadable
+        $state.PanelProcessStart = $self.StartTime
+        Invoke-DesignerTick -State $state
+        $state.Running | Should -BeTrue
+        $state.PanelProcessStart = $self.StartTime.AddMinutes(-5)
+        Invoke-DesignerTick -State $state
+        $state.Running | Should -BeFalse
+        Get-DesignerProcessStartTime -Process $self | Should -Be $self.StartTime
+        Get-DesignerProcessStartTime -Process ([System.Diagnostics.Process]::new()) | Should -Be ([datetime]::MinValue)
     }
 
     It 'says plainly that the designer folder is missing, and writes no events or logs' {

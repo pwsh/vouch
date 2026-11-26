@@ -712,6 +712,8 @@ often its own address.
 - **Esc** (in the browser) or **Cancel picking** stops; the arrow keys, Page Up/Down and
   Space scroll the page. To work with the keyboard instead, cancel and type the words or
   the selector in the Designer.
+- The browser's own shortcuts still work during a pick: **F5 really reloads the page**
+  (a real request to the site).
 - The page's own buttons, links and fields do not act on your click. But a page that
   watches **every** click or key anywhere ("click anywhere to close", its own keyboard
   shortcuts) may still react, and your click counts as you using the page, which pages
@@ -905,7 +907,7 @@ Commands, typed in a PowerShell window in the Vouch folder:
 | --- | --- |
 | Run a saved configuration | `.\vouch.ps1 -ConfigPath .\q3-itgc.json` |
 | Run only some pages | `.\vouch.ps1 -ConfigPath .\q3-itgc.json -Only p002,p005` |
-| Check a report has not been changed | `.\vouch.ps1 -Verify .\reports\<report file>` |
+| Check the screenshots in a report are the ones Vouch captured | `.\vouch.ps1 -Verify .\reports\<report file>` |
 | Run automatically after I sign in | `.\Install-VouchSchedule.ps1 -ConfigPath .\q3-itgc.json -Schedule AtLogOn` |
 | Run automatically every weekday at 7:30 | `.\Install-VouchSchedule.ps1 -ConfigPath .\q3-itgc.json -At 07:30` |
 | Start the scheduled run now | `.\Install-VouchSchedule.ps1 -RunNow` |

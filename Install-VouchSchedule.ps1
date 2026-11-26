@@ -194,8 +194,9 @@ function Get-VouchTaskArguments {
         warnings as failure (-FailOnWarning) unless warnings are allowed: an expired
         sign-in in an unattended evidence run must never show as a success in Task
         Scheduler, so this scheduler rule beats the file's output.failOnWarning (allowed:
-        -FailOnWarning:$false, which beats an "on" in the file the other way round). A typed switch is passed with its
-        value (-SaveImages:$false), so "off" beats an "on" in the file too.
+        -FailOnWarning:$false, which beats an "on" in the file the other way round). A
+        typed switch is passed with its value (-SaveImages:$false), so "off" beats an "on"
+        in the file too.
         -JsonSummary always; -LogDir only when given (a configuration that names its
         own log folder keeps it).
     #>

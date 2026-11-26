@@ -72,6 +72,9 @@ function New-DesignerState {
         StopReason           = ''
         PanelProcess         = $null
         PanelStartedAt       = [datetime]::MinValue
+        # The panel process's own start time: a process found later under the same id with
+        # another start time is not the panel (Test-DesignerProcessExited).
+        PanelProcessStart    = [datetime]::MinValue
         PanelProfileDir      = ''
         # Called once per loop turn (about every 200 ms) with the state: the hook later
         # steps use to follow the browser and a run without blocking the server.
@@ -1772,6 +1775,13 @@ function Test-DesignerProcessExited {
     }
     catch { Write-Verbose "Whether the process has ended could not be told: $($_.Exception.Message)" }
     return $Unknown
+}
+
+function Get-DesignerProcessStartTime {
+    # A process's start time, or MinValue when it cannot be read (then it is not compared).
+    param([AllowNull()][object]$Process)
+    if ($null -eq $Process) { return [datetime]::MinValue }
+    try { return [datetime]$Process.get_StartTime() } catch { return [datetime]::MinValue }
 }
 
 function Stop-DesignerPanel {
@@ -3615,14 +3625,17 @@ function Invoke-DesignerTick {
     $panel = $State.PanelProcess
     if ($null -ne $panel) {
         # Cannot tell counts as closed, as before: the server must not outlive its window.
-        $gone = Test-DesignerProcessExited -Process $panel -Unknown $true
+        $gone = Test-DesignerProcessExited -Process $panel -StartTime $State.PanelProcessStart -Unknown $true
         if ($gone) {
             # A launcher that handed over to another Edge exits at once; look for the browser.
             $replacement = $null
             if (((Get-Date) - $State.PanelStartedAt).TotalSeconds -lt 10 -and $State.PanelProfileDir) {
                 $replacement = Find-EdgeBrowserProcess -ProfileDir $State.PanelProfileDir
             }
-            if ($null -ne $replacement -and $replacement.Id -ne $panel.Id) { $State.PanelProcess = $replacement }
+            if ($null -ne $replacement -and $replacement.Id -ne $panel.Id) {
+                $State.PanelProcess = $replacement
+                $State.PanelProcessStart = Get-DesignerProcessStartTime -Process $replacement
+            }
             else {
                 $State.PanelProcess = $null
                 $State.Running = $false
@@ -3730,6 +3743,7 @@ function Start-VouchDesigner {
             try {
                 $state.PanelProcess = Start-DesignerPanel -Url $url -ProfileDir $PanelProfileDir -AuditProfileDir $state.AuditProfileDir
                 $state.PanelStartedAt = Get-Date
+                $state.PanelProcessStart = Get-DesignerProcessStartTime -Process $state.PanelProcess
             }
             catch {
                 Write-Host "The Designer window could not be opened: $($_.Exception.Message)" -ForegroundColor Yellow

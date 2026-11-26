@@ -98,7 +98,7 @@ The Run tab's **Command line** box shows the same run as a command, and the
 # Sign in to your applications in the audit profile (without the Designer)
 .\vouch.ps1 -LoginSetup
 
-# Check a report has not changed since it was made
+# Check a report's screenshots and structure against what Vouch recorded
 .\vouch.ps1 -Verify .\reports\VouchReport_2026-09-24_061204.html
 ```
 
@@ -824,8 +824,13 @@ For people upgrading from 1.3:
 - **`-Verify` is stricter about structure**: an element or attribute Vouch does not write,
   a re-save that changes layout or encoding (reports must be UTF-8 without a byte order
   mark), altered styling or any picture change now fails, even when the edit was honest.
-  Consistent edits of the report's *text* still pass — `-Verify` never proved the text. Reports made by 1.2, 1.3 and 2.0 verify. **Linked-image reports cannot be
-  verified by Vouch 1.3.**
+  Consistent edits of the report's *text* still pass — `-Verify` never proved the text.
+  Reports made by 1.2, 1.3 and 2.0 verify. **Linked-image reports cannot be verified by
+  Vouch 1.3.**
+- **The integrity note inside every new report** now says what `-Verify` confirms (the
+  screenshots are the ones captured and the report is built the way Vouch writes it) and
+  that it does not cover the report's text; 1.x reports said it confirms "the evidence is
+  unchanged". Older reports keep their wording and still verify.
 - **JSON summary** gains `ReportDetails`, `Zip`, `LogPath`, `LogComplete`, and per item
   `Account`, `CaptureArea`, `ZoomPercent` and capture numbers/labels (all additive).
 - **Scheduler**: `-ConfigPath`; `-NoPrompt` always passed; `-FailOnWarning` for every

@@ -30,7 +30,7 @@ What to look at:
 - **An image's properties** — right-click any `.jpg` → *Properties → Details*: title,
   author, date taken, program and the full capture record in *Comments*.
 
-Check that nothing has changed since the run:
+Check the screenshots and the report's structure against what the run recorded:
 
 ```powershell
 .\vouch.ps1 -Verify .\examples\live-test-2026-09-24\live-test.html

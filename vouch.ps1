@@ -5443,8 +5443,9 @@ function New-HtmlReport {
     [void]$sb.AppendLine('<h2>Integrity</h2>')
     [void]$sb.AppendLine('<p class="integrity-note">Each screenshot carries its own metadata (page, capture time, run ID, computer and user) ' +
         'inside the image file, and is identified below by the SHA-256 hash of that file. The manifest hash covers all of them at once: ' +
-        'record it in the workpaper at capture time, and anyone can later confirm the evidence is unchanged with ' +
-        '<code>vouch.ps1 -Verify &lt;report&gt;</code>, or check saved images with <code>sha256sum -c SHA256SUMS</code>.</p>')
+        'record it in the workpaper at capture time. <code>vouch.ps1 -Verify &lt;report&gt;</code> later confirms that the screenshots are the ones ' +
+        'captured and that the report is built the way Vouch writes it; it does not cover the report&#39;s text. Saved images can be checked with ' +
+        '<code>sha256sum -c SHA256SUMS</code>.</p>')
     if ($withOptions) {
         if ($Options.EmbedImages) {
             [void]$sb.AppendLine('<p class="integrity-note"><strong>Self-contained report:</strong> every screenshot is stored inside this file, so it can be moved or attached on its own.</p>')
@@ -6309,9 +6310,10 @@ function Test-ReportIntegrity {
         to it (Resolve-ReportImagePath decides which files may be read at all). A
         problem with one image is a failed check with a reason, never an exception.
 
-        This proves the report and images are unchanged since the manifest hash was
-        recorded; it cannot tell on its own whether someone rebuilt all hashes together,
-        which is why the manifest hash should be kept outside the report as well.
+        This shows that the screenshots are the ones the hashes name and that the report
+        is built the way Vouch writes it - not that its text is unchanged (Test-ReportMarkup
+        checks structure, not words). It cannot tell on its own whether someone rebuilt all
+        hashes together, which is why the manifest hash should be kept outside the report.
     #>
     param([Parameter(Mandatory)][string]$Path)
 
